@@ -69,6 +69,7 @@ use std::fs;
 use std::io;
 use std::path::PathBuf;
 use std::str;
+use std::sync::Mutex;
 
 use anyhow::bail;
 use cargo_util::registry::make_dep_path;
@@ -226,6 +227,9 @@ pub struct CacheManager<'gctx> {
     cache_root: Filesystem,
     /// [`GlobalContext`] reference for convenience.
     gctx: &'gctx GlobalContext,
+    /// Keeps track of if we have sent a warning message if there was an error updating the cache.
+    /// The motivation is to avoid warning spam if the cache is not writable.
+    has_warned: Mutex<bool>,
 }
 
 impl<'gctx> CacheManager<'gctx> {
@@ -233,7 +237,11 @@ impl<'gctx> CacheManager<'gctx> {
     ///
     /// `root` --- The root path where caches are located.
     pub fn new(cache_root: Filesystem, gctx: &'gctx GlobalContext) -> CacheManager<'gctx> {
-        CacheManager { cache_root, gctx }
+        CacheManager {
+            cache_root,
+            gctx,
+            has_warned: Default::default(),
+        }
     }
 
     /// Gets the cache associated with the key.
@@ -251,14 +259,28 @@ impl<'gctx> CacheManager<'gctx> {
     /// Associates the value with the key.
     pub fn put(&self, key: &str, value: &[u8]) {
         let cache_path = &self.cache_path(key);
-        if fs::create_dir_all(cache_path.parent().unwrap()).is_ok() {
-            let path = Filesystem::new(cache_path.clone());
-            self.gctx
-                .assert_package_cache_locked(CacheLockMode::DownloadExclusive, &path);
-            if let Err(e) = fs::write(cache_path, value) {
-                tracing::info!(?cache_path, "failed to write cache: {e}");
+        if let Err(e) = self.put_inner(cache_path, value) {
+            tracing::info!(?cache_path, "failed to write cache: {e}");
+
+            let mut has_warned = self.has_warned.lock().unwrap();
+
+            if !*has_warned {
+                let _ = self.gctx.shell().warn(format!(
+                    "failed to write cache, path: {}, error: {e}",
+                    cache_path.to_str().unwrap_or_default()
+                ));
+                *has_warned = true;
             }
         }
+    }
+
+    fn put_inner(&self, cache_path: &PathBuf, value: &[u8]) -> std::io::Result<()> {
+        fs::create_dir_all(cache_path.parent().unwrap())?;
+        let path = Filesystem::new(cache_path.clone());
+        self.gctx
+            .assert_package_cache_locked(CacheLockMode::DownloadExclusive, &path);
+        fs::write(cache_path, value)?;
+        Ok(())
     }
 
     /// Invalidates the cache associated with the key.

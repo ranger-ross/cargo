@@ -135,6 +135,11 @@ pub struct Layout {
     /// The lockfile for a build (`.cargo-lock`). Will be unlocked when this
     /// struct is `drop`ped.
     _lock: FileLock,
+    /// Same as `_lock` but for the build directory.
+    ///
+    /// Will be `None` when the build-dir and target-dir are the same path as we cannot
+    /// lock the same path twice.
+    _build_lock: Option<FileLock>,
 }
 
 impl Layout {
@@ -150,15 +155,22 @@ impl Layout {
         dest: &str,
     ) -> CargoResult<Layout> {
         let mut root = ws.target_dir();
+        let mut build_root = ws.build_dir();
         if let Some(target) = target {
             root.push(target.short_name());
+            build_root.push(target.short_name());
         }
+        let build_dest = build_root.join(dest);
         let dest = root.join(dest);
         // If the root directory doesn't already exist go ahead and create it
         // here. Use this opportunity to exclude it from backups as well if the
         // system supports it since this is a freshly created folder.
         //
         paths::create_dir_all_excluded_from_backups_atomic(root.as_path_unlocked())?;
+        if root != build_root {
+            paths::create_dir_all_excluded_from_backups_atomic(build_root.as_path_unlocked())?;
+        }
+
         // Now that the excluded from backups target root is created we can create the
         // actual destination (sub)subdirectory.
         paths::create_dir_all(dest.as_path_unlocked())?;
@@ -167,23 +179,36 @@ impl Layout {
         // directory, so just lock the entire thing for the duration of this
         // compile.
         let lock = dest.open_rw_exclusive_create(".cargo-lock", ws.gctx(), "build directory")?;
+
+        let build_lock = if root != build_root {
+            Some(build_dest.open_rw_exclusive_create(
+                ".cargo-lock",
+                ws.gctx(),
+                "build directory",
+            )?)
+        } else {
+            None
+        };
         let root = root.into_path_unlocked();
+        let build_root = build_root.into_path_unlocked();
         let dest = dest.into_path_unlocked();
-        let deps = dest.join("deps");
+        let build_dest = build_dest.as_path_unlocked();
+        let deps = build_dest.join("deps");
         let artifact = deps.join("artifact");
 
         Ok(Layout {
             deps,
-            build: dest.join("build"),
+            build: build_dest.join("build"),
             artifact,
-            incremental: dest.join("incremental"),
-            fingerprint: dest.join(".fingerprint"),
+            incremental: build_dest.join("incremental"),
+            fingerprint: build_dest.join(".fingerprint"),
             examples: dest.join("examples"),
             doc: root.join("doc"),
-            tmp: root.join("tmp"),
+            tmp: build_root.join("tmp"),
             root,
             dest,
             _lock: lock,
+            _build_lock: build_lock,
         })
     }
 

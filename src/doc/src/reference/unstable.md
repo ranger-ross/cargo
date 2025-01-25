@@ -77,6 +77,7 @@ Each new feature described below should explain how to use it.
     * [update-breaking](#update-breaking) --- Allows upgrading to breaking versions with `update --breaking`
 * Output behavior
     * [artifact-dir](#artifact-dir) --- Adds a directory where artifacts are copied to.
+    * [build-dir](#build-dir) --- Adds a directory where intermediate build artifacts are stored.
     * [Different binary name](#different-binary-name) --- Assign a name to the built binary that is separate from the crate name.
     * [root-dir](#root-dir) --- Controls the root directory relative to which paths are printed
 * Compile behavior
@@ -235,6 +236,27 @@ This can also be specified in `.cargo/config.toml` files.
 ```toml
 [build]
 artifact-dir = "out"
+```
+
+## build-dir
+* Original Issue: [#14125](https://github.com/rust-lang/cargo/issues/14125)
+* Tracking Issue: None
+
+The directory where intermediate build artifacts will be stored.
+Intermediate artifacts are produced by Rustc/Cargo during the build process.
+
+* Type: string (path)
+* Default: Defaults to the value of `build.target-dir`
+* Environment: `CARGO_BUILD_BUILD_DIR` or `CARGO_BUILD_DIR`
+
+
+This can be specified in `.cargo/config.toml` files using the `build.build-dir`.
+
+Example:
+
+```toml
+[build]
+build-dir = "out"
 ```
 
 ## root-dir

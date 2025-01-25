@@ -1857,7 +1857,7 @@ pub fn dep_info_loc(build_runner: &mut BuildRunner<'_, '_>, unit: &Unit) -> Path
 /// Returns an absolute path that target directory.
 /// All paths are rewritten to be relative to this.
 fn target_root(build_runner: &BuildRunner<'_, '_>) -> PathBuf {
-    build_runner.bcx.ws.target_dir().into_path_unlocked()
+    build_runner.bcx.ws.build_dir().into_path_unlocked()
 }
 
 /// Reads the value from the old fingerprint hash file and compare.

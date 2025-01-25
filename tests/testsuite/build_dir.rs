@@ -12,19 +12,22 @@ fn binary_with_debug() {
             ".cargo/config.toml",
             r#"
             [build]
-            target-dir = "build"
+            target-dir = "target"
+            build-dir = "build"
             "#,
         )
         .build();
 
-    p.cargo("build")
-        .masquerade_as_nightly_cargo(&[])
+    p.cargo("build -Z unstable-options -Z build-dir")
+        .masquerade_as_nightly_cargo(&["build-dir"])
         .enable_mac_dsym()
         .run();
 
     assert_build_dir(p.root().join("build"), "debug", true);
-    assert!(p.root().join("build/debug/foo").is_file());
-    assert!(!p.root().join("target").exists());
+    assert_build_dir(p.root().join("target"), "debug", false);
+
+    // Verify the binary was copied to the `target` dir
+    assert!(p.root().join("target/debug/foo").is_file());
 }
 
 #[cargo_test]
@@ -35,19 +38,22 @@ fn binary_with_release() {
             ".cargo/config.toml",
             r#"
             [build]
-            target-dir = "build"
+            target-dir = "target"
+            build-dir = "build"
             "#,
         )
         .build();
 
-    p.cargo("build --release")
-        .masquerade_as_nightly_cargo(&[])
+    p.cargo("build -Z unstable-options -Z build-dir --release")
+        .masquerade_as_nightly_cargo(&["build-dir"])
         .enable_mac_dsym()
         .run();
 
     assert_build_dir(p.root().join("build"), "release", true);
-    assert!(p.root().join("build/release/foo").is_file());
-    assert!(!p.root().join("target").exists());
+    assert_build_dir(p.root().join("target"), "release", false);
+
+    // Verify the binary was copied to the `target` dir
+    assert!(p.root().join("target/release/foo").is_file());
 }
 
 #[cargo_test]
@@ -56,12 +62,13 @@ fn should_default_to_target() {
         .file("src/main.rs", r#"fn main() { println!("Hello, World!") }"#)
         .build();
 
-    p.cargo("build")
-        .masquerade_as_nightly_cargo(&[])
+    p.cargo("build -Z unstable-options -Z build-dir")
+        .masquerade_as_nightly_cargo(&["build-dir"])
         .enable_mac_dsym()
         .run();
 
     assert_build_dir(p.root().join("target"), "debug", true);
+    // Verify the binary exists in the correct location
     assert!(p.root().join("target/debug/foo").is_file());
 }
 
@@ -73,17 +80,18 @@ fn cargo_doc_should_output_to_target_dir() {
             ".cargo/config.toml",
             r#"
             [build]
-            target-dir = "build"
+            target-dir = "target"
+            build-dir = "build"
             "#,
         )
         .build();
 
-    p.cargo("doc")
-        .masquerade_as_nightly_cargo(&[])
+    p.cargo("doc -Z unstable-options -Z build-dir")
+        .masquerade_as_nightly_cargo(&["build-dir"])
         .enable_mac_dsym()
         .run();
 
-    let docs_dir = p.root().join("build/doc");
+    let docs_dir = p.root().join("target/doc");
     assert!(docs_dir.exists());
     assert!(docs_dir.join("foo/index.html").exists());
 }
@@ -96,35 +104,68 @@ fn cargo_package_should_output_to_target_dir() {
             ".cargo/config.toml",
             r#"
             [build]
-            target-dir = "build"
+            target-dir = "target"
+            build-dir = "build"
             "#,
         )
         .build();
 
-    p.cargo("package")
-        .masquerade_as_nightly_cargo(&[])
+    p.cargo("package -Z unstable-options -Z build-dir")
+        .masquerade_as_nightly_cargo(&["build-dir"])
         .enable_mac_dsym()
         .run();
 
     assert_build_dir(p.root().join("build"), "debug", true);
 
-    let package_dir = p.root().join("build/package");
-    assert!(package_dir.exists());
-    assert!(package_dir.join("foo-0.0.1.crate").exists());
-    assert!(package_dir.join("foo-0.0.1.crate").is_file());
-    assert!(package_dir.join("foo-0.0.1").exists());
-    assert!(package_dir.join("foo-0.0.1").is_dir());
+    let package_build_dir = p.root().join("build/package");
+    assert!(package_build_dir.exists());
+    assert!(package_build_dir.join("foo-0.0.1").exists());
+    assert!(package_build_dir.join("foo-0.0.1").is_dir());
+    let package_artifact_dir = p.root().join("target/package");
+    assert!(package_artifact_dir.exists());
+    assert!(package_artifact_dir.join("foo-0.0.1.crate").exists());
+    assert!(package_artifact_dir.join("foo-0.0.1.crate").is_file());
 }
 
 #[cargo_test]
-fn cargo_clean_should_clean_the_target_dir() {
+fn cargo_clean_should_clean_the_target_dir_and_build_dir() {
     let p = project()
         .file("src/main.rs", r#"fn main() { println!("Hello, World!") }"#)
         .file(
             ".cargo/config.toml",
             r#"
             [build]
-            target-dir = "build"
+            target-dir = "target"
+            build-dir = "build"
+            "#,
+        )
+        .build();
+
+    p.cargo("build -Z unstable-options -Z build-dir")
+        .masquerade_as_nightly_cargo(&["build-dir"])
+        .enable_mac_dsym()
+        .run();
+
+    assert_build_dir(p.root().join("build"), "debug", true);
+
+    p.cargo("clean -Z unstable-options -Z build-dir")
+        .masquerade_as_nightly_cargo(&["build-dir"])
+        .enable_mac_dsym()
+        .run();
+
+    assert!(!p.root().join("build").exists());
+    assert!(!p.root().join("target").exists());
+}
+
+#[cargo_test]
+fn verify_build_dir_is_disabled_by_feature_flag() {
+    let p = project()
+        .file("src/main.rs", r#"fn main() { println!("Hello, World!") }"#)
+        .file(
+            ".cargo/config.toml",
+            r#"
+            [build]
+            build-dir = "build"
             "#,
         )
         .build();
@@ -134,13 +175,8 @@ fn cargo_clean_should_clean_the_target_dir() {
         .enable_mac_dsym()
         .run();
 
-    assert_build_dir(p.root().join("build"), "debug", true);
-
-    p.cargo("clean")
-        .masquerade_as_nightly_cargo(&[])
-        .enable_mac_dsym()
-        .run();
-
+    assert_build_dir(p.root().join("target"), "debug", true);
+    assert!(p.root().join("target/debug/foo").is_file());
     assert!(!p.root().join("build").exists());
 }
 

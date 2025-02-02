@@ -6,6 +6,29 @@ use cargo_test_support::prelude::*;
 use cargo_test_support::project;
 
 #[cargo_test]
+fn verify_feature_is_disabled_by_feature_flag() {
+    let p = project()
+        .file("src/main.rs", r#"fn main() { println!("Hello, World!") }"#)
+        .file(
+            ".cargo/config.toml",
+            r#"
+            [build]
+            build-dir = "build"
+            "#,
+        )
+        .build();
+
+    p.cargo("build")
+        .masquerade_as_nightly_cargo(&[])
+        .enable_mac_dsym()
+        .run();
+
+    assert_build_dir(p.root().join("target"), "debug", true);
+    assert!(p.root().join("target/debug/foo").is_file());
+    assert!(!p.root().join("build").exists());
+}
+
+#[cargo_test]
 fn binary_with_debug() {
     let p = project()
         .file("src/main.rs", r#"fn main() { println!("Hello, World!") }"#)

@@ -94,6 +94,102 @@ fn should_default_to_target() {
     assert!(p.root().join("target/debug/foo").is_file());
 }
 
+mod should_template_build_dir_correctly {
+    use cargo_test_support::paths;
+
+    use super::*;
+
+    #[cargo_test]
+    fn workspace_root() {
+        let p = project()
+            .file("src/main.rs", r#"fn main() { println!("Hello, World!") }"#)
+            .file(
+                ".cargo/config.toml",
+                r#"
+            [build]
+            build-dir = "{workspace-root}/build"
+            "#,
+            )
+            .build();
+
+        p.cargo("build -Z unstable-options -Z build-dir")
+            .masquerade_as_nightly_cargo(&["build-dir"])
+            .enable_mac_dsym()
+            .run();
+
+        assert_build_dir(p.root().join("build"), "debug", true);
+        assert_build_dir(p.root().join("target"), "debug", false);
+
+        // Verify the binary was copied to the `target` dir
+        assert!(p.root().join("target/debug/foo").is_file());
+    }
+
+    #[cargo_test]
+    fn cargo_cache() {
+        let p = project()
+            .file("src/main.rs", r#"fn main() { println!("Hello, World!") }"#)
+            .file(
+                ".cargo/config.toml",
+                r#"
+            [build]
+            build-dir = "{cargo-cache}/build"
+            "#,
+            )
+            .build();
+
+        p.cargo("build -Z unstable-options -Z build-dir")
+            .masquerade_as_nightly_cargo(&["build-dir"])
+            .enable_mac_dsym()
+            .run();
+
+        assert_build_dir(paths::home().join(".cargo/build"), "debug", true);
+        assert_build_dir(p.root().join("target"), "debug", false);
+
+        // Verify the binary was copied to the `target` dir
+        assert!(p.root().join("target/debug/foo").is_file());
+    }
+
+    #[cargo_test]
+    fn workspace_manfiest_path_hash() {
+        let p = project()
+            .file("src/main.rs", r#"fn main() { println!("Hello, World!") }"#)
+            .file(
+                ".cargo/config.toml",
+                r#"
+            [build]
+            build-dir = "foo/{workspace-manifest-path-hash}/build"
+            "#,
+            )
+            .build();
+
+        p.cargo("build -Z unstable-options -Z build-dir")
+            .masquerade_as_nightly_cargo(&["build-dir"])
+            .enable_mac_dsym()
+            .run();
+
+        let foo_dir = p.root().join("foo");
+        assert!(foo_dir.exists());
+
+        // Since the hash will change between test runs simply find the first directory in `foo`
+        // and assume that is the build dir.
+        let hash_dir = std::fs::read_dir(foo_dir)
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap()
+            .unwrap();
+
+        let build_dir = hash_dir.path().join("build");
+        assert!(build_dir.exists());
+
+        assert_build_dir(build_dir, "debug", true);
+        assert_build_dir(p.root().join("target"), "debug", false);
+
+        // Verify the binary was copied to the `target` dir
+        assert!(p.root().join("target/debug/foo").is_file());
+    }
+}
+
 #[track_caller]
 fn assert_build_dir(path: PathBuf, profile: &str, is_build_dir: bool) {
     println!("checking if {path:?} is a build directory ({is_build_dir})");

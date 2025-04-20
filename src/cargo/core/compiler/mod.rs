@@ -97,7 +97,7 @@ use crate::util::context::WarningHandling;
 use crate::util::errors::{CargoResult, VerboseError};
 use crate::util::interning::InternedString;
 use crate::util::machine_message::{self, Message};
-use crate::util::{add_path_args, internal};
+use crate::util::{add_path_args, internal, Filesystem};
 use cargo_util::{paths, ProcessBuilder, ProcessError};
 use cargo_util_schemas::manifest::TomlDebugInfo;
 use cargo_util_schemas::manifest::TomlTrimPaths;
@@ -336,7 +336,12 @@ fn rustc(
         output_options.show_diagnostics = false;
     }
     let env_config = Arc::clone(build_runner.bcx.gctx.env_config()?);
+    let dep_dir = Filesystem::new(build_runner.files().deps_dir(&unit));
     return Ok(Work::new(move |state| {
+        let _dep_lock = dep_dir
+            .open_rw_exclusive_create(".dep-lock", None, "dep lock")
+            .unwrap();
+
         // Artifacts are in a different location than typical units,
         // hence we must assure the crate- and target-dependent
         // directory is present.

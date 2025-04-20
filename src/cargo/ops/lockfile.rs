@@ -85,7 +85,7 @@ pub fn write_pkg_lockfile(ws: &Workspace<'_>, resolve: &mut Resolve) -> CargoRes
 
     // Ok, if that didn't work just write it out
     lock_root
-        .open_rw_exclusive_create(LOCKFILE_NAME, ws.gctx(), "Cargo.lock file")
+        .open_rw_exclusive_create(LOCKFILE_NAME, Some(ws.gctx()), "Cargo.lock file")
         .and_then(|mut f| {
             f.file().set_len(0)?;
             f.write_all(out.as_bytes())?;

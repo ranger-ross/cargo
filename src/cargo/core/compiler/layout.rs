@@ -180,12 +180,13 @@ impl Layout {
         // For now we don't do any more finer-grained locking on the artifact
         // directory, so just lock the entire thing for the duration of this
         // compile.
-        let lock = dest.open_rw_exclusive_create(".cargo-lock", ws.gctx(), "build directory")?;
+        let lock =
+            dest.open_rw_exclusive_create(".cargo-lock", Some(ws.gctx()), "build directory")?;
 
         let build_lock = if root != build_root {
             Some(build_dest.open_rw_exclusive_create(
                 ".cargo-lock",
-                ws.gctx(),
+                Some(ws.gctx()),
                 "build directory",
             )?)
         } else {

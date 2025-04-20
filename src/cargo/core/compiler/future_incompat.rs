@@ -165,7 +165,7 @@ impl OnDiskReports {
             .build_dir()
             .open_rw_exclusive_create(
                 FUTURE_INCOMPAT_FILE,
-                ws.gctx(),
+                Some(ws.gctx()),
                 "Future incompatibility report",
             )
             .and_then(|file| {

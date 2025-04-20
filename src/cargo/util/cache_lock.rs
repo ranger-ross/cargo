@@ -287,7 +287,7 @@ impl RecursiveLock {
             self.is_exclusive = true;
             match gctx
                 .home()
-                .open_rw_exclusive_create(self.filename, gctx, description)
+                .open_rw_exclusive_create(self.filename, Some(gctx), description)
             {
                 Ok(lock) => self.lock = Some(lock),
                 Err(e) => {

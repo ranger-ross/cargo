@@ -207,7 +207,7 @@ impl Filesystem {
     pub fn open_rw_exclusive_create<P>(
         &self,
         path: P,
-        gctx: &GlobalContext,
+        gctx: Option<&GlobalContext>,
         msg: &str,
     ) -> CargoResult<FileLock>
     where
@@ -259,7 +259,7 @@ impl Filesystem {
         P: AsRef<Path>,
     {
         let (path, f) = self.open(path.as_ref(), &OpenOptions::new().read(true), false)?;
-        acquire(gctx, msg, &path, &|| try_lock_shared(&f), &|| {
+        acquire(Some(gctx), msg, &path, &|| try_lock_shared(&f), &|| {
             lock_shared(&f)
         })?;
         Ok(FileLock { f: Some(f), path })
@@ -279,7 +279,7 @@ impl Filesystem {
         let mut opts = OpenOptions::new();
         opts.read(true).write(true).create(true);
         let (path, f) = self.open(path.as_ref(), &opts, true)?;
-        acquire(gctx, msg, &path, &|| try_lock_shared(&f), &|| {
+        acquire(Some(gctx), msg, &path, &|| try_lock_shared(&f), &|| {
             lock_shared(&f)
         })?;
         Ok(FileLock { f: Some(f), path })
@@ -386,7 +386,7 @@ fn try_acquire(path: &Path, lock_try: &dyn Fn() -> io::Result<()>) -> CargoResul
 /// Returns an error if the lock could not be acquired or if any error other
 /// than a contention error happens.
 fn acquire(
-    gctx: &GlobalContext,
+    gctx: Option<&GlobalContext>,
     msg: &str,
     path: &Path,
     lock_try: &dyn Fn() -> io::Result<()>,
@@ -394,15 +394,18 @@ fn acquire(
 ) -> CargoResult<()> {
     if cfg!(debug_assertions) {
         // Force borrow to catch invalid borrows outside of contention situations
-        gctx.shell().verbosity();
+        if let Some(gctx) = gctx {
+            gctx.shell().verbosity();
+        }
     }
     if try_acquire(path, lock_try)? {
         return Ok(());
     }
-    let msg = format!("waiting for file lock on {}", msg);
-    gctx.shell()
-        .status_with_color("Blocking", &msg, &style::NOTE)?;
-
+    if let Some(gctx) = gctx {
+        let msg = format!("waiting for file lock on {}", msg);
+        gctx.shell()
+            .status_with_color("Blocking", &msg, &style::NOTE)?;
+    }
     lock_block().with_context(|| format!("failed to lock file: {}", path.display()))?;
     Ok(())
 }

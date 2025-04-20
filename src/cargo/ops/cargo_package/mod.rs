@@ -140,7 +140,7 @@ fn create_package(
     let dir = ws.target_dir().join("package");
     let mut dst = {
         let tmp = format!(".{}", filename);
-        dir.open_rw_exclusive_create(&tmp, gctx, "package scratch space")?
+        dir.open_rw_exclusive_create(&tmp, Some(gctx), "package scratch space")?
     };
 
     // Package up and test a temporary tarball and only move it to the final
@@ -1047,7 +1047,8 @@ struct TmpRegistry<'a> {
 impl<'a> TmpRegistry<'a> {
     fn new(gctx: &'a GlobalContext, root: Filesystem, upstream: SourceId) -> CargoResult<Self> {
         root.create_dir()?;
-        let _lock = root.open_rw_exclusive_create(".cargo-lock", gctx, "temporary registry")?;
+        let _lock =
+            root.open_rw_exclusive_create(".cargo-lock", Some(gctx), "temporary registry")?;
         let slf = Self {
             gctx,
             root,
@@ -1082,7 +1083,7 @@ impl<'a> TmpRegistry<'a> {
         {
             let mut tar_copy = self.root.open_rw_exclusive_create(
                 package.package_id().tarball_name(),
-                self.gctx,
+                Some(self.gctx),
                 "temporary package registry",
             )?;
             tar.file().seek(SeekFrom::Start(0))?;
@@ -1151,7 +1152,7 @@ impl<'a> TmpRegistry<'a> {
             cargo_util::registry::make_dep_path(&package.name().as_str().to_lowercase(), false);
         let mut dst = self.index_path().open_rw_exclusive_create(
             file,
-            self.gctx,
+            Some(self.gctx),
             "temporary package registry",
         )?;
         dst.write_all(index_line.as_bytes())?;

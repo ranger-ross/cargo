@@ -101,9 +101,12 @@ impl InstallTracker {
     /// Create an `InstallTracker` from information on disk.
     pub fn load(gctx: &GlobalContext, root: &Filesystem) -> CargoResult<InstallTracker> {
         let v1_lock =
-            root.open_rw_exclusive_create(Path::new(".crates.toml"), gctx, "crate metadata")?;
-        let v2_lock =
-            root.open_rw_exclusive_create(Path::new(".crates2.json"), gctx, "crate metadata")?;
+            root.open_rw_exclusive_create(Path::new(".crates.toml"), Some(gctx), "crate metadata")?;
+        let v2_lock = root.open_rw_exclusive_create(
+            Path::new(".crates2.json"),
+            Some(gctx),
+            "crate metadata",
+        )?;
 
         let v1 = (|| -> CargoResult<_> {
             let mut contents = String::new();

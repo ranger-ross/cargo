@@ -2506,7 +2506,7 @@ pub fn save_credentials(
     let mut file = {
         gctx.home_path.create_dir()?;
         gctx.home_path
-            .open_rw_exclusive_create(filename, gctx, "credentials' config file")?
+            .open_rw_exclusive_create(filename, Some(gctx), "credentials' config file")?
     };
 
     let mut contents = String::new();

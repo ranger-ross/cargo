@@ -403,6 +403,12 @@ impl<'a, 'gctx> BuildRunner<'a, 'gctx> {
                 .deps_output
                 .insert(kind, layout.deps().to_path_buf());
         }
+
+        for (unit, _) in self.bcx.unit_graph.iter() {
+            let dep_dir = self.files().deps_dir(unit);
+            std::fs::create_dir_all(dep_dir).context("couldn't prepare dep directories")?;
+        }
+
         Ok(())
     }
 

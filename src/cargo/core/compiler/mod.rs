@@ -1535,11 +1535,21 @@ fn build_deps_args(
     unit: &Unit,
 ) -> CargoResult<()> {
     let bcx = build_runner.bcx;
-    cmd.arg("-L").arg(&{
-        let mut deps = OsString::from("dependency=");
-        deps.push(build_runner.files().deps_dir(unit));
-        deps
-    });
+
+    // Recusively add all depenendency args to rustc process
+    fn add_dep_arg(cmd: &mut ProcessBuilder, build_runner: &BuildRunner<'_, '_>, unit: &Unit) {
+        cmd.arg("-L").arg(&{
+            let mut deps = OsString::from("dependency=");
+            deps.push(build_runner.files().deps_dir(&unit));
+            deps
+        });
+
+        for dep in build_runner.unit_deps(unit) {
+            add_dep_arg(cmd, build_runner, &dep.unit);
+        }
+    }
+
+    add_dep_arg(cmd, build_runner, unit);
 
     // Be sure that the host path is also listed. This'll ensure that proc macro
     // dependencies are correctly found (for reexported macros).

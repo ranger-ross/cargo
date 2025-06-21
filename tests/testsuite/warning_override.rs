@@ -1,6 +1,7 @@
 //! Tests for overriding warning behavior using `build.warnings` config option.
 
-use cargo_test_support::{cargo_test, project, str, tools, Project};
+use crate::utils::{ext::CargoProjectExt, tools};
+use cargo_test_support::{cargo_test, project, str, Project};
 
 fn make_project_with_rustc_warning() -> Project {
     project()

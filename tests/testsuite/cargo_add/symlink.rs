@@ -3,6 +3,8 @@ use cargo_test_support::project;
 use cargo_test_support::registry;
 use std::fs;
 
+use crate::utils::ext::CargoProjectExt;
+
 #[cargo_test]
 fn symlink_case() {
     if !cargo_test_support::symlink_supported() {

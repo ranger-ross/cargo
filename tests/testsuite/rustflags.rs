@@ -9,6 +9,8 @@ use cargo_test_support::{
 };
 use snapbox::assert_data_eq;
 
+use crate::utils::ext::CargoProjectExt;
+
 #[cargo_test]
 fn env_rustflags_normal_source() {
     let p = project()

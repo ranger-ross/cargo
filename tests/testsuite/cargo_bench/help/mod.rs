@@ -2,6 +2,8 @@ use cargo_test_support::file;
 use cargo_test_support::prelude::*;
 use cargo_test_support::str;
 
+use crate::utils::ext::CargoCommandExt;
+
 #[cargo_test]
 fn case() {
     snapbox::cmd::Command::cargo_ui()

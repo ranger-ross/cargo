@@ -7,6 +7,8 @@ use cargo_test_support::project;
 use cargo_test_support::registry::{self, api_path};
 use cargo_test_support::str;
 
+use crate::utils::ext::CargoProjectExt;
+
 fn setup(name: &str, content: Option<&str>) {
     let dir = api_path().join(format!("api/v1/crates/{}", name));
     dir.mkdir_p();

@@ -7,6 +7,8 @@ use cargo_test_support::project;
 use cargo_test_support::registry;
 use cargo_test_support::str;
 
+use crate::utils::ext::CargoProjectExt;
+
 fn setup(name: &str, version: &str) {
     let dir = registry::api_path().join(format!("api/v1/crates/{}/{}", name, version));
     dir.mkdir_p();

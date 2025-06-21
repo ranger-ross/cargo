@@ -5,6 +5,8 @@ use cargo_test_support::project;
 use cargo_test_support::registry::Package;
 use cargo_test_support::str;
 
+use crate::utils::ext::CargoProjectExt;
+
 #[cargo_test]
 fn dependency_warning_ignored() {
     let foo = project()

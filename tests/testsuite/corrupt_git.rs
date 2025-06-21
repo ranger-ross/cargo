@@ -8,6 +8,8 @@ use cargo_test_support::prelude::*;
 use cargo_test_support::{basic_manifest, git, project};
 use cargo_util::paths as cargopaths;
 
+use crate::utils::ext::CargoProjectExt;
+
 #[cargo_test]
 fn deleting_database_files() {
     let project = project();

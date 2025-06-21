@@ -3,6 +3,8 @@
 use cargo_test_support::prelude::*;
 use cargo_test_support::{basic_manifest, project, str};
 
+use crate::utils::ext::CargoProjectExt;
+
 macro_rules! x {
     ($tool:tt => $what:tt $(of $who:tt)?) => {{
         #[cfg(windows)]

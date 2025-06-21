@@ -5,6 +5,8 @@ use cargo_test_support::registry::Package;
 use cargo_test_support::str;
 use cargo_test_support::{project, registry};
 
+use crate::utils::ext::CargoProjectExt;
+
 #[cargo_test]
 fn feature_required() {
     let p = project()

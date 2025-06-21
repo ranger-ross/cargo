@@ -8,6 +8,8 @@ use cargo_test_support::{
 };
 use serde_json::json;
 
+use crate::utils::ext::CargoProjectExt;
+
 #[cargo_test]
 fn cargo_metadata_simple() {
     let p = project()

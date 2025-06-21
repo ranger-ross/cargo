@@ -13,6 +13,8 @@ use cargo_test_support::registry::{self, Package, RegistryBuilder};
 use cargo_test_support::str;
 use cargo_test_support::{basic_lib_manifest, basic_manifest, paths, project, Project};
 
+use crate::utils::ext::CargoProjectExt;
+
 #[cargo_test]
 fn vendor_simple() {
     let p = project()

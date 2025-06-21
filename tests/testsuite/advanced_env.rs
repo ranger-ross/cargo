@@ -3,6 +3,8 @@
 use cargo_test_support::prelude::*;
 use cargo_test_support::{paths, project, registry::Package};
 
+use crate::utils::ext::CargoProjectExt;
+
 #[cargo_test]
 fn source_config_env() {
     // Try to define [source] with environment variables.

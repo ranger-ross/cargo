@@ -3,6 +3,8 @@
 //! Ideally these should never happen, but I don't think we'll ever be able to
 //! prevent all collisions.
 
+use crate::utils::cross_compile::disabled as cross_compile_disabled;
+use crate::utils::ext::CargoProjectExt;
 use cargo_test_support::prelude::*;
 use cargo_test_support::registry::Package;
 use cargo_test_support::str;
@@ -470,7 +472,7 @@ the same path; see <https://github.com/rust-lang/cargo/issues/6313>.
 #[cargo_test]
 fn collision_doc_target() {
     // collision in doc with --target, doesn't fail due to orphans
-    if cross_compile::disabled() {
+    if cross_compile_disabled() {
         return;
     }
 

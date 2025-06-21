@@ -6,6 +6,8 @@ use cargo_test_support::prelude::*;
 use cargo_test_support::registry::Package;
 use cargo_test_support::{basic_manifest, project, str};
 
+use crate::utils::ext::CargoProjectExt;
+
 #[cargo_test]
 fn override_simple() {
     Package::new("bar", "0.1.0").publish();

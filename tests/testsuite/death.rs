@@ -9,6 +9,8 @@ use std::thread;
 use cargo_test_support::prelude::*;
 use cargo_test_support::{project, slow_cpu_multiplier};
 
+use crate::utils::ext::CargoProjectExt;
+
 #[cargo_test]
 fn ctrl_c_kills_everyone() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();

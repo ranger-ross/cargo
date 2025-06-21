@@ -12,6 +12,8 @@ use cargo_test_support::registry::{Dependency, Package};
 use cargo_test_support::ProjectBuilder;
 use cargo_test_support::{paths, project, rustc_host, str, Execs};
 
+use crate::utils::ext::CargoProjectExt;
+
 struct Setup {
     rustc_wrapper: PathBuf,
     real_sysroot: String,

@@ -7,7 +7,7 @@ use std::sync::mpsc::channel;
 use std::thread;
 use std::{env, str};
 
-use cargo_test_support::cargo_process;
+use crate::utils::cargo_process;
 use cargo_test_support::git;
 use cargo_test_support::install::assert_has_installed_exe;
 use cargo_test_support::paths;
@@ -15,6 +15,8 @@ use cargo_test_support::prelude::*;
 use cargo_test_support::registry::Package;
 use cargo_test_support::str;
 use cargo_test_support::{basic_manifest, execs, project, slow_cpu_multiplier};
+
+use crate::utils::ext::CargoProjectExt;
 
 fn pkg(name: &str, vers: &str) {
     Package::new(name, vers)

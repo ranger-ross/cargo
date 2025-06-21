@@ -15,6 +15,8 @@ use cargo_test_support::{paths, project, str};
 use cargo_test_support::{prelude::*, Project};
 use std::env::consts::{DLL_PREFIX, DLL_SUFFIX, EXE_SUFFIX};
 
+use crate::utils::ext::CargoProjectExt;
+
 #[cargo_test]
 fn verify_build_dir_is_disabled_by_feature_flag() {
     let p = project()

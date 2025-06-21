@@ -3,6 +3,8 @@
 use cargo_test_support::prelude::*;
 use cargo_test_support::{basic_bin_manifest, main_file, project, str};
 
+use crate::utils::ext::CargoProjectExt;
+
 #[track_caller]
 fn assert_not_a_cargo_toml(command: &str, manifest_path_argument: &str) {
     let p = project()

@@ -7,7 +7,6 @@ use std::sync::Arc;
 use std::sync::Mutex;
 
 use cargo::core::SourceId;
-use cargo_test_support::cargo_process;
 use cargo_test_support::paths;
 use cargo_test_support::prelude::*;
 use cargo_test_support::registry::{
@@ -16,6 +15,9 @@ use cargo_test_support::registry::{
 use cargo_test_support::{basic_manifest, project, str};
 use cargo_test_support::{git, t};
 use cargo_util::paths::remove_dir_all;
+
+use crate::utils::cargo_process;
+use crate::utils::ext::CargoProjectExt;
 
 fn setup_http() -> TestRegistry {
     RegistryBuilder::new().http_index().build()

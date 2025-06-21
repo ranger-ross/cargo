@@ -9,6 +9,8 @@ use cargo_test_support::{
     str, Execs,
 };
 
+use crate::utils::ext::CargoProjectExt;
+
 #[cargo_test]
 fn offline_unused_target_dep() {
     // --offline with a target dependency that is not used and not downloaded.

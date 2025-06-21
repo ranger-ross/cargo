@@ -1,9 +1,11 @@
 //! Common executables that can be reused by various tests.
 
-use crate::{basic_manifest, paths, project, Project};
+use cargo_test_support::{basic_manifest, paths, project, Project};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::OnceLock;
+
+use super::ext::CargoProjectExt;
 
 static ECHO_WRAPPER: OnceLock<Mutex<Option<PathBuf>>> = OnceLock::new();
 static ECHO: OnceLock<Mutex<Option<PathBuf>>> = OnceLock::new();

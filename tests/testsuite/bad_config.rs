@@ -6,6 +6,8 @@ use cargo_test_support::registry::{self, Package};
 use cargo_test_support::str;
 use cargo_test_support::{basic_manifest, project, rustc_host};
 
+use crate::utils::ext::CargoProjectExt;
+
 #[cargo_test]
 fn bad1() {
     let p = project()

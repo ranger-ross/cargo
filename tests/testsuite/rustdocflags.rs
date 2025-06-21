@@ -6,6 +6,8 @@ use cargo_test_support::rustc_host;
 use cargo_test_support::rustc_host_env;
 use cargo_test_support::str;
 
+use crate::utils::ext::CargoProjectExt;
+
 #[cargo_test]
 fn parses_env() {
     let p = project().file("src/lib.rs", "").build();

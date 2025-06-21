@@ -13,6 +13,8 @@ use cargo_test_support::{
 use flate2::read::GzDecoder;
 use tar::Archive;
 
+use crate::utils::ext::CargoProjectExt;
+
 #[cargo_test]
 fn simple() {
     let p = project()

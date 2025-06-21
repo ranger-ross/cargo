@@ -5,6 +5,8 @@ use cargo_test_support::registry::Package;
 use cargo_test_support::{basic_lib_manifest, paths, project, str};
 use cargo_util_schemas::manifest::TomlDebugInfo;
 
+use crate::utils::ext::CargoProjectExt;
+
 // TODO: this should be remove once -Zprofile-rustflags is stabilized
 #[cargo_test]
 fn rustflags_works_with_zflag() {

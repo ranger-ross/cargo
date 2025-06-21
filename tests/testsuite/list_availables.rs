@@ -6,6 +6,8 @@ use cargo_test_support::project;
 use cargo_test_support::str;
 use snapbox::IntoData;
 
+use crate::utils::ext::CargoProjectExt;
+
 fn list_availables_test(command: &str, expected: ExpectedSnapshots<impl IntoData>) {
     let full_project = project()
         .file("examples/a.rs", "fn main() { }")

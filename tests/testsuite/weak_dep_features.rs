@@ -7,6 +7,8 @@ use cargo_test_support::registry::{Dependency, Package, RegistryBuilder};
 use cargo_test_support::str;
 use cargo_test_support::{project, publish};
 
+use crate::utils::ext::CargoProjectExt;
+
 use super::features2::switch_to_resolver_2;
 
 // Helper to create lib.rs files that check features.

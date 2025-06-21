@@ -6,6 +6,8 @@ use cargo_test_support::{
     basic_lib_manifest, basic_manifest, git, paths, project, publish, registry, str,
 };
 
+use crate::utils::ext::CargoProjectExt;
+
 #[cargo_test]
 fn permit_additional_workspace_fields() {
     let p = project()

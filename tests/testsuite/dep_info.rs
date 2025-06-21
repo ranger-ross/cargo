@@ -12,6 +12,8 @@ use cargo_test_support::{assert_deps, assert_deps_contains};
 use cargo_test_support::{basic_bin_manifest, basic_manifest, main_file, project, rustc_host};
 use filetime::FileTime;
 
+use crate::utils::ext::CargoProjectExt;
+
 #[cargo_test]
 fn build_dep_info() {
     let p = project()

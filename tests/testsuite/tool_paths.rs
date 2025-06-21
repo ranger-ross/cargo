@@ -3,6 +3,8 @@
 use cargo_test_support::prelude::*;
 use cargo_test_support::{basic_lib_manifest, project, rustc_host, rustc_host_env, str};
 
+use crate::utils::ext::CargoProjectExt;
+
 #[cargo_test]
 fn pathless_tools() {
     let target = rustc_host();

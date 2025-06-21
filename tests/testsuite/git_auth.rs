@@ -14,6 +14,8 @@ use cargo_test_support::paths;
 use cargo_test_support::prelude::*;
 use cargo_test_support::project;
 
+use crate::utils::ext::CargoProjectExt;
+
 fn setup_failed_auth_test() -> (SocketAddr, JoinHandle<()>, Arc<AtomicUsize>) {
     let server = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = server.local_addr().unwrap();

@@ -17,6 +17,8 @@ use cargo_test_support::registry::Package;
 use cargo_test_support::{basic_lib_manifest, basic_manifest, git, main_file, project};
 use cargo_test_support::{sleep_ms, str, t, Project};
 
+use crate::utils::ext::CargoProjectExt;
+
 #[cargo_test]
 fn cargo_compile_simple_git_dep() {
     let project = project();

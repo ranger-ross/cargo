@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::str;
 
+use crate::utils::ext::CargoProjectExt;
 use crate::utils::tools::echo_subcommand;
 use cargo_test_support::basic_manifest;
 use cargo_test_support::prelude::*;

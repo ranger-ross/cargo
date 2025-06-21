@@ -18,6 +18,8 @@ use cargo_test_support::{
 };
 use filetime::FileTime;
 
+use crate::utils::ext::CargoProjectExt;
+
 use super::death;
 
 #[cargo_test]

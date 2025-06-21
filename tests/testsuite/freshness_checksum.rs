@@ -13,6 +13,8 @@ use cargo_test_support::{
     basic_lib_manifest, basic_manifest, project, rustc_host, rustc_host_env, str,
 };
 
+use crate::utils::ext::CargoProjectExt;
+
 use super::death;
 
 #[cargo_test]

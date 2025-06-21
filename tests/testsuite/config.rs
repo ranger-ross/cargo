@@ -23,6 +23,8 @@ use cargo_util_schemas::manifest::TomlTrimPathsValue;
 use cargo_util_schemas::manifest::{self as cargo_toml, TomlDebugInfo, VecStringOrBool as VSOB};
 use serde::Deserialize;
 
+use crate::utils::ext::CargoProjectExt;
+
 /// Helper for constructing a `GlobalContext` object.
 pub struct GlobalContextBuilder {
     env: HashMap<String, String>,

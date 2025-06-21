@@ -8,6 +8,8 @@ use cargo_test_support::prelude::*;
 use cargo_test_support::project;
 use cargo_test_support::str;
 
+use crate::utils::ext::CargoProjectExt;
+
 #[cargo_test(container_test)]
 fn self_signed_should_fail() {
     // Cargo should not allow a connection to a self-signed certificate.

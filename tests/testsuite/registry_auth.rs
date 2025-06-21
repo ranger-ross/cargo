@@ -6,6 +6,8 @@ use cargo_test_support::registry::{Package, RegistryBuilder, Token};
 use cargo_test_support::str;
 use cargo_test_support::{project, Execs, Project};
 
+use crate::utils::ext::CargoProjectExt;
+
 fn cargo(p: &Project, s: &str) -> Execs {
     let mut e = p.cargo(s);
     e.masquerade_as_nightly_cargo(&["asymmetric-token"])

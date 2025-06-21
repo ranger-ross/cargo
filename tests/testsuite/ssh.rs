@@ -14,6 +14,8 @@ use cargo_test_support::git::cargo_uses_gitoxide;
 use cargo_test_support::prelude::*;
 use cargo_test_support::{paths, process, project, str, Project};
 
+use crate::utils::ext::CargoProjectExt;
+
 fn ssh_repo_url(container: &ContainerHandle, name: &str) -> String {
     let port = container.port_mappings[&22];
     format!("ssh://testuser@127.0.0.1:{port}/repos/{name}.git")

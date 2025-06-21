@@ -13,6 +13,8 @@ use cargo_test_support::prelude::*;
 use cargo_test_support::{project, rustc_host, str};
 use cargo_util::is_ci;
 
+use crate::utils::ext::CargoProjectExt;
+
 const EXE_CONTENT: &str = r#"
 use std::env;
 

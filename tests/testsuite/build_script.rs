@@ -8,6 +8,7 @@ use std::thread;
 use crate::utils::cross_compile::{
     can_run_on_host as cross_compile_can_run_on_host, disabled as cross_compile_disabled,
 };
+use crate::utils::ext::CargoProjectExt;
 use crate::utils::tools;
 use cargo_test_support::compare::assert_e2e;
 use cargo_test_support::paths::cargo_home;

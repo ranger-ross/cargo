@@ -9,6 +9,8 @@ use cargo_test_support::sleep_ms;
 use cargo_test_support::str;
 use cargo_test_support::{basic_manifest, project};
 
+use crate::utils::ext::CargoProjectExt;
+
 #[cargo_test]
 fn binary_with_debug() {
     let p = project()

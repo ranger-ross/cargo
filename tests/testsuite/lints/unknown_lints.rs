@@ -1,3 +1,4 @@
+use crate::utils::ext::CargoProjectExt;
 use cargo_test_support::prelude::*;
 use cargo_test_support::project;
 use cargo_test_support::str;

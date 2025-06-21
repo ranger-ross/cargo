@@ -1,5 +1,6 @@
 //! Tests for caching compiler diagnostics.
 
+use crate::utils::ext::CargoProjectExt;
 use crate::utils::tools;
 use cargo_test_support::prelude::*;
 use cargo_test_support::str;

@@ -16,6 +16,8 @@ use cargo_test_support::registry::Package;
 use cargo_test_support::str;
 use cargo_test_support::{basic_manifest, execs, project, slow_cpu_multiplier};
 
+use crate::utils::ext::CargoProjectExt;
+
 fn pkg(name: &str, vers: &str) {
     Package::new(name, vers)
         .file("src/main.rs", "fn main() {{}}")

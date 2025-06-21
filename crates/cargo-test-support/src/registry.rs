@@ -2,7 +2,7 @@
 //!
 //! # Example
 //!
-//! ```no_run
+//! ```ignore
 //! use cargo_test_support::registry::Package;
 //! use cargo_test_support::project;
 //! use cargo_test_support::str;

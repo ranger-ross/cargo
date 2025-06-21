@@ -4,6 +4,8 @@ use cargo_test_support::prelude::*;
 use cargo_test_support::registry::{self, Package};
 use cargo_test_support::{paths, project, str, Project};
 
+use crate::utils::ext::CargoProjectExt;
+
 fn basic_project() -> Project {
     Package::new("bar", "1.0.0")
         .file("src/lib.rs", "pub struct Straw;")

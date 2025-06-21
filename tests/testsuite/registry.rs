@@ -17,6 +17,8 @@ use cargo_test_support::{basic_manifest, project, str};
 use cargo_test_support::{git, t};
 use cargo_util::paths::remove_dir_all;
 
+use crate::utils::ext::CargoProjectExt;
+
 fn setup_http() -> TestRegistry {
     RegistryBuilder::new().http_index().build()
 }

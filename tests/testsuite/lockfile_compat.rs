@@ -7,6 +7,8 @@ use cargo_test_support::registry::Package;
 use cargo_test_support::str;
 use cargo_test_support::{basic_lib_manifest, basic_manifest, project};
 
+use crate::utils::ext::CargoProjectExt;
+
 #[cargo_test]
 fn oldest_lockfile_still_works() {
     let cargo_commands = vec!["build", "update"];

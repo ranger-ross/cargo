@@ -6,6 +6,8 @@ use cargo_test_support::prelude::*;
 use cargo_test_support::registry::{Dependency, Package};
 use cargo_test_support::{basic_manifest, project, str};
 
+use crate::utils::ext::CargoProjectExt;
+
 use super::features2::switch_to_resolver_2;
 
 #[cargo_test]

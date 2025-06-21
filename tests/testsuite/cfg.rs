@@ -5,6 +5,8 @@ use cargo_test_support::registry::Package;
 use cargo_test_support::rustc_host;
 use cargo_test_support::{basic_manifest, project, str};
 
+use crate::utils::ext::CargoProjectExt;
+
 #[cargo_test]
 fn cfg_easy() {
     let p = project()

@@ -8,6 +8,8 @@ use cargo_test_support::{
     basic_manifest, cargo_process, git, paths, project, publish::validate_crate_contents, str,
 };
 
+use crate::utils::ext::CargoProjectExt;
+
 fn pl_manifest(name: &str, version: &str, extra: &str) -> String {
     format!(
         r#"

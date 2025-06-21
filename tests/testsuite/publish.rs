@@ -9,6 +9,8 @@ use cargo_test_support::registry::{self, Package, RegistryBuilder, Response};
 use cargo_test_support::{basic_manifest, project, publish, str};
 use cargo_test_support::{paths, Project};
 
+use crate::utils::ext::CargoProjectExt;
+
 const CLEAN_FOO_JSON: &str = r#"
     {
         "authors": [],

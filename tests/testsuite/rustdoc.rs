@@ -5,6 +5,7 @@ use cargo_test_support::str;
 use cargo_test_support::{basic_manifest, cross_compile, project};
 
 use crate::utils::cross_compile::disabled as cross_compile_disabled;
+use crate::utils::ext::CargoProjectExt;
 
 #[cargo_test]
 fn rustdoc_simple() {

@@ -5,6 +5,8 @@
 use cargo_test_support::prelude::*;
 use cargo_test_support::{basic_manifest, project, str, Project};
 
+use crate::utils::ext::CargoProjectExt;
+
 fn all_target_project() -> Project {
     // This abuses the `codegen-units` setting so that we can verify exactly
     // which profile is used for each compiler invocation.

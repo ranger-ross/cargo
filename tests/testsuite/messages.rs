@@ -7,6 +7,8 @@ use cargo_test_support::prelude::*;
 use cargo_test_support::{process, project, Project};
 use cargo_util::ProcessError;
 
+use crate::utils::ext::CargoProjectExt;
+
 /// Captures the actual diagnostics displayed by rustc. This is done to avoid
 /// relying on the exact message formatting in rustc.
 pub fn raw_rustc_output(project: &Project, path: &str, extra: &[&str]) -> String {

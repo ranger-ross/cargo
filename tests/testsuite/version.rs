@@ -3,6 +3,8 @@
 use cargo_test_support::prelude::*;
 use cargo_test_support::{cargo_process, project};
 
+use crate::utils::ext::CargoProjectExt;
+
 #[cargo_test]
 fn simple() {
     let p = project().build();

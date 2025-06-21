@@ -8,6 +8,8 @@ use cargo_test_support::{
     str, Project,
 };
 
+use crate::utils::ext::CargoProjectExt;
+
 #[cargo_test]
 fn metabuild_gated() {
     let p = project()

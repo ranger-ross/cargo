@@ -27,6 +27,8 @@ use cargo_test_support::{
 };
 use itertools::Itertools;
 
+use crate::utils::ext::CargoProjectExt;
+
 use super::config::GlobalContextBuilder;
 
 /// Helper to create a simple `foo` project which depends on a registry

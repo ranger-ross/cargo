@@ -3,6 +3,8 @@
 use cargo_test_support::prelude::*;
 use cargo_test_support::{project, str, Project};
 
+use crate::utils::ext::CargoProjectExt;
+
 #[cargo_test]
 fn build_example() {
     full_project()

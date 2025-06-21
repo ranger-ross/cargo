@@ -6,6 +6,8 @@ use cargo_test_support::{
 };
 use cargo_util::paths::dylib_path_envvar;
 
+use crate::utils::ext::CargoProjectExt;
+
 #[cargo_test]
 fn simple() {
     let p = project()

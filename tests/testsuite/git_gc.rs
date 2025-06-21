@@ -12,6 +12,8 @@ use cargo_test_support::project;
 use cargo_test_support::registry::Package;
 use url::Url;
 
+use crate::utils::ext::CargoProjectExt;
+
 pub fn find_index() -> PathBuf {
     let dir = paths::home().join(".cargo/registry/index");
     dir.read_dir().unwrap().next().unwrap().unwrap().path()

@@ -19,6 +19,7 @@ use cargo_test_support::{
 use cargo_util::{ProcessBuilder, ProcessError};
 
 use crate::utils::cross_compile::disabled as cross_compile_disabled;
+use crate::utils::ext::CargoProjectExt;
 use cargo_test_support::install::{assert_has_installed_exe, assert_has_not_installed_exe, exe};
 use cargo_test_support::paths;
 

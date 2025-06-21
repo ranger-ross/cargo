@@ -11,6 +11,8 @@ use glob::GlobError;
 use std::env;
 use std::path::{Path, PathBuf};
 
+use crate::utils::ext::CargoProjectExt;
+
 #[cargo_test]
 fn cargo_clean_simple() {
     let p = project()

@@ -10,6 +10,7 @@ use cargo_test_support::{basic_bin_manifest, basic_manifest, cross_compile, proj
 use crate::utils::cross_compile::{
     can_run_on_host as cross_compile_can_run_on_host, disabled as cross_compile_disabled,
 };
+use crate::utils::ext::CargoProjectExt;
 
 #[cargo_test]
 fn simple_cross() {

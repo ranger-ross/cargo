@@ -4,6 +4,8 @@ use cargo_test_support::prelude::*;
 use cargo_test_support::registry::Package;
 use cargo_test_support::{basic_lib_manifest, basic_manifest, project, str};
 
+use crate::utils::ext::CargoProjectExt;
+
 #[cargo_test]
 fn profile_override_basic() {
     let p = project()

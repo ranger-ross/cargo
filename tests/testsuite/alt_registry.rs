@@ -9,6 +9,8 @@ use cargo_test_support::registry::{self, Package, RegistryBuilder};
 use cargo_test_support::str;
 use cargo_test_support::{basic_manifest, paths, project};
 
+use crate::utils::ext::CargoProjectExt;
+
 #[cargo_test]
 fn depend_on_alt_registry() {
     registry::alt_init();

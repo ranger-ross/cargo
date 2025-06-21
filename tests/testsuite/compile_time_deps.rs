@@ -1,6 +1,8 @@
 use cargo_test_support::prelude::*;
 use cargo_test_support::{project, str};
 
+use crate::utils::ext::CargoProjectExt;
+
 #[cargo_test]
 fn gated_by_unstable_opts() {
     let p = project()

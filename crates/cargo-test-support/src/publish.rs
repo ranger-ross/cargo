@@ -2,7 +2,7 @@
 //!
 //! # Example
 //!
-//! ```no_run
+//! ```ignore
 //! # use cargo_test_support::registry::RegistryBuilder;
 //! # use cargo_test_support::publish::validate_upload;
 //! # use cargo_test_support::project;

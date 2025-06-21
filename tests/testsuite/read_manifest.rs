@@ -3,6 +3,8 @@
 use cargo_test_support::prelude::*;
 use cargo_test_support::{basic_bin_manifest, main_file, project, str};
 
+use crate::utils::ext::CargoProjectExt;
+
 pub fn basic_bin_manifest_with_readme(name: &str, readme_filename: &str) -> String {
     format!(
         r#"

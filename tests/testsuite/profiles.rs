@@ -6,6 +6,8 @@ use cargo_test_support::prelude::*;
 use cargo_test_support::registry::Package;
 use cargo_test_support::{project, rustc_host, str};
 
+use crate::utils::ext::CargoProjectExt;
+
 #[cargo_test]
 fn profile_overrides() {
     let p = project()

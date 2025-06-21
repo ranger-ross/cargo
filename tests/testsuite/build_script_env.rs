@@ -6,6 +6,8 @@ use cargo_test_support::project;
 use cargo_test_support::sleep_ms;
 use cargo_test_support::str;
 
+use crate::utils::ext::CargoProjectExt;
+
 #[cargo_test]
 fn rerun_if_env_changes() {
     let p = project()

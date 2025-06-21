@@ -5,6 +5,8 @@ use cargo_test_support::project;
 use cargo_test_support::registry::{Package, RegistryBuilder, TestRegistry};
 use cargo_test_support::str;
 
+use crate::utils::ext::CargoProjectExt;
+
 fn setup() -> (TestRegistry, String) {
     let alt = RegistryBuilder::new().alternative().build();
     (

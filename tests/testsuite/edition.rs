@@ -4,6 +4,8 @@ use cargo::core::Edition;
 use cargo_test_support::prelude::*;
 use cargo_test_support::{basic_lib_manifest, project, str};
 
+use crate::utils::ext::CargoProjectExt;
+
 #[cargo_test]
 fn edition_works_for_build_script() {
     let p = project()

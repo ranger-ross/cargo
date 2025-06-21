@@ -11,6 +11,8 @@ use cargo_test_support::{
     basic_bin_manifest, cargo_process, cargo_test, paths, project, symlink_supported,
     ProjectBuilder,
 };
+
+use crate::utils::ext::CargoProjectExt;
 ///////////////////////////////
 //// Unstable feature tests start
 ///////////////////////////////

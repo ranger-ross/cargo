@@ -11,6 +11,8 @@ use cargo_test_support::prelude::*;
 use cargo_test_support::registry::Package;
 use cargo_test_support::{basic_manifest, project, str, Project};
 
+use crate::utils::ext::CargoProjectExt;
+
 use super::config::write_config_toml;
 
 // An arbitrary lint (unused_variables) that triggers a lint.

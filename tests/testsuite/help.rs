@@ -9,6 +9,8 @@ use cargo_test_support::registry::Package;
 use cargo_test_support::str;
 use cargo_test_support::{basic_manifest, cargo_process, paths, project};
 
+use crate::utils::ext::CargoProjectExt;
+
 #[cargo_test]
 fn help() {
     cargo_process("").run();

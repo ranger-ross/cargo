@@ -5,6 +5,8 @@ use cargo_test_support::project;
 use cargo_test_support::registry::{Dependency, Package};
 use cargo_test_support::str;
 
+use crate::utils::ext::CargoProjectExt;
+
 #[cargo_test(nightly, reason = "exported_private_dependencies lint is unstable")]
 fn exported_priv_warning() {
     Package::new("priv_dep", "0.1.0")

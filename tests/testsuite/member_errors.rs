@@ -12,6 +12,8 @@ use cargo_test_support::project;
 use cargo_test_support::registry;
 use cargo_test_support::str;
 
+use crate::utils::ext::CargoProjectExt;
+
 /// Tests inclusion of a `ManifestError` pointing to a member manifest
 /// when that manifest fails to deserialize.
 #[cargo_test]

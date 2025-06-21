@@ -2,8 +2,9 @@
 
 use cargo_test_support::prelude::*;
 use cargo_test_support::registry::{Package, TestRegistry};
-use cargo_test_support::{basic_manifest, cargo_process, paths, project, registry, str, Project};
+use cargo_test_support::{basic_manifest, paths, project, registry, str, Project};
 
+use crate::utils::cargo_process;
 use crate::utils::ext::CargoProjectExt;
 
 fn toml_bin(proj: &Project, name: &str) -> String {

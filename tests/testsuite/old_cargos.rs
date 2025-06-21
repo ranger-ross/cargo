@@ -15,10 +15,11 @@ use std::fs;
 use cargo::CargoResult;
 use cargo_test_support::prelude::*;
 use cargo_test_support::registry::{self, Dependency, Package};
-use cargo_test_support::{cargo_exe, execs, paths, process, project, rustc_host, str};
+use cargo_test_support::{execs, paths, process, project, rustc_host, str};
 use cargo_util::{ProcessBuilder, ProcessError};
 use semver::Version;
 
+use crate::utils::cargo_exe;
 use crate::utils::ext::CargoProjectExt;
 
 fn tc_process(cmd: &str, toolchain: &str) -> ProcessBuilder {

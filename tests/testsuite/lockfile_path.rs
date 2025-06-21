@@ -8,11 +8,12 @@ use cargo_test_support::compare::assert_e2e;
 use cargo_test_support::install::assert_has_installed_exe;
 use cargo_test_support::registry::{Package, RegistryBuilder};
 use cargo_test_support::{
-    basic_bin_manifest, cargo_process, cargo_test, paths, project, symlink_supported,
-    ProjectBuilder,
+    basic_bin_manifest, cargo_test, paths, project, symlink_supported, ProjectBuilder,
 };
 
+use crate::utils::cargo_process;
 use crate::utils::ext::CargoProjectExt;
+
 ///////////////////////////////
 //// Unstable feature tests start
 ///////////////////////////////

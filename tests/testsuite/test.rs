@@ -12,6 +12,7 @@ use cargo_test_support::{rustc_host, rustc_host_env, sleep_ms};
 use cargo_util::paths::dylib_path_envvar;
 
 use crate::utils::cross_compile::can_run_on_host as cross_compile_can_run_on_host;
+use crate::utils::ext::CargoProjectExt;
 
 #[cargo_test]
 fn cargo_test_simple() {

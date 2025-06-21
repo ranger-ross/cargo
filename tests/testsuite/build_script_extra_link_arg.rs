@@ -9,6 +9,8 @@ use cargo_test_support::registry::Package;
 use cargo_test_support::str;
 use cargo_test_support::{basic_bin_manifest, basic_lib_manifest, basic_manifest, project};
 
+use crate::utils::ext::CargoProjectExt;
+
 #[cargo_test]
 fn build_script_extra_link_arg_bin() {
     let p = project()

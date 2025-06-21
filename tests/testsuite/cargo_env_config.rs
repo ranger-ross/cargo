@@ -5,6 +5,8 @@ use cargo_test_support::prelude::*;
 use cargo_test_support::str;
 use cargo_test_support::{basic_bin_manifest, project};
 
+use crate::utils::ext::CargoProjectExt;
+
 #[cargo_test]
 fn env_basic() {
     let p = project()

@@ -1,6 +1,7 @@
 //! Tests for the `cargo tree` command.
 
 use crate::utils::cross_compile::disabled as cross_compile_disabled;
+use crate::utils::ext::CargoProjectExt;
 use cargo_test_support::cross_compile::alternate;
 use cargo_test_support::prelude::*;
 use cargo_test_support::registry::{Dependency, Package};

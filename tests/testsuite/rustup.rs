@@ -10,6 +10,8 @@ use cargo_test_support::paths::{home, root};
 use cargo_test_support::prelude::*;
 use cargo_test_support::{cargo_process, process, project, str};
 
+use crate::utils::ext::CargoProjectExt;
+
 /// Helper to generate an executable.
 fn make_exe(dest: &Path, name: &str, contents: &str, env: &[(&str, PathBuf)]) -> PathBuf {
     let rs_name = format!("{name}.rs");

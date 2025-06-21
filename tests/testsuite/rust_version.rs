@@ -3,6 +3,8 @@
 use cargo_test_support::prelude::*;
 use cargo_test_support::{cargo_process, project, registry::Package, str};
 
+use crate::utils::ext::CargoProjectExt;
+
 #[cargo_test]
 fn rust_version_satisfied() {
     let p = project()

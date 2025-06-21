@@ -3,6 +3,7 @@
 use crate::utils::cross_compile::{
     can_run_on_host as cross_compile_can_run_on_host, disabled as cross_compile_disabled,
 };
+use crate::utils::ext::CargoProjectExt;
 use cargo_test_support::prelude::*;
 use cargo_test_support::{basic_manifest, cross_compile, project, rustc_host, str};
 

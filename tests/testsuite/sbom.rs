@@ -9,6 +9,8 @@ use cargo_test_support::project;
 use cargo_test_support::registry::Package;
 use snapbox::IntoData;
 
+use crate::utils::ext::CargoProjectExt;
+
 const SBOM_FILE_EXTENSION: &str = ".cargo-sbom.json";
 
 fn append_sbom_suffix(link: &PathBuf) -> PathBuf {

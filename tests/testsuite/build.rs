@@ -5,6 +5,7 @@ use std::fs;
 use std::io::Read;
 use std::process::Stdio;
 
+use crate::utils::ext::CargoProjectExt;
 use crate::utils::tools;
 use cargo::core::compiler::UserIntent;
 use cargo::core::Shell;

@@ -2,6 +2,7 @@
 
 use std::env;
 
+use crate::utils::ext::CargoProjectExt;
 use crate::utils::tools::echo_subcommand;
 use cargo_test_support::prelude::*;
 use cargo_test_support::str;

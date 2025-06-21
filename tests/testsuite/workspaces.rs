@@ -8,6 +8,8 @@ use cargo_test_support::registry::Package;
 use cargo_test_support::str;
 use cargo_test_support::{basic_lib_manifest, basic_manifest, git, project, sleep_ms};
 
+use crate::utils::ext::CargoProjectExt;
+
 #[cargo_test]
 fn simple_explicit() {
     let p = project()

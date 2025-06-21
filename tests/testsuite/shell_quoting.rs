@@ -6,6 +6,8 @@ use cargo_test_support::prelude::*;
 use cargo_test_support::project;
 use cargo_test_support::str;
 
+use crate::utils::ext::CargoProjectExt;
+
 #[cargo_test]
 fn features_are_quoted() {
     let p = project()

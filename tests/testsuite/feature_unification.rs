@@ -3,6 +3,8 @@
 use cargo_test_support::prelude::*;
 use cargo_test_support::{basic_manifest, cargo_process, project, str};
 
+use crate::utils::ext::CargoProjectExt;
+
 #[cargo_test]
 fn workspace_feature_unification() {
     let p = project()

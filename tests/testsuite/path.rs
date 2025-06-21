@@ -9,11 +9,15 @@ use cargo_test_support::str;
 use cargo_test_support::{basic_lib_manifest, basic_manifest, main_file, project};
 use cargo_test_support::{sleep_ms, t};
 
+use crate::utils::ext::CargoProjectExt;
+
 #[cargo_test]
 // I have no idea why this is failing spuriously on Windows;
 // for more info, see #3466.
 #[cfg(not(windows))]
 fn cargo_compile_with_nested_deps_shorthand() {
+    use crate::utils::ext::CargoProjectExt;
+
     let p = project()
         .file(
             "Cargo.toml",

@@ -3,6 +3,7 @@
 use std::fs;
 use std::str;
 
+use crate::utils::ext::CargoProjectExt;
 use crate::utils::tools;
 use cargo::core::compiler::RustDocFingerprint;
 use cargo_test_support::prelude::*;

@@ -3,6 +3,8 @@
 use cargo_test_support::prelude::*;
 use cargo_test_support::{basic_bin_manifest, basic_lib_manifest, basic_manifest, project, str};
 
+use crate::utils::ext::CargoProjectExt;
+
 #[cargo_test]
 fn build_lib_for_foo() {
     let p = project()

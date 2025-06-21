@@ -17,6 +17,7 @@
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 
+use crate::utils::ext::CargoProjectExt;
 use crate::utils::tools;
 use cargo_test_support::prelude::*;
 use cargo_test_support::{basic_manifest, paths, project, str, Execs};

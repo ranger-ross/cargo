@@ -13,6 +13,8 @@ use cargo_test_support::str;
 use cargo_test_support::{basic_manifest, project, t, ProjectBuilder};
 use serde::Serialize;
 
+use crate::utils::ext::CargoProjectExt;
+
 fn setup() {
     let root = paths::root();
     t!(fs::create_dir(&root.join(".cargo")));

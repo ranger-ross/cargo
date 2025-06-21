@@ -4,6 +4,8 @@ use cargo_test_support::prelude::*;
 use cargo_test_support::project;
 use cargo_test_support::str;
 
+use crate::utils::ext::CargoProjectExt;
+
 #[cargo_test(nightly, reason = "rustdoc scrape examples flags are unstable")]
 fn basic() {
     let p = project()

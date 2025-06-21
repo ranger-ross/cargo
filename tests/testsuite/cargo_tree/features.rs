@@ -5,6 +5,8 @@ use cargo_test_support::project;
 use cargo_test_support::registry::{Dependency, Package};
 use cargo_test_support::str;
 
+use crate::utils::ext::CargoProjectExt;
+
 #[cargo_test]
 fn dep_feature_various() {
     // Checks different ways of setting features via dependencies.

@@ -19,6 +19,8 @@ use cargo_test_support::{cargo_exe, execs, paths, process, project, rustc_host, 
 use cargo_util::{ProcessBuilder, ProcessError};
 use semver::Version;
 
+use crate::utils::ext::CargoProjectExt;
+
 fn tc_process(cmd: &str, toolchain: &str) -> ProcessBuilder {
     let mut p = if toolchain == "this" {
         if cmd == "cargo" {

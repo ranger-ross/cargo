@@ -4,6 +4,7 @@
 //! prevent all collisions.
 
 use crate::utils::cross_compile::disabled as cross_compile_disabled;
+use crate::utils::ext::CargoProjectExt;
 use cargo_test_support::prelude::*;
 use cargo_test_support::registry::Package;
 use cargo_test_support::str;

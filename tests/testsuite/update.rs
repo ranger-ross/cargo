@@ -6,6 +6,8 @@ use cargo_test_support::registry::{self};
 use cargo_test_support::registry::{Dependency, Package};
 use cargo_test_support::{basic_lib_manifest, basic_manifest, git, project, str};
 
+use crate::utils::ext::CargoProjectExt;
+
 #[cargo_test]
 fn minor_update_two_places() {
     Package::new("log", "0.1.0").publish();

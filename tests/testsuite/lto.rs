@@ -4,6 +4,8 @@ use cargo_test_support::registry::Package;
 use cargo_test_support::RawOutput;
 use cargo_test_support::{basic_manifest, project, str, Project};
 
+use crate::utils::ext::CargoProjectExt;
+
 #[cargo_test]
 fn with_deps() {
     Package::new("bar", "0.0.1").publish();

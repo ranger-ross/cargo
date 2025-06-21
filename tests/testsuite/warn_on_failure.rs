@@ -4,6 +4,8 @@ use cargo_test_support::prelude::*;
 use cargo_test_support::registry::Package;
 use cargo_test_support::{project, str, Project};
 
+use crate::utils::ext::CargoProjectExt;
+
 static WARNING1: &str = "Hello! I'm a warning. :)";
 static WARNING2: &str = "And one more!";
 

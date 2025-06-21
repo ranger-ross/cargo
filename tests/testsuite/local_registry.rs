@@ -7,6 +7,8 @@ use cargo_test_support::prelude::*;
 use cargo_test_support::registry::{registry_path, Package};
 use cargo_test_support::{basic_manifest, project, str, t};
 
+use crate::utils::ext::CargoProjectExt;
+
 fn setup() {
     let root = paths::root();
     t!(fs::create_dir(&root.join(".cargo")));

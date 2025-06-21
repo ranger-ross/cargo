@@ -1,5 +1,6 @@
 //! Tests for the `cargo fix` command.
 
+use crate::utils::ext::CargoProjectExt;
 use crate::utils::tools;
 use cargo::core::Edition;
 use cargo_test_support::compare::assert_e2e;

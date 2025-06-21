@@ -6,6 +6,8 @@ use cargo_test_support::prelude::*;
 use cargo_test_support::registry::{Package, RegistryBuilder, TestRegistry};
 use cargo_test_support::{cargo_process, paths, project, str, t};
 
+use crate::utils::ext::CargoProjectExt;
+
 fn setup_replacement(config: &str) -> TestRegistry {
     let crates_io = RegistryBuilder::new()
         .no_configure_registry()

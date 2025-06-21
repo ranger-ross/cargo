@@ -4,6 +4,8 @@ use cargo_test_support::prelude::*;
 use cargo_test_support::project;
 use cargo_test_support::str;
 
+use crate::utils::ext::CargoProjectExt;
+
 use super::config::{assert_error, write_config_at, write_config_toml, GlobalContextBuilder};
 
 #[cargo_test]

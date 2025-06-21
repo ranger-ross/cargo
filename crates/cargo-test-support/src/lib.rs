@@ -110,7 +110,6 @@ pub mod install;
 pub mod paths;
 pub mod publish;
 pub mod registry;
-pub mod tools;
 
 pub mod prelude {
     pub use crate::cargo_test;

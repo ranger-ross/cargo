@@ -1,3 +1,4 @@
+use crate::utils::ext::CargoCommandExt;
 use cargo_test_support::prelude::*;
 use cargo_test_support::{compare::assert_ui, registry::RegistryBuilder, Project};
 use cargo_test_support::{current_dir, file};

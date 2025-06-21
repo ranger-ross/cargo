@@ -1,3 +1,4 @@
+use crate::utils::ext::CargoCommandExt;
 use cargo_test_support::prelude::*;
 use cargo_test_support::{basic_manifest, file, git, project};
 

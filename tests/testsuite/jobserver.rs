@@ -6,13 +6,13 @@ use std::process::Command;
 use std::thread;
 
 use cargo_test_support::basic_bin_manifest;
-use cargo_test_support::cargo_exe;
 use cargo_test_support::install::assert_has_installed_exe;
 use cargo_test_support::paths;
 use cargo_test_support::prelude::*;
 use cargo_test_support::{project, rustc_host, str};
 use cargo_util::is_ci;
 
+use crate::utils::cargo_exe;
 use crate::utils::ext::CargoProjectExt;
 
 const EXE_CONTENT: &str = r#"

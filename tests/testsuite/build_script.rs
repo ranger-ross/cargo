@@ -15,9 +15,7 @@ use cargo_test_support::paths::cargo_home;
 use cargo_test_support::prelude::*;
 use cargo_test_support::registry::Package;
 use cargo_test_support::str;
-use cargo_test_support::{
-    basic_manifest, cargo_exe, cross_compile, is_coarse_mtime, project, project_in,
-};
+use cargo_test_support::{basic_manifest, cross_compile, is_coarse_mtime, project, project_in};
 use cargo_test_support::{git, rustc_host, sleep_ms, slow_cpu_multiplier, symlink_supported};
 use cargo_util::paths::{self, remove_dir_all};
 
@@ -185,7 +183,7 @@ fn custom_build_env_vars() {
         )
         .file("bar/src/lib.rs", "pub fn hello() {}");
 
-    let cargo = cargo_exe();
+    let cargo = crate::utils::cargo_exe();
     let cargo = cargo.to_str().unwrap();
     let rustc = paths::resolve_executable("rustc".as_ref()).unwrap();
     let rustc = rustc.to_str().unwrap();

@@ -22,11 +22,12 @@ use cargo_test_support::paths;
 use cargo_test_support::prelude::*;
 use cargo_test_support::registry::{Package, RegistryBuilder};
 use cargo_test_support::{
-    basic_manifest, cargo_process, execs, git, process, project, retry, sleep_ms, str,
-    thread_wait_timeout, Execs, Project,
+    basic_manifest, execs, git, process, project, retry, sleep_ms, str, thread_wait_timeout, Execs,
+    Project,
 };
 use itertools::Itertools;
 
+use crate::utils::cargo_process;
 use crate::utils::ext::CargoProjectExt;
 
 use super::config::GlobalContextBuilder;

@@ -5,9 +5,10 @@ use std::fs::File;
 use cargo_test_support::prelude::*;
 use cargo_test_support::registry::Package;
 use cargo_test_support::{
-    basic_manifest, cargo_process, git, paths, project, publish::validate_crate_contents, str,
+    basic_manifest, git, paths, project, publish::validate_crate_contents, str,
 };
 
+use crate::utils::cargo_process;
 use crate::utils::ext::CargoProjectExt;
 
 fn pl_manifest(name: &str, version: &str, extra: &str) -> String {

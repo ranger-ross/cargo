@@ -7,12 +7,13 @@ use cargo_test_support::prelude::*;
 use cargo_test_support::publish::validate_crate_contents;
 use cargo_test_support::registry::{self, Package};
 use cargo_test_support::{
-    basic_manifest, cargo_process, git, paths, project, rustc_host, str, symlink_supported, t,
-    Project, ProjectBuilder,
+    basic_manifest, git, paths, project, rustc_host, str, symlink_supported, t, Project,
+    ProjectBuilder,
 };
 use flate2::read::GzDecoder;
 use tar::Archive;
 
+use crate::utils::cargo_process;
 use crate::utils::ext::CargoProjectExt;
 
 #[cargo_test]

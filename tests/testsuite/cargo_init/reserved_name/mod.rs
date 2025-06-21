@@ -1,5 +1,6 @@
 use std::fs;
 
+use crate::utils::ext::CargoCommandExt;
 use cargo_test_support::file;
 use cargo_test_support::paths;
 use cargo_test_support::prelude::*;

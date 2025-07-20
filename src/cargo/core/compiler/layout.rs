@@ -153,15 +153,16 @@ impl Layout {
     /// "debug" or "release".
     pub fn new(
         ws: &Workspace<'_>,
-        target: Option<CompileTarget>,
+        target: CompileTarget,
         dest: &str,
+        is_host_layout: bool,
     ) -> CargoResult<Layout> {
         let mut root = ws.target_dir();
         let mut build_root = ws.build_dir();
-        if let Some(target) = target {
+        if !is_host_layout {
             root.push(target.short_name());
-            build_root.push(target.short_name());
         }
+        build_root.push(target.short_name());
         let build_dest = build_root.join(dest);
         let dest = root.join(dest);
         // If the root directory doesn't already exist go ahead and create it

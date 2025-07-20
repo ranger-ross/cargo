@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::core::PackageId;
 use crate::core::compiler::compilation::{self, UnitOutput};
-use crate::core::compiler::{self, Unit, artifact};
+use crate::core::compiler::{self, CompileTarget, Unit, artifact};
 use crate::util::cache_lock::CacheLockMode;
 use crate::util::errors::CargoResult;
 use anyhow::{Context as _, bail};
@@ -359,11 +359,14 @@ impl<'a, 'gctx> BuildRunner<'a, 'gctx> {
     #[tracing::instrument(skip_all)]
     pub fn prepare_units(&mut self) -> CargoResult<()> {
         let dest = self.bcx.profiles.get_dir_name();
-        let host_layout = Layout::new(self.bcx.ws, None, &dest)?;
+        let h = &self.compilation.host;
+        let host_target = CompileTarget::new(&h)?;
+        let host_layout = Layout::new(self.bcx.ws, host_target, &dest, true)?;
         let mut targets = HashMap::new();
         for kind in self.bcx.all_kinds.iter() {
             if let CompileKind::Target(target) = *kind {
-                let layout = Layout::new(self.bcx.ws, Some(target), &dest)?;
+                let is_host = target == host_target;
+                let layout = Layout::new(self.bcx.ws, target, &dest, is_host)?;
                 targets.insert(target, layout);
             }
         }

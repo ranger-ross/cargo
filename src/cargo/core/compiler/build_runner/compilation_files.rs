@@ -259,6 +259,14 @@ impl<'a, 'gctx: 'a> CompilationFiles<'a, 'gctx> {
         self.host.deps()
     }
 
+    pub fn incremental(&self, unit: &Unit) -> PathBuf {
+        return self
+            .layout(unit.kind)
+            .new_build()
+            .join(self.pkg_dir(unit))
+            .join("incremental");
+    }
+
     /// Returns the directories where Rust crate dependencies are found for the
     /// specified unit.
     // pub fn deps_dir(&self, unit: &Unit) -> PathBuf {

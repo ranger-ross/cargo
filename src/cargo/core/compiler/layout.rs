@@ -261,10 +261,6 @@ impl Layout {
     pub fn fingerprint(&self) -> &Path {
         &self.fingerprint
     }
-    /// Fetch the build script path.
-    pub fn build(&self) -> &Path {
-        &self.build
-    }
     pub fn new_build(&self) -> &Path {
         &self.new_build
     }

@@ -209,7 +209,7 @@ fn clean_specs(
             if target.is_custom_build() {
                 // Get both the build_script_build and the output directory.
                 for (_, layout) in &layouts_with_host {
-                    let dir = escape_glob_path(layout.build())?;
+                    let dir = escape_glob_path(layout.new_build())?;
                     clean_ctx.rm_rf_package_glob_containing_hash(
                         &pkg.name(),
                         &Path::new(&dir).join(&pkg_dir),

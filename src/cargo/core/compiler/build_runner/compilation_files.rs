@@ -317,7 +317,7 @@ impl<'a, 'gctx: 'a> CompilationFiles<'a, 'gctx> {
         assert!(!unit.mode.is_run_custom_build());
         assert!(self.metas.contains_key(unit));
         let dir = self.pkg_dir(unit);
-        self.layout(CompileKind::Host).build().join(dir)
+        self.layout(CompileKind::Host).new_build().join(dir)
     }
 
     /// Returns the directory for compiled artifacts files.
@@ -351,7 +351,7 @@ impl<'a, 'gctx: 'a> CompilationFiles<'a, 'gctx> {
         assert!(unit.target.is_custom_build());
         assert!(unit.mode.is_run_custom_build());
         let dir = self.pkg_dir(unit);
-        self.layout(unit.kind).build().join(dir)
+        self.layout(unit.kind).new_build().join(dir)
     }
 
     /// Returns the "`OUT_DIR`" directory for running a build script.

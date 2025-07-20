@@ -1662,7 +1662,7 @@ fn build_deps_args(
         cmd.arg("-L").arg(&{
             let mut deps = OsString::from("dependency=");
             deps.push(build_runner.files().deps_dir(&unit));
-            dbg!(deps)
+            deps
         });
 
         for dep in build_runner.unit_deps(unit) {

@@ -271,7 +271,10 @@ impl<'a, 'gctx: 'a> CompilationFiles<'a, 'gctx> {
     /// Directory where the fingerprint for the given unit should go.
     pub fn fingerprint_dir(&self, unit: &Unit) -> PathBuf {
         let dir = self.pkg_dir(unit);
-        self.layout(unit.kind).fingerprint().join(dir)
+        self.layout(unit.kind)
+            .new_build()
+            .join(dir)
+            .join(".fingerprint")
     }
 
     /// Returns the path for a file in the fingerprint directory.

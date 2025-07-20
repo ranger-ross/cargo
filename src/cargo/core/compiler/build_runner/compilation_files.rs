@@ -261,8 +261,11 @@ impl<'a, 'gctx: 'a> CompilationFiles<'a, 'gctx> {
 
     /// Returns the directories where Rust crate dependencies are found for the
     /// specified unit.
-    pub fn deps_dir(&self, unit: &Unit) -> &Path {
-        self.layout(unit.kind).deps()
+    // pub fn deps_dir(&self, unit: &Unit) -> PathBuf {
+    //     self.layout(unit.kind).deps(unit)
+    // }
+    pub fn deps_dir(&self, unit: &Unit) -> PathBuf {
+        return self.layout(unit.kind).new_build().join(self.pkg_dir(unit));
     }
 
     /// Directory where the fingerprint for the given unit should go.

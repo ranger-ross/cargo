@@ -273,15 +273,18 @@ impl<'a, 'gctx: 'a> CompilationFiles<'a, 'gctx> {
     //     self.layout(unit.kind).deps(unit)
     // }
     pub fn deps_dir(&self, unit: &Unit) -> PathBuf {
-        return self.layout(unit.kind).build().join(self.pkg_dir(unit));
+        return self
+            .layout(unit.kind)
+            .build()
+            .join(self.pkg_dir(unit))
+            .join("deps");
     }
 
     /// Directory where the fingerprint for the given unit should go.
     pub fn fingerprint_dir(&self, unit: &Unit) -> PathBuf {
-        let dir = self.pkg_dir(unit);
         self.layout(unit.kind)
             .build()
-            .join(dir)
+            .join(self.pkg_dir(unit))
             .join(".fingerprint")
     }
 
@@ -317,7 +320,10 @@ impl<'a, 'gctx: 'a> CompilationFiles<'a, 'gctx> {
         assert!(!unit.mode.is_run_custom_build());
         assert!(self.metas.contains_key(unit));
         let dir = self.pkg_dir(unit);
-        self.layout(CompileKind::Host).build().join(dir)
+        self.layout(CompileKind::Host)
+            .build()
+            .join(dir)
+            .join("build-script")
     }
 
     /// Returns the directory for compiled artifacts files.
@@ -351,7 +357,10 @@ impl<'a, 'gctx: 'a> CompilationFiles<'a, 'gctx> {
         assert!(unit.target.is_custom_build());
         assert!(unit.mode.is_run_custom_build());
         let dir = self.pkg_dir(unit);
-        self.layout(unit.kind).build().join(dir)
+        self.layout(unit.kind)
+            .build()
+            .join(dir)
+            .join("build-script-execution")
     }
 
     /// Returns the "`OUT_DIR`" directory for running a build script.

@@ -303,6 +303,7 @@ impl<'gctx> Compilation<'gctx> {
                     &self.root_output[&CompileKind::Host],
                 ));
             }
+            dbg!(&self.deps_output);
             search_path.push(self.deps_output[&CompileKind::Host].clone());
         } else {
             search_path.extend(super::filter_dynamic_search_path(

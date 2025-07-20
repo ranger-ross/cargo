@@ -120,6 +120,7 @@ pub struct Layout {
     deps: PathBuf,
     /// The directory for build scripts: `$dest/build`
     build: PathBuf,
+    new_build: PathBuf,
     /// The directory for artifacts, i.e. binaries, cdylibs, staticlibs: `$dest/deps/artifact`
     artifact: PathBuf,
     /// The directory for incremental files: `$dest/incremental`
@@ -201,6 +202,7 @@ impl Layout {
         Ok(Layout {
             deps,
             build: build_dest.join("build"),
+            new_build: build_dest.join("new_build"),
             artifact,
             incremental: build_dest.join("incremental"),
             fingerprint: build_dest.join(".fingerprint"),
@@ -262,6 +264,9 @@ impl Layout {
     /// Fetch the build script path.
     pub fn build(&self) -> &Path {
         &self.build
+    }
+    pub fn new_build(&self) -> &Path {
+        &self.new_build
     }
     /// Fetch the artifact path.
     pub fn artifact(&self) -> &Path {

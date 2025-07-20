@@ -236,8 +236,9 @@ fn clean_specs(
                             (layout.build_examples(), Some(layout.examples()))
                         }
                         // Tests/benchmarks are never uplifted.
-                        TargetKind::Test | TargetKind::Bench => (layout.deps(), None),
-                        _ => (layout.deps(), Some(layout.dest())),
+                        // TargetKind::Test | TargetKind::Bench => (layout.deps(), None),
+                        // _ => (layout.deps(), Some(layout.dest())),
+                        _ => todo!(),
                     };
                     let mut dir_glob_str = escape_glob_path(dir)?;
                     let dir_glob = Path::new(&dir_glob_str);

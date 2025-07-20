@@ -120,7 +120,6 @@ pub struct Layout {
     deps: PathBuf,
     /// The directory for build scripts: `$dest/build`
     build: PathBuf,
-    new_build: PathBuf,
     /// The directory for artifacts, i.e. binaries, cdylibs, staticlibs: `$dest/deps/artifact`
     artifact: PathBuf,
     /// The directory for incremental files: `$dest/incremental`
@@ -202,7 +201,6 @@ impl Layout {
         Ok(Layout {
             deps,
             build: build_dest.join("build"),
-            new_build: build_dest.join("new_build"),
             artifact,
             incremental: build_dest.join("incremental"),
             fingerprint: build_dest.join(".fingerprint"),
@@ -219,9 +217,6 @@ impl Layout {
 
     /// Makes sure all directories stored in the Layout exist on the filesystem.
     pub fn prepare(&mut self) -> CargoResult<()> {
-        paths::create_dir_all(&self.deps)?;
-        paths::create_dir_all(&self.incremental)?;
-        paths::create_dir_all(&self.fingerprint)?;
         paths::create_dir_all(&self.examples)?;
         paths::create_dir_all(&self.build_examples)?;
         paths::create_dir_all(&self.build)?;
@@ -261,8 +256,8 @@ impl Layout {
     pub fn fingerprint(&self) -> &Path {
         &self.fingerprint
     }
-    pub fn new_build(&self) -> &Path {
-        &self.new_build
+    pub fn build(&self) -> &Path {
+        &self.build
     }
     /// Fetch the artifact path.
     pub fn artifact(&self) -> &Path {

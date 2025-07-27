@@ -482,6 +482,22 @@ is a directory named `target` located at the root of the workspace.
 
 Can be overridden with the `--target-dir` CLI option.
 
+#### `build.build-dir`
+
+* Type: string (path)
+* Default: Defaults to the value of `build.target-dir`
+* Environment: `CARGO_BUILD_BUILD_DIR`
+
+The directory where intermediate build artifacts will be stored.
+Intermediate artifacts are produced by Rustc/Cargo during the build process.
+
+This option supports path templating.
+
+Available template variables:
+* `{workspace-root}` resolves to root of the current workspace.
+* `{cargo-cache-home}` resolves to `CARGO_HOME`
+* `{workspace-path-hash}` resolves to a hash of the manifest path
+
 #### `build.rustflags`
 * Type: string or array of strings
 * Default: none

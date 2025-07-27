@@ -56,7 +56,7 @@ pub mod unit_dependencies;
 pub mod unit_graph;
 
 use std::borrow::Cow;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::env;
 use std::ffi::{OsStr, OsString};
 use std::fmt::Display;
@@ -66,6 +66,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context as _, Error};
+use itertools::Itertools;
 use lazycell::LazyCell;
 use tracing::{debug, instrument, trace};
 
@@ -1645,20 +1646,20 @@ fn build_deps_args(
     unit: &Unit,
 ) -> CargoResult<()> {
     let bcx = build_runner.bcx;
-    fn add_dep_arg(cmd: &mut ProcessBuilder, build_runner: &BuildRunner<'_, '_>, unit: &Unit) {
-        cmd.arg("-L").arg(&{
-            let mut deps = OsString::from("dependency=");
-            deps.push(build_runner.files().deps_dir(&unit));
-            deps
-        });
-
-        for dep in build_runner.unit_deps(unit) {
-            add_dep_arg(cmd, build_runner, &dep.unit);
-        }
-    }
+    let mut map = BTreeMap::new();
 
     // Recusively add all depenendency args to rustc process
-    add_dep_arg(cmd, build_runner, unit);
+    add_dep_arg(&mut map, build_runner, unit);
+
+    let paths = map.into_iter().map(|(_, path)| path).sorted_unstable();
+
+    for path in paths {
+        cmd.arg("-L").arg(&{
+            let mut deps = OsString::from("dependency=");
+            deps.push(path);
+            deps
+        });
+    }
 
     // Be sure that the host path is also listed. This'll ensure that proc macro
     // dependencies are correctly found (for reexported macros).
@@ -1721,6 +1722,21 @@ fn build_deps_args(
     }
 
     Ok(())
+}
+
+fn add_dep_arg<'a, 'b: 'a>(
+    map: &mut BTreeMap<&'a Unit, PathBuf>,
+    build_runner: &'b BuildRunner<'b, '_>,
+    unit: &'a Unit,
+) {
+    map.insert(&unit, build_runner.files().deps_dir(&unit));
+
+    for dep in build_runner.unit_deps(unit) {
+        if map.contains_key(&dep.unit) {
+            continue;
+        }
+        add_dep_arg(map, build_runner, &dep.unit);
+    }
 }
 
 /// Adds extra rustc flags and environment variables collected from the output

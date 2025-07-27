@@ -285,7 +285,7 @@ impl<'a, 'gctx: 'a> CompilationFiles<'a, 'gctx> {
         self.layout(unit.kind)
             .build()
             .join(self.pkg_dir(unit))
-            .join(".fingerprint")
+            .join("fingerprint")
     }
 
     /// Returns the path for a file in the fingerprint directory.

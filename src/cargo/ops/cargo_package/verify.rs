@@ -66,13 +66,7 @@ pub fn run_verify(
     let new_pkg = src.root_package()?;
     let pkg_fingerprint = hash_all(&dst)?;
 
-    let target_dir = if gctx.cli_unstable().build_dir {
-        Some(ws.build_dir())
-    } else {
-        None
-    };
-
-    let mut ws = Workspace::ephemeral(new_pkg, gctx, target_dir, true)?;
+    let mut ws = Workspace::ephemeral(new_pkg, gctx, Some(ws.build_dir()), true)?;
     if let Some(local_reg) = local_reg {
         ws.add_local_overlay(
             local_reg.upstream,

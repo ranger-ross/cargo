@@ -5705,7 +5705,6 @@ fn workspace_with_local_deps() {
 [FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
 [VERIFYING] level1 v0.0.1 ([ROOT]/foo/level1)
 [UNPACKING] level2 v0.0.1 (registry `[ROOT]/foo/target/package/tmp-registry`)
-[COMPILING] level3 v0.0.1
 [COMPILING] level2 v0.0.1
 [COMPILING] level1 v0.0.1 ([ROOT]/foo/target/package/level1-0.0.1)
 [FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
@@ -6614,7 +6613,6 @@ fn workspace_with_renamed_member() {
 [FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
 [VERIFYING] obeli-sk-utils v0.16.2 ([ROOT]/foo/crates/utils)
 [UNPACKING] obeli-sk-concepts v0.16.2 (registry `[ROOT]/foo/target/package/tmp-registry`)
-[COMPILING] obeli-sk-val-json v0.16.2
 [COMPILING] obeli-sk-concepts v0.16.2
 [COMPILING] obeli-sk-utils v0.16.2 ([ROOT]/foo/target/package/obeli-sk-utils-0.16.2)
 [FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
@@ -6997,7 +6995,6 @@ fn registry_inference_ignores_unpublishable() {
 [FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
 [VERIFYING] main v0.0.1 ([ROOT]/foo/main)
 [UPDATING] `alternative` index
-[COMPILING] dep v0.1.0 (registry `alternative`)
 [COMPILING] main v0.0.1 ([ROOT]/foo/target/package/main-0.0.1)
 [FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
 

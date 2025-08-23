@@ -55,7 +55,7 @@ impl LayoutTree {
     ) {
         // Keep processing lines as long as they are direct children of the current parent node.
         while let Some(line) = lines.peek() {
-            let (level, _) = Self::get_line_info(line);
+            let (level, _, _) = Self::get_line_info(line);
 
             // If the current line's level is not one greater than the parent's,
             // it's not a direct child, so we stop parsing for this parent.
@@ -65,13 +65,16 @@ impl LayoutTree {
 
             // This line is a child, so we must consume it from the iterator.
             let line = lines.next().unwrap();
-            let (level, name) = Self::get_line_info(&line); // Re-parse the consumed line
+            let (level, name, active) = Self::get_line_info(&line); // Re-parse the consumed line
+            if !active {
+                continue;
+            }
             let current_path = parent.path.join(name);
 
             // To determine if the current line is a file or a directory, we peek at the *next* line.
             // If the next line is more indented, the current line must be a directory.
             let is_directory = if let Some(next_line) = lines.peek() {
-                let (next_level, _) = Self::get_line_info(&next_line);
+                let (next_level, _, _) = Self::get_line_info(&next_line);
                 next_level > level
             } else {
                 false // No more lines, so it must be a file.
@@ -82,11 +85,9 @@ impl LayoutTree {
                     path: current_path,
                     children: Vec::new(),
                 };
-                // This is a directory, so we recurse to parse its children.
                 Self::parse_level(&mut dir_node, lines, level as isize);
                 parent.children.push(dir_node);
             } else {
-                // This is a file, so we just add its path.
                 parent.children.push(LayoutTreeNode {
                     path: current_path,
                     children: Vec::new(),
@@ -98,17 +99,36 @@ impl LayoutTree {
     /// A helper function to extract the indentation level and name from a single line.
     ///
     /// Example: `│   ├── .cargo-lock` -> `(1, ".cargo-lock")`
-    fn get_line_info(line: &str) -> (usize, &str) {
+    fn get_line_info(line: &str) -> (usize, &str, bool) {
         // Find the index where the name begins. It's after the tree prefix (`├── ` or `└── `).
         let name_start_index = line.rfind(' ').map_or(0, |i| i + 1);
         let name = &line[name_start_index..];
+        let mut active = true;
 
         // The indentation level is calculated by the character length of the prefix.
         // Each level of depth adds 4 characters (e.g., `│   ` or `    `).
         let prefix = &line[..name_start_index];
         let level = prefix.chars().count() / 4;
 
-        (level, name)
+        static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+        let target =
+            RE.get_or_init(|| regex::Regex::new(r#"\[target_os=(?<target>[a-z,]+)\]"#).unwrap());
+
+        if let Some(cap) = target.captures(line) {
+            macro_rules! t {
+                ($name:literal) => {
+                    if cfg!(target_os = $name) { true } else { false }
+                };
+            }
+            active = cap["target"].split(",").any(|target| match target {
+                "windows" => t!("windows"),
+                "linux" => t!("linux"),
+                "macos" => t!("macos"),
+                _ => panic!("Unsupported target_os {target}"),
+            });
+        }
+
+        (level, name, active)
     }
 
     /// Creates a `LayoutTree` by recursively walking a directory structure from a given path.
@@ -154,7 +174,6 @@ impl LayoutTree {
                         current_node.children.push(child_node);
                     }
                 } else if child_path.is_file() {
-                    println!("Adding FILE {}", child_path.display());
                     // If the child is a file, add its path to the current node's `files`.
                     current_node.children.push(LayoutTreeNode {
                         path: child_path,
@@ -198,10 +217,6 @@ impl LayoutTree {
     pub fn matches_snapshot(&self, snapshot: &Self) -> bool {
         fn matches(n: &LayoutTreeNode, snap: &LayoutTreeNode) -> bool {
             if snap.children.len() != n.children.len() {
-                println!(
-                    "snap.children = false! {:?} -- {:?}",
-                    snap.children, n.children
-                );
                 return false;
             }
 
@@ -212,7 +227,6 @@ impl LayoutTree {
                         let mut p = path.to_string_lossy().to_string();
                         p.truncate(p.len() - "[EXE]".len());
                         path = PathBuf::from(p);
-                        println!("stripped path! AFTER: {path:?}");
                     }
                 }
 
@@ -228,10 +242,10 @@ impl LayoutTree {
                     .iter()
                     .filter(|p| preprocess(p.path.clone()) == preprocess(d.path.clone()))
                 {
-                    println!(
-                        "checking potential match {}",
-                        potential_match.path.display()
-                    );
+                    // println!(
+                    //     "checking potential match {}",
+                    //     potential_match.path.display()
+                    // );
                     if matches(&d, potential_match) {
                         found = true;
                         // TODO: Maybe mark this "match" as used
@@ -240,7 +254,7 @@ impl LayoutTree {
                 }
 
                 if !found {
-                    println!("missing {:?} -- {:#?}", d.path, snap);
+                    // println!("missing {:?} -- {:#?}", d.path, snap);
                     return false;
                 }
             }

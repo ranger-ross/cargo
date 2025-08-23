@@ -246,8 +246,6 @@ impl CargoPathExt for Path {
     fn verify_file_layout(&self, expected: impl AsRef<str>) {
         let actual_layout = LayoutTree::from_path(&self).unwrap();
 
-        // println!("Actual :: {actual_layout:#?}");
-
         let expected_layout = LayoutTree::parse(expected.as_ref());
 
         if !actual_layout.matches_snapshot(&expected_layout) {

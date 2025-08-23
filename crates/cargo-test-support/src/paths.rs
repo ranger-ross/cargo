@@ -254,7 +254,7 @@ impl CargoPathExt for Path {
             let actual_snapshot = actual_layout.to_string();
             let expected_snapshot = expected_layout.to_string();
 
-            compare::assert_e2e().eq(expected_snapshot, actual_snapshot);
+            compare::assert_e2e().eq(actual_snapshot, expected_snapshot);
         }
     }
 }

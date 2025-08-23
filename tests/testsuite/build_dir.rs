@@ -341,11 +341,20 @@ fn cargo_tmpdir_should_output_to_build_dir() {
 │   ├── .cargo-lock
 │   ├── .fingerprint
 │   │   ├── foo-[HASH]
-...
+│   │   │   ├── dep-test-bin-foo
+│   │   │   ├── invoked.timestamp
+│   │   │   ├── test-bin-foo
+│   │   │   └── test-bin-foo.json
 │   │   ├── foo-[HASH]
-...
+│   │   │   ├── dep-test-integration-test-foo
+│   │   │   ├── invoked.timestamp
+│   │   │   ├── test-integration-test-foo
+│   │   │   └── test-integration-test-foo.json
 │   │   └── foo-[HASH]
-...
+│   │       ├── bin-foo
+│   │       ├── bin-foo.json
+│   │       ├── dep-bin-foo
+│   │       └── invoked.timestamp
 │   ├── build
 │   ├── deps
 │   │   ├── foo-[HASH][EXE]
@@ -455,9 +464,15 @@ fn benches_should_output_to_build_dir() {
 │   ├── .cargo-lock
 │   ├── .fingerprint
 │   │   ├── foo-[HASH]
-...
+│   │   │   ├── dep-test-bench-foo
+│   │   │   ├── invoked.timestamp
+│   │   │   ├── test-bench-foo
+│   │   │   └── test-bench-foo.json
 │   │   └── foo-[HASH]
-...
+│   │       ├── bin-foo
+│   │       ├── bin-foo.json
+│   │       ├── dep-bin-foo
+│   │       └── invoked.timestamp
 │   ├── build
 │   ├── deps
 │   │   ├── foo-[HASH][EXE]

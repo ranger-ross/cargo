@@ -33,7 +33,8 @@ fn binary_with_debug() {
 
     assert_not_exists(&p.root().join("target"));
 
-    p.root().join("build-dir").verify_file_layout(str![[r#"
+    p.root().join("build-dir").verify_file_layout(
+        r#"
 [ROOT]/foo/build-dir
 ├── .rustc_info.json
 ├── CACHEDIR.TAG
@@ -52,18 +53,21 @@ fn binary_with_debug() {
     ├── examples
     └── incremental
 
-"#]]);
+"#,
+    );
 
-    p.root().join("target-dir").verify_file_layout(str![[r#"
-[ROOT]/foo/target-dir
-├── CACHEDIR.TAG
-└── debug
-    ├── .cargo-lock
-    ├── examples
-    ├── foo[EXE]
-    └── foo.d
+    p.root().join("target-dir").verify_file_layout(
+        r#"
+    [ROOT]/foo/target-dir
+    ├── CACHEDIR.TAG
+    └── debug
+        ├── .cargo-lock
+        ├── examples
+        ├── foo[EXE]
+        └── foo.d
 
-"#]]);
+    "#,
+    );
 }
 
 #[cargo_test]
@@ -82,7 +86,8 @@ fn binary_with_release() {
 
     p.cargo("build --release").enable_mac_dsym().run();
 
-    p.root().join("build-dir").verify_file_layout(str![[r#"
+    p.root().join("build-dir").verify_file_layout(
+        r#"
 [ROOT]/foo/build-dir
 ├── .rustc_info.json
 ├── CACHEDIR.TAG
@@ -101,9 +106,11 @@ fn binary_with_release() {
     ├── examples
     └── incremental
 
-"#]]);
+"#,
+    );
 
-    p.root().join("target-dir").verify_file_layout(str![[r#"
+    p.root().join("target-dir").verify_file_layout(
+        r#"
 [ROOT]/foo/target-dir
 ├── CACHEDIR.TAG
 └── release
@@ -112,7 +119,8 @@ fn binary_with_release() {
     ├── foo[EXE]
     └── foo.d
 
-"#]]);
+"#,
+    );
 }
 
 #[cargo_test]
@@ -196,7 +204,8 @@ fn should_default_to_target() {
 
     p.cargo("build").enable_mac_dsym().run();
 
-    p.root().join("target").verify_file_layout(str![[r#"
+    p.root().join("target").verify_file_layout(
+        r#"
 [ROOT]/foo/target
 ├── .rustc_info.json
 ├── CACHEDIR.TAG
@@ -217,7 +226,8 @@ fn should_default_to_target() {
     ├── foo.d
     └── incremental
 
-"#]]);
+"#,
+    );
 }
 
 #[cargo_test]
@@ -231,7 +241,8 @@ fn should_respect_env_var() {
         .enable_mac_dsym()
         .run();
 
-    p.root().join("build-dir").verify_file_layout(str![[r#"
+    p.root().join("build-dir").verify_file_layout(
+        r#"
 [ROOT]/foo/build-dir
 ├── .rustc_info.json
 ├── CACHEDIR.TAG
@@ -250,7 +261,8 @@ fn should_respect_env_var() {
     ├── examples
     └── incremental
 
-"#]]);
+"#,
+    );
 }
 
 #[cargo_test]
@@ -320,7 +332,8 @@ fn cargo_tmpdir_should_output_to_build_dir() {
 
     p.cargo("test").enable_mac_dsym().run();
 
-    p.root().join("build-dir").verify_file_layout(str![[r#"
+    p.root().join("build-dir").verify_file_layout(
+        r#"
 [ROOT]/foo/build-dir
 ├── .rustc_info.json
 ├── CACHEDIR.TAG
@@ -346,9 +359,11 @@ fn cargo_tmpdir_should_output_to_build_dir() {
 └── tmp
     └── foo.txt
 
-"#]]);
+"#,
+    );
 
-    p.root().join("target-dir").verify_file_layout(str![[r#"
+    p.root().join("target-dir").verify_file_layout(
+        r#"
 [ROOT]/foo/target-dir
 ├── CACHEDIR.TAG
 └── debug
@@ -356,7 +371,8 @@ fn cargo_tmpdir_should_output_to_build_dir() {
     ├── examples
     └── foo[EXE]
 
-"#]]);
+"#,
+    );
 }
 
 #[cargo_test]
@@ -376,7 +392,8 @@ fn examples_should_output_to_build_dir_and_uplift_to_target_dir() {
 
     p.cargo("build --examples").enable_mac_dsym().run();
 
-    p.root().join("build-dir").verify_file_layout(str![[r#"
+    p.root().join("build-dir").verify_file_layout(
+        r#"
 [ROOT]/foo/build-dir
 ├── .rustc_info.json
 ├── CACHEDIR.TAG
@@ -395,9 +412,11 @@ fn examples_should_output_to_build_dir_and_uplift_to_target_dir() {
     │   └── foo-[HASH].d
     └── incremental
 
-"#]]);
+"#,
+    );
 
-    p.root().join("target-dir").verify_file_layout(str![[r#"
+    p.root().join("target-dir").verify_file_layout(
+        r#"
 [ROOT]/foo/target-dir
 ├── CACHEDIR.TAG
 └── debug
@@ -406,7 +425,8 @@ fn examples_should_output_to_build_dir_and_uplift_to_target_dir() {
         ├── foo[EXE]
         └── foo.d
 
-"#]]);
+"#,
+    );
 }
 
 #[cargo_test]
@@ -426,7 +446,8 @@ fn benches_should_output_to_build_dir() {
 
     p.cargo("build --bench=foo").enable_mac_dsym().run();
 
-    p.root().join("build-dir").verify_file_layout(str![[r#"
+    p.root().join("build-dir").verify_file_layout(
+        r#"
 [ROOT]/foo/build-dir
 ├── .rustc_info.json
 ├── CACHEDIR.TAG
@@ -447,9 +468,11 @@ fn benches_should_output_to_build_dir() {
 │   └── incremental
 └── tmp
 
-"#]]);
+"#,
+    );
 
-    p.root().join("target-dir").verify_file_layout(str![[r#"
+    p.root().join("target-dir").verify_file_layout(
+        r#"
 [ROOT]/foo/target-dir
 ├── CACHEDIR.TAG
 └── debug
@@ -457,7 +480,8 @@ fn benches_should_output_to_build_dir() {
     ├── examples
     └── foo[EXE]
 
-"#]]);
+"#,
+    );
 }
 
 #[cargo_test]
@@ -498,7 +522,8 @@ fn cargo_package_should_build_in_build_dir_and_output_to_target_dir() {
 
     p.cargo("package").enable_mac_dsym().run();
 
-    p.root().join("build-dir").verify_file_layout(str![[r#"
+    p.root().join("build-dir").verify_file_layout(
+        r#"
 [ROOT]/foo/build-dir
 ├── .rustc_info.json
 ├── debug
@@ -525,14 +550,17 @@ fn cargo_package_should_build_in_build_dir_and_output_to_target_dir() {
         └── src
             └── main.rs
 
-"#]]);
+"#,
+    );
 
-    p.root().join("target-dir").verify_file_layout(str![[r#"
+    p.root().join("target-dir").verify_file_layout(
+        r#"
 [ROOT]/foo/target-dir
 └── package
     └── foo-0.0.1.crate
 
-"#]]);
+"#,
+    );
 }
 
 #[cargo_test]
@@ -551,7 +579,8 @@ fn cargo_clean_should_clean_the_target_dir_and_build_dir() {
 
     p.cargo("build").enable_mac_dsym().run();
 
-    p.root().join("build-dir").verify_file_layout(str![[r#"
+    p.root().join("build-dir").verify_file_layout(
+        r#"
 [ROOT]/foo/build-dir
 ├── .rustc_info.json
 ├── CACHEDIR.TAG
@@ -570,9 +599,11 @@ fn cargo_clean_should_clean_the_target_dir_and_build_dir() {
     ├── examples
     └── incremental
 
-"#]]);
+"#,
+    );
 
-    p.root().join("target-dir").verify_file_layout(str![[r#"
+    p.root().join("target-dir").verify_file_layout(
+        r#"
 [ROOT]/foo/target-dir
 ├── CACHEDIR.TAG
 └── debug
@@ -581,7 +612,8 @@ fn cargo_clean_should_clean_the_target_dir_and_build_dir() {
     ├── foo[EXE]
     └── foo.d
 
-"#]]);
+"#,
+    );
 
     p.cargo("clean").enable_mac_dsym().run();
 
@@ -650,12 +682,12 @@ fn template_should_error_for_invalid_variables() {
     p.cargo("build")
         .enable_mac_dsym()
         .with_status(101)
-        .with_stderr_data(str![[r#"
+        .with_stderr_data(r#"
 [ERROR] unexpected variable `fake` in build.build-dir path `{fake}/build-dir`
 
 [HELP] available template variables are `{workspace-root}`, `{cargo-cache-home}`, `{workspace-path-hash}`
 
-"#]])
+"#)
         .run();
 }
 
@@ -674,12 +706,14 @@ fn template_should_suggest_nearest_variable() {
 
     p.cargo("build")
         .with_status(101)
-        .with_stderr_data(str![[r#"
+        .with_stderr_data(
+            r#"
 [ERROR] unexpected variable `workspace-ro` in build.build-dir path `{workspace-ro}/build-dir`
 
 [HELP] a template variable with a similar name exists: `workspace-root`
 
-"#]])
+"#,
+        )
         .run();
 }
 
@@ -699,7 +733,8 @@ fn template_workspace_root() {
 
     p.cargo("build").enable_mac_dsym().run();
 
-    p.root().join("build-dir").verify_file_layout(str![[r#"
+    p.root().join("build-dir").verify_file_layout(
+        r#"
 [ROOT]/foo/build-dir
 ├── .rustc_info.json
 ├── CACHEDIR.TAG
@@ -718,9 +753,11 @@ fn template_workspace_root() {
     ├── examples
     └── incremental
 
-"#]]);
+"#,
+    );
 
-    p.root().join("target-dir").verify_file_layout(str![[r#"
+    p.root().join("target-dir").verify_file_layout(
+        r#"
 [ROOT]/foo/target-dir
 ├── CACHEDIR.TAG
 └── debug
@@ -729,7 +766,8 @@ fn template_workspace_root() {
     ├── foo[EXE]
     └── foo.d
 
-"#]]);
+"#,
+    );
 }
 
 #[cargo_test]
@@ -748,9 +786,8 @@ fn template_cargo_cache_home() {
 
     p.cargo("build").enable_mac_dsym().run();
 
-    paths::cargo_home()
-        .join("build-dir")
-        .verify_file_layout(str![[r#"
+    paths::cargo_home().join("build-dir").verify_file_layout(
+        r#"
 [ROOT]/home/.cargo/build-dir
 ├── .rustc_info.json
 ├── CACHEDIR.TAG
@@ -769,9 +806,11 @@ fn template_cargo_cache_home() {
     ├── examples
     └── incremental
 
-"#]]);
+"#,
+    );
 
-    p.root().join("target-dir").verify_file_layout(str![[r#"
+    p.root().join("target-dir").verify_file_layout(
+        r#"
 [ROOT]/foo/target-dir
 ├── CACHEDIR.TAG
 └── debug
@@ -780,7 +819,8 @@ fn template_cargo_cache_home() {
     ├── foo[EXE]
     └── foo.d
 
-"#]]);
+"#,
+    );
 }
 
 #[cargo_test]
@@ -815,7 +855,8 @@ fn template_workspace_path_hash() {
 
     let build_dir = hash_dir.as_path().join("build-dir");
 
-    build_dir.verify_file_layout(str![[r#"
+    build_dir.verify_file_layout(
+        r#"
 [ROOT]/foo/foo/[HASH]/build-dir
 ├── .rustc_info.json
 ├── CACHEDIR.TAG
@@ -834,9 +875,11 @@ fn template_workspace_path_hash() {
     ├── examples
     └── incremental
 
-"#]]);
+"#,
+    );
 
-    p.root().join("target-dir").verify_file_layout(str![[r#"
+    p.root().join("target-dir").verify_file_layout(
+        r#"
 [ROOT]/foo/target-dir
 ├── CACHEDIR.TAG
 └── debug
@@ -845,7 +888,8 @@ fn template_workspace_path_hash() {
     ├── foo[EXE]
     └── foo.d
 
-"#]]);
+"#,
+    );
 }
 
 /// Verify that the {workspace-path-hash} does not changes if cargo is run from inside of
@@ -888,7 +932,8 @@ fn template_workspace_path_hash_should_handle_symlink() {
     assert_exists(&foo_dir);
     let original_hash_dir = parse_workspace_manifest_path_hash(&foo_dir);
 
-    original_hash_dir.verify_file_layout(str![[r#"
+    original_hash_dir.verify_file_layout(
+        r#"
 [ROOT]/foo/foo/[HASH]
 └── build-dir
     ├── .rustc_info.json
@@ -908,16 +953,19 @@ fn template_workspace_path_hash_should_handle_symlink() {
         ├── examples
         └── incremental
 
-"#]]);
+"#,
+    );
 
-    p.root().join("target").verify_file_layout(str![[r#"
+    p.root().join("target").verify_file_layout(
+        r#"
 [ROOT]/foo/target
 ├── CACHEDIR.TAG
 └── debug
     ├── .cargo-lock
     └── examples
 
-"#]]);
+"#,
+    );
 
     // Create a symlink of the project root.
     let mut symlinked_dir = p.root().clone();
@@ -935,7 +983,8 @@ fn template_workspace_path_hash_should_handle_symlink() {
     assert_exists(&foo_dir);
     let symlink_hash_dir = parse_workspace_manifest_path_hash(&foo_dir);
 
-    symlink_hash_dir.verify_file_layout(str![[r#"
+    symlink_hash_dir.verify_file_layout(
+        r#"
 [ROOT]/foo/foo/[HASH]
 └── build-dir
     ├── .rustc_info.json
@@ -955,16 +1004,19 @@ fn template_workspace_path_hash_should_handle_symlink() {
         ├── examples
         └── incremental
 
-"#]]);
+"#,
+    );
 
-    p.root().join("target").verify_file_layout(str![[r#"
+    p.root().join("target").verify_file_layout(
+        r#"
 [ROOT]/foo/target
 ├── CACHEDIR.TAG
 └── debug
     ├── .cargo-lock
     └── examples
 
-"#]]);
+"#,
+    );
 
     // Verify the hash dir created from the symlinked and non-symlinked dirs are the same.
     assert_eq!(original_hash_dir, symlink_hash_dir);

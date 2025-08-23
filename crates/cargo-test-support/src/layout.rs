@@ -1,6 +1,5 @@
 use std::{
     collections::HashMap,
-    ffi::OsStr,
     fmt,
     iter::Peekable,
     path::{Path, PathBuf},
@@ -56,7 +55,7 @@ impl LayoutTree {
     ) {
         // Keep processing lines as long as they are direct children of the current parent node.
         while let Some(line) = lines.peek() {
-            let (level, name) = Self::get_line_info(line);
+            let (level, _) = Self::get_line_info(line);
 
             // If the current line's level is not one greater than the parent's,
             // it's not a direct child, so we stop parsing for this parent.
@@ -113,7 +112,6 @@ impl LayoutTree {
     }
 
     /// Creates a `LayoutTree` by recursively walking a directory structure from a given path.
-    // TODO: Need to add redaction support for hashes
     pub fn from_path(path: &Path) -> std::io::Result<Self> {
         // Canonicalize the root path to ensure consistent, absolute paths.
         let root_path = path.canonicalize()?;
@@ -275,53 +273,28 @@ impl LayoutTree {
         node: &LayoutTreeNode,
         prefix: &str,
     ) -> fmt::Result {
-        // Helper enum to treat files and directories uniformly for sorting.
-        enum Child<'a> {
-            Dir(&'a LayoutTreeNode),
-            File(&'a PathBuf),
-        }
+        let mut children: Vec<_> = node.children.iter().collect();
 
-        impl<'a> Child<'a> {
-            /// Returns the final component of the path (the name) for sorting.
-            fn name(&self) -> &OsStr {
-                match self {
-                    Child::Dir(d) => d.path.file_name().unwrap_or_else(|| d.path.as_os_str()),
-                    Child::File(f) => f.file_name().unwrap_or_else(|| f.as_os_str()),
-                }
-            }
-        }
-
-        // 1. Collect all directories and files into a single vector.
-        let mut children: Vec<Child<'_>> = node
-            .children
-            .iter()
-            .map(Child::Dir) // TODO: FIX THIS -- handle files
-            .collect();
-
-        // 2. Sort the children alphabetically by name for a canonical output.
-        children.sort_by(|a, b| a.name().cmp(b.name()));
+        children.sort_by(|a, b| a.path.file_name().cmp(&b.path.file_name()));
 
         let num_children = children.len();
         for (i, child) in children.iter().enumerate() {
             let is_last = i == num_children - 1;
 
-            // 3. Determine the correct tree connector and the prefix for the next level.
             let connector = if is_last { "└── " } else { "├── " };
             let next_level_prefix = if is_last { "    " } else { "│   " };
 
-            // 4. Write the formatted line for the current child.
             writeln!(
                 f,
                 "{}{}{}",
                 prefix,
                 connector,
-                child.name().to_string_lossy()
+                child.path.file_name().unwrap().to_string_lossy()
             )?;
 
-            // 5. If the child is a directory, recurse to format its children.
-            if let Child::Dir(dir) = child {
+            if !child.children.is_empty() {
                 let new_prefix = format!("{}{}", prefix, next_level_prefix);
-                Self::format_children(f, dir, &new_prefix)?;
+                Self::format_children(f, child, &new_prefix)?;
             }
         }
 

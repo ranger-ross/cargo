@@ -13,6 +13,7 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::compare;
+use crate::layout::LayoutTree;
 
 static CARGO_INTEGRATION_TEST_DIR: &str = "cit";
 
@@ -155,7 +156,7 @@ pub trait CargoPathExt {
     where
         F: Fn(i64, u32) -> (i64, u32);
 
-    fn verify_file_layout(&self, expected: impl snapbox::IntoData);
+    fn verify_file_layout(&self, expected: impl AsRef<str>);
 }
 
 impl CargoPathExt for Path {
@@ -242,14 +243,18 @@ impl CargoPathExt for Path {
     }
 
     #[track_caller]
-    fn verify_file_layout(&self, expected: impl snapbox::IntoData) {
-        let layout = generate_tree(&self);
+    fn verify_file_layout(&self, expected: impl AsRef<str>) {
+        let actual_layout = LayoutTree::from_path(&self).unwrap();
 
-        let name = format!("verify_file_layout {}", self.display());
-        if let Err(err) =
-            compare::assert_ui().try_eq(Some(&name), layout.into(), expected.into_data())
-        {
-            panic!("{err}");
+        // println!("Actual :: {actual_layout:#?}");
+
+        let expected_layout = LayoutTree::parse(expected.as_ref());
+
+        if !actual_layout.matches_snapshot(&expected_layout) {
+            let actual_snapshot = actual_layout.to_string();
+            let expected_snapshot = expected_layout.to_string();
+
+            compare::assert_e2e().eq(expected_snapshot, actual_snapshot);
         }
     }
 }
@@ -278,7 +283,7 @@ impl CargoPathExt for PathBuf {
     }
 
     #[track_caller]
-    fn verify_file_layout(&self, expected: impl snapbox::IntoData) {
+    fn verify_file_layout(&self, expected: impl AsRef<str>) {
         self.as_path().verify_file_layout(expected);
     }
 }

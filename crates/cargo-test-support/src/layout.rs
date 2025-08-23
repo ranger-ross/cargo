@@ -1,15 +1,13 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     ffi::OsStr,
-    fmt::{self, Display},
+    fmt,
     iter::Peekable,
     path::{Path, PathBuf},
     str::Lines,
 };
 
-use crate::{compare::assert_e2e, paths, project, str};
-use snapbox::Data;
-use std::env::consts::{DLL_PREFIX, DLL_SUFFIX, EXE_SUFFIX};
+use crate::compare::assert_e2e;
 use walkdir::WalkDir;
 
 #[derive(Debug)]
@@ -17,11 +15,10 @@ pub struct LayoutTree {
     root: LayoutTreeNode,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct LayoutTreeNode {
     path: PathBuf,
-    dirs: Vec<LayoutTreeNode>,
-    files: Vec<PathBuf>,
+    children: Vec<LayoutTreeNode>,
 }
 
 impl LayoutTree {
@@ -37,8 +34,7 @@ impl LayoutTree {
         // Create the root node of our tree.
         let mut root = LayoutTreeNode {
             path: root_path,
-            dirs: Vec::new(),
-            files: Vec::new(),
+            children: Vec::new(),
         };
 
         // Begin the recursive parsing process for all children of the root.
@@ -85,15 +81,17 @@ impl LayoutTree {
             if is_directory {
                 let mut dir_node = LayoutTreeNode {
                     path: current_path,
-                    dirs: Vec::new(),
-                    files: Vec::new(),
+                    children: Vec::new(),
                 };
                 // This is a directory, so we recurse to parse its children.
                 Self::parse_level(&mut dir_node, lines, level as isize);
-                parent.dirs.push(dir_node);
+                parent.children.push(dir_node);
             } else {
                 // This is a file, so we just add its path.
-                parent.files.push(current_path);
+                parent.children.push(LayoutTreeNode {
+                    path: current_path,
+                    children: Vec::new(),
+                });
             }
         }
     }
@@ -141,8 +139,7 @@ impl LayoutTree {
             // Create a new node for the current directory.
             let mut current_node = LayoutTreeNode {
                 path: current_path.to_path_buf(),
-                dirs: Vec::new(),
-                files: Vec::new(),
+                children: Vec::new(),
             };
 
             // Now, find the children of the current directory. We do this by
@@ -156,11 +153,15 @@ impl LayoutTree {
                     // If the child is a directory, its node must already be in our map.
                     // We remove it and add it to the current node's `dirs`.
                     if let Some(child_node) = completed_nodes.remove(&child_path) {
-                        current_node.dirs.push(child_node);
+                        current_node.children.push(child_node);
                     }
                 } else if child_path.is_file() {
+                    println!("Adding FILE {}", child_path.display());
                     // If the child is a file, add its path to the current node's `files`.
-                    current_node.files.push(child_path);
+                    current_node.children.push(LayoutTreeNode {
+                        path: child_path,
+                        children: Vec::new(),
+                    });
                 }
             }
 
@@ -169,35 +170,70 @@ impl LayoutTree {
         }
 
         // After the walk, the map should contain exactly one node: the root.
-        let root_node = completed_nodes.remove(&root_path).ok_or_else(|| {
+        let mut root_node = completed_nodes.remove(&root_path).ok_or_else(|| {
             std::io::Error::new(
                 std::io::ErrorKind::NotFound,
                 "Root node not found after walk; the directory may be empty or invalid.",
             )
         })?;
 
+        fn redact_node(node: &mut LayoutTreeNode) {
+            let e2e = assert_e2e();
+            let redactions = e2e.redactions();
+            let redact_path = |path: &mut PathBuf| {
+                let r = redactions.redact(&path.to_string_lossy());
+                *path = PathBuf::from(r)
+            };
+
+            redact_path(&mut node.path);
+            for dir in node.children.iter_mut() {
+                redact_node(dir);
+            }
+        }
+
+        // Walk the tree and add redactions
+        redact_node(&mut root_node);
+
         Ok(LayoutTree { root: root_node })
     }
 
     pub fn matches_snapshot(&self, snapshot: &Self) -> bool {
         fn matches(n: &LayoutTreeNode, snap: &LayoutTreeNode) -> bool {
-            // TODO: Handle hashing
-            if snap.files.len() != n.files.len() {
-                return false;
-            }
-            let s: HashSet<_> = n.files.clone().into_iter().collect();
-            let ss: HashSet<_> = snap.files.clone().into_iter().collect();
-            if ss != s {
-                return false;
-            }
-
-            if snap.dirs.len() != n.dirs.len() {
+            if snap.children.len() != n.children.len() {
+                println!(
+                    "snap.children = false! {:?} -- {:?}",
+                    snap.children, n.children
+                );
                 return false;
             }
 
-            for d in &n.dirs {
+            let preprocess = |mut path: PathBuf| -> PathBuf {
+                // HACK: It would be nice if we could handle redactions in a cleaner way.
+                if cfg!(not(target_os = "windows")) {
+                    if path.to_str().unwrap_or_default().ends_with("[EXE]") {
+                        let mut p = path.to_string_lossy().to_string();
+                        p.truncate(p.len() - "[EXE]".len());
+                        path = PathBuf::from(p);
+                        println!("stripped path! AFTER: {path:?}");
+                    }
+                }
+
+                path
+            };
+
+            // TODO: Check for children with no children
+
+            for d in &n.children {
                 let mut found = false;
-                for potential_match in snap.dirs.iter().filter(|p| p.path == d.path) {
+                for potential_match in snap
+                    .children
+                    .iter()
+                    .filter(|p| preprocess(p.path.clone()) == preprocess(d.path.clone()))
+                {
+                    println!(
+                        "checking potential match {}",
+                        potential_match.path.display()
+                    );
                     if matches(&d, potential_match) {
                         found = true;
                         // TODO: Maybe mark this "match" as used
@@ -206,6 +242,7 @@ impl LayoutTree {
                 }
 
                 if !found {
+                    println!("missing {:?} -- {:#?}", d.path, snap);
                     return false;
                 }
             }
@@ -255,11 +292,10 @@ impl LayoutTree {
         }
 
         // 1. Collect all directories and files into a single vector.
-        let mut children: Vec<Child> = node
-            .dirs
+        let mut children: Vec<Child<'_>> = node
+            .children
             .iter()
-            .map(Child::Dir)
-            .chain(node.files.iter().map(Child::File))
+            .map(Child::Dir) // TODO: FIX THIS -- handle files
             .collect();
 
         // 2. Sort the children alphabetically by name for a canonical output.

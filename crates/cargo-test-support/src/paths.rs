@@ -12,6 +12,9 @@ use std::sync::Mutex;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use crate::compare;
+use crate::layout::LayoutTree;
+
 static CARGO_INTEGRATION_TEST_DIR: &str = "cit";
 
 static GLOBAL_ROOT: OnceLock<Mutex<Option<PathBuf>>> = OnceLock::new();
@@ -152,6 +155,8 @@ pub trait CargoPathExt {
     fn move_in_time<F>(&self, travel_amount: F)
     where
         F: Fn(i64, u32) -> (i64, u32);
+
+    fn verify_file_layout(&self, expected: impl AsRef<str>);
 }
 
 impl CargoPathExt for Path {
@@ -236,6 +241,20 @@ impl CargoPathExt for Path {
             });
         }
     }
+
+    #[track_caller]
+    fn verify_file_layout(&self, expected: impl AsRef<str>) {
+        let actual_layout = LayoutTree::from_path(&self).unwrap();
+
+        let expected_layout = LayoutTree::parse(expected.as_ref());
+
+        if !actual_layout.matches_snapshot(&expected_layout) {
+            let actual_snapshot = actual_layout.to_string();
+            let expected_snapshot = expected_layout.to_string();
+
+            compare::assert_e2e().eq(actual_snapshot, expected_snapshot);
+        }
+    }
 }
 
 impl CargoPathExt for PathBuf {
@@ -259,6 +278,11 @@ impl CargoPathExt for PathBuf {
         F: Fn(i64, u32) -> (i64, u32),
     {
         self.as_path().move_in_time(travel_amount)
+    }
+
+    #[track_caller]
+    fn verify_file_layout(&self, expected: impl AsRef<str>) {
+        self.as_path().verify_file_layout(expected);
     }
 }
 
@@ -412,5 +436,48 @@ pub fn windows_reserved_names_are_allowed() -> bool {
         false
     } else {
         true
+    }
+}
+
+pub fn generate_tree(path: &Path) -> String {
+    let mut output = format!("{}\n", path.display());
+    generate_tree_inner(path, &[], true, &mut output);
+    return output;
+}
+
+pub fn generate_tree_inner(path: &Path, prefix_state: &[bool], last: bool, output: &mut String) {
+    let file_name = path
+        .file_name()
+        .map(|s| s.to_string_lossy())
+        .unwrap_or_else(|| path.to_string_lossy());
+
+    if !prefix_state.is_empty() {
+        // Build indentation based on ancestor "lastness"
+        let mut indent = String::new();
+        for &has_more_siblings in &prefix_state[..prefix_state.len() - 1] {
+            indent.push_str(if has_more_siblings { "│   " } else { "    " });
+        }
+        let connector = if last { "└── " } else { "├── " };
+        output.push_str(&format!("{indent}{connector}{file_name}\n"));
+    }
+
+    if path.is_dir() {
+        let mut entries: Vec<_> = walkdir::WalkDir::new(path)
+            .max_depth(1)
+            .into_iter()
+            .filter_map(Result::ok)
+            .filter(|e| e.path() != path) // skip the dir itself
+            .collect();
+
+        entries.sort_by_key(|e| e.file_name().to_os_string());
+
+        let count = entries.len();
+        for (i, entry) in entries.into_iter().enumerate() {
+            let is_last = i == count - 1;
+            // push info about *this* level for children
+            let mut new_prefix_state = prefix_state.to_vec();
+            new_prefix_state.push(!is_last);
+            generate_tree_inner(entry.path(), &new_prefix_state, is_last, output);
+        }
     }
 }

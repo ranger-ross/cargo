@@ -29,7 +29,7 @@ fn binary_with_debug() {
         )
         .build();
 
-    p.cargo("build").enable_mac_dsym().run();
+    p.cargo("build").run();
 
     assert_not_exists(&p.root().join("target"));
 
@@ -45,6 +45,8 @@ fn binary_with_debug() {
     │       ├── bin-foo
     │       ├── bin-foo.json
     │       ├── dep-bin-foo
+    │       ├── win-only.json [target_os=windows]
+    │       ├── macos-only.json [target_os=macos]
     │       └── invoked.timestamp
     ├── build
     ├── deps
@@ -84,7 +86,7 @@ fn binary_with_release() {
         )
         .build();
 
-    p.cargo("build --release").enable_mac_dsym().run();
+    p.cargo("build --release").run();
 
     p.root().join("build-dir").verify_file_layout(
         r#"
@@ -187,7 +189,7 @@ fn libs() {
             )
             .build();
 
-        p.cargo("build").enable_mac_dsym().run();
+        p.cargo("build").run();
 
         assert_build_dir_layout(p.root().join("build-dir"), "debug");
 
@@ -202,7 +204,7 @@ fn should_default_to_target() {
         .file("src/main.rs", r#"fn main() { println!("Hello, World!") }"#)
         .build();
 
-    p.cargo("build").enable_mac_dsym().run();
+    p.cargo("build").run();
 
     p.root().join("target").verify_file_layout(
         r#"
@@ -238,7 +240,6 @@ fn should_respect_env_var() {
 
     p.cargo("build")
         .env("CARGO_BUILD_BUILD_DIR", "build-dir")
-        .enable_mac_dsym()
         .run();
 
     p.root().join("build-dir").verify_file_layout(
@@ -291,7 +292,7 @@ fn build_script_should_output_to_build_dir() {
         )
         .build();
 
-    p.cargo("build").enable_mac_dsym().run();
+    p.cargo("build").run();
 
     assert_build_dir_layout(p.root().join("build-dir"), "debug");
     assert_exists_patterns_with_base_dir(
@@ -330,7 +331,7 @@ fn cargo_tmpdir_should_output_to_build_dir() {
         )
         .build();
 
-    p.cargo("test").enable_mac_dsym().run();
+    p.cargo("test").run();
 
     p.root().join("build-dir").verify_file_layout(
         r#"
@@ -399,7 +400,7 @@ fn examples_should_output_to_build_dir_and_uplift_to_target_dir() {
         )
         .build();
 
-    p.cargo("build --examples").enable_mac_dsym().run();
+    p.cargo("build --examples").run();
 
     p.root().join("build-dir").verify_file_layout(
         r#"
@@ -453,7 +454,7 @@ fn benches_should_output_to_build_dir() {
         )
         .build();
 
-    p.cargo("build --bench=foo").enable_mac_dsym().run();
+    p.cargo("build --bench=foo").run();
 
     p.root().join("build-dir").verify_file_layout(
         r#"
@@ -513,7 +514,7 @@ fn cargo_doc_should_output_to_target_dir() {
         )
         .build();
 
-    p.cargo("doc").enable_mac_dsym().run();
+    p.cargo("doc").run();
 
     let docs_dir = p.root().join("target-dir/doc");
 
@@ -535,7 +536,7 @@ fn cargo_package_should_build_in_build_dir_and_output_to_target_dir() {
         )
         .build();
 
-    p.cargo("package").enable_mac_dsym().run();
+    p.cargo("package").run();
 
     p.root().join("build-dir").verify_file_layout(
         r#"
@@ -592,7 +593,7 @@ fn cargo_clean_should_clean_the_target_dir_and_build_dir() {
         )
         .build();
 
-    p.cargo("build").enable_mac_dsym().run();
+    p.cargo("build").run();
 
     p.root().join("build-dir").verify_file_layout(
         r#"
@@ -630,7 +631,7 @@ fn cargo_clean_should_clean_the_target_dir_and_build_dir() {
 "#,
     );
 
-    p.cargo("clean").enable_mac_dsym().run();
+    p.cargo("clean").run();
 
     assert_not_exists(&p.root().join("build-dir"));
     assert_not_exists(&p.root().join("target-dir"));
@@ -650,7 +651,7 @@ fn timings_report_should_output_to_target_dir() {
         )
         .build();
 
-    p.cargo("build --timings").enable_mac_dsym().run();
+    p.cargo("build --timings").run();
 
     assert_exists(&p.root().join("target-dir/cargo-timings/cargo-timing.html"));
 }
@@ -695,7 +696,6 @@ fn template_should_error_for_invalid_variables() {
         .build();
 
     p.cargo("build")
-        .enable_mac_dsym()
         .with_status(101)
         .with_stderr_data(str![[r#"
 [ERROR] unexpected variable `fake` in build.build-dir path `{fake}/build-dir`
@@ -744,7 +744,7 @@ fn template_workspace_root() {
         )
         .build();
 
-    p.cargo("build").enable_mac_dsym().run();
+    p.cargo("build").run();
 
     p.root().join("build-dir").verify_file_layout(
         r#"
@@ -797,7 +797,7 @@ fn template_cargo_cache_home() {
         )
         .build();
 
-    p.cargo("build").enable_mac_dsym().run();
+    p.cargo("build").run();
 
     paths::cargo_home().join("build-dir").verify_file_layout(
         r#"
@@ -860,7 +860,7 @@ fn template_workspace_path_hash() {
         )
         .build();
 
-    p.cargo("build").enable_mac_dsym().run();
+    p.cargo("build").run();
 
     let foo_dir = p.root().join("foo");
     assert_exists(&foo_dir);
@@ -938,7 +938,7 @@ fn template_workspace_path_hash_should_handle_symlink() {
         .build();
 
     // Build from the non-symlinked directory
-    p.cargo("check").enable_mac_dsym().run();
+    p.cargo("check").run();
 
     // Parse and verify the hash dir created from the non-symlinked dir
     let foo_dir = p.root().join("foo");
@@ -990,7 +990,7 @@ fn template_workspace_path_hash_should_handle_symlink() {
     foo_dir.rm_rf();
 
     // Run cargo from the symlinked dir
-    p.cargo("check").cwd(&symlinked_dir).enable_mac_dsym().run();
+    p.cargo("check").cwd(&symlinked_dir).run();
 
     // Parse and verify the hash created from the symlinked dir
     assert_exists(&foo_dir);

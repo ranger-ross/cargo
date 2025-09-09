@@ -393,6 +393,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, info};
 
 use crate::core::Package;
+use crate::core::compiler::CompileKind;
 use crate::core::compiler::unit_graph::UnitDep;
 use crate::util;
 use crate::util::errors::CargoResult;
@@ -447,6 +448,19 @@ pub fn prepare_target(
     let Some(dirty_reason) = dirty_reason else {
         return Ok(Job::new_fresh());
     };
+
+    let tt = build_runner.files().pkg_dir(&unit);
+    let o = build_runner
+        .files()
+        .layout(CompileKind::Host)
+        .build_unit(&tt);
+    // println!("o: {o:?}");
+    let cache = build_runner.bcx.shared_cache.clone();
+    let cache_key = cache.key(unit, fingerprint.clone());
+
+    if build_runner.bcx.shared_cache.load(&cache_key, &o) {
+        return Ok(Job::new_fresh());
+    }
 
     // We're going to rebuild, so ensure the source of the crate passes all
     // verification checks before we build it.
@@ -529,10 +543,18 @@ pub fn prepare_target(
                 *fingerprint.local.lock().unwrap() = new_local;
             }
 
-            write_fingerprint(&loc, &fingerprint)
+            let ret = write_fingerprint(&loc, &fingerprint);
+
+            return ret;
         })
     } else {
-        Work::new(move |_| write_fingerprint(&loc, &fingerprint))
+        Work::new(move |_| {
+            let ret = write_fingerprint(&loc, &fingerprint);
+
+            cache.save(&cache_key, &o);
+
+            return ret;
+        })
     };
 
     Ok(Job::new_dirty(write_fingerprint, dirty_reason))
@@ -963,7 +985,7 @@ impl Fingerprint {
         *self.memoized_hash.lock().unwrap() = None;
     }
 
-    fn hash_u64(&self) -> u64 {
+    pub fn hash_u64(&self) -> u64 {
         if let Some(s) = *self.memoized_hash.lock().unwrap() {
             return s;
         }

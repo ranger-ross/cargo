@@ -2,14 +2,18 @@
 
 use crate::core::PackageSet;
 use crate::core::Workspace;
+use crate::core::compiler::fingerprint::Fingerprint;
 use crate::core::compiler::unit_graph::UnitGraph;
 use crate::core::compiler::{BuildConfig, CompileKind, Unit};
 use crate::core::profiles::Profiles;
 use crate::util::Rustc;
+use crate::util::cache_lock;
 use crate::util::context::GlobalContext;
 use crate::util::errors::CargoResult;
 use crate::util::interning::InternedString;
 use std::collections::{HashMap, HashSet};
+use std::path::Path;
+use std::sync::Arc;
 
 mod target_info;
 pub use self::target_info::{
@@ -78,6 +82,55 @@ pub struct BuildContext<'a, 'gctx> {
 
     /// The list of all kinds that are involved in this build
     pub all_kinds: HashSet<CompileKind>,
+
+    pub shared_cache: Arc<SharedBuildCache>,
+}
+
+pub struct SharedBuildCache;
+
+impl SharedBuildCache {
+    pub fn key(&self, unit: &Unit, fingerprint: Arc<Fingerprint>) -> String {
+        format!("{}-{}", unit.pkg.name(), fingerprint.hash_u64())
+    }
+
+    pub fn load(&self, cache_key: &str, path: &Path) -> bool {
+        let p = "/home/ross/projects/cargo-cache";
+
+        println!("Checking check {}", cache_key);
+        let c = format!("{p}/{cache_key}");
+        if !std::path::PathBuf::from(&c).exists() {
+            return false;
+        }
+
+        copy_dir_all(c, path).unwrap();
+
+        return true;
+    }
+
+    pub fn save(&self, cache_key: &str, path: &Path) {
+        let p = "/home/ross/projects/cargo-cache";
+        println!("saving cache {cache_key} -- {path:?}");
+        let c = format!("{p}/{cache_key}");
+        if std::path::PathBuf::from(&c).exists() {
+            return;
+        }
+
+        copy_dir_all(path, c).unwrap();
+    }
+}
+
+fn copy_dir_all(src: impl AsRef<Path>, dst: impl AsRef<Path>) -> std::io::Result<()> {
+    std::fs::create_dir_all(&dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let ty = entry.file_type()?;
+        if ty.is_dir() {
+            copy_dir_all(entry.path(), dst.as_ref().join(entry.file_name()))?;
+        } else {
+            std::fs::copy(entry.path(), dst.as_ref().join(entry.file_name()))?;
+        }
+    }
+    Ok(())
 }
 
 impl<'a, 'gctx> BuildContext<'a, 'gctx> {
@@ -111,6 +164,7 @@ impl<'a, 'gctx> BuildContext<'a, 'gctx> {
             unit_graph,
             scrape_units,
             all_kinds,
+            shared_cache: Arc::new(SharedBuildCache),
         })
     }
 

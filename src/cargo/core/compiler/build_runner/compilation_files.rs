@@ -234,7 +234,7 @@ impl<'a, 'gctx: 'a> CompilationFiles<'a, 'gctx> {
     ///
     /// Note that some units may share the same directory, so care should be
     /// taken in those cases!
-    fn pkg_dir(&self, unit: &Unit) -> String {
+    pub fn pkg_dir(&self, unit: &Unit) -> String {
         let name = unit.pkg.package_id().name();
         let meta = self.metas[unit];
         if let Some(c_extra_filename) = meta.c_extra_filename() {

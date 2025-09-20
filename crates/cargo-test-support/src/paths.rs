@@ -1,6 +1,8 @@
 //! Access common paths and manipulate the filesystem
 
 use filetime::FileTime;
+use itertools::Itertools;
+use walkdir::WalkDir;
 
 use std::cell::RefCell;
 use std::env;
@@ -11,6 +13,9 @@ use std::process::Command;
 use std::sync::Mutex;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
+
+use crate::compare::assert_e2e;
+use crate::compare::match_contains;
 
 static CARGO_INTEGRATION_TEST_DIR: &str = "cit";
 
@@ -152,6 +157,10 @@ pub trait CargoPathExt {
     fn move_in_time<F>(&self, travel_amount: F)
     where
         F: Fn(i64, u32) -> (i64, u32);
+
+    fn assert_build_dir_layout(&self, expected: impl snapbox::IntoData);
+
+    fn assert_dir_layout(&self, expected: impl snapbox::IntoData, ignored_path_patterns: &[String]);
 }
 
 impl CargoPathExt for Path {
@@ -236,6 +245,37 @@ impl CargoPathExt for Path {
             });
         }
     }
+
+    #[track_caller]
+    fn assert_build_dir_layout(&self, expected: impl snapbox::IntoData) {
+        self.assert_dir_layout(expected.unordered(), &build_dir_ignored_path_patterns());
+    }
+
+    #[track_caller]
+    fn assert_dir_layout(
+        &self,
+        expected: impl snapbox::IntoData,
+        ignored_path_patterns: &[String],
+    ) {
+        let assert = assert_e2e();
+        let actual = WalkDir::new(self)
+            .sort_by_file_name()
+            .into_iter()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_type().is_file())
+            .map(|e| e.path().to_string_lossy().into_owned())
+            .filter(|file| {
+                for ignored in ignored_path_patterns {
+                    if match_contains(&ignored, file, &assert.redactions()).is_ok() {
+                        return false;
+                    }
+                }
+                return true;
+            })
+            .join("\n");
+
+        assert.eq(format!("{actual}\n"), expected);
+    }
 }
 
 impl CargoPathExt for PathBuf {
@@ -259,6 +299,21 @@ impl CargoPathExt for PathBuf {
         F: Fn(i64, u32) -> (i64, u32),
     {
         self.as_path().move_in_time(travel_amount)
+    }
+
+    #[track_caller]
+    fn assert_build_dir_layout(&self, expected: impl snapbox::IntoData) {
+        self.as_path().assert_build_dir_layout(expected);
+    }
+
+    #[track_caller]
+    fn assert_dir_layout(
+        &self,
+        expected: impl snapbox::IntoData,
+        ignored_path_patterns: &[String],
+    ) {
+        self.as_path()
+            .assert_dir_layout(expected, ignored_path_patterns);
     }
 }
 
@@ -288,6 +343,20 @@ where
             panic!("failed to {} {}: {}", desc, path.display(), e);
         }
     }
+}
+
+/// The paths to ignore when [`CargoPathExt::assert_build_dir_layout`] is called
+fn build_dir_ignored_path_patterns() -> Vec<String> {
+    vec![
+        // Ignore MacOS debug symbols as there are many files/directories that would clutter up
+        // tests few not a lot of benefit.
+        "[..].dSYM/[..]",
+        // Ignore Windows debub symbols files (.pdb)
+        "[..].pdb",
+    ]
+    .into_iter()
+    .map(ToString::to_string)
+    .collect()
 }
 
 /// Get the filename for a library.

@@ -6,8 +6,7 @@
 //! file verify the files saved to disk are in the correct locations according to the `build-dir`
 //! configuration.
 //!
-//! Tests check if directories match some "layout" by using [`assert_build_dir_layout`] and
-//! [`assert_artifact_dir_layout`].
+//! Tests check if directories match some "layout" by using [`CargoPathExt::assert_file_layout`]
 
 use std::path::PathBuf;
 
@@ -30,20 +29,23 @@ fn binary_with_debug() {
         )
         .build();
 
-    p.cargo("build").enable_mac_dsym().run();
+    p.cargo("-Zbuild-dir-new-layout build")
+        .masquerade_as_nightly_cargo(&["new build-dir layout"])
+        .enable_mac_dsym()
+        .run();
 
     assert_not_exists(&p.root().join("target"));
 
     p.root().join("build-dir").assert_file_layout(str![[r#"
-[ROOT]/foo/build-dir/CACHEDIR.TAG
-[ROOT]/foo/build-dir/debug/.cargo-lock
-[ROOT]/foo/build-dir/debug/deps/foo[..].d
-[ROOT]/foo/build-dir/debug/deps/foo[..][EXE]
-[ROOT]/foo/build-dir/debug/.fingerprint/foo-[HASH]/invoked.timestamp
-[ROOT]/foo/build-dir/debug/.fingerprint/foo-[HASH]/dep-bin-foo
-[ROOT]/foo/build-dir/debug/.fingerprint/foo-[HASH]/bin-foo
-[ROOT]/foo/build-dir/debug/.fingerprint/foo-[HASH]/bin-foo.json
 [ROOT]/foo/build-dir/.rustc_info.json
+[ROOT]/foo/build-dir/[HOST_TARGET]/CACHEDIR.TAG
+[ROOT]/foo/build-dir/[HOST_TARGET]/debug/.cargo-lock
+[ROOT]/foo/build-dir/[HOST_TARGET]/debug/build/foo-[HASH]/deps/foo[..].d
+[ROOT]/foo/build-dir/[HOST_TARGET]/debug/build/foo-[HASH]/deps/foo[..][EXE]
+[ROOT]/foo/build-dir/[HOST_TARGET]/debug/build/foo-[HASH]/fingerprint/invoked.timestamp
+[ROOT]/foo/build-dir/[HOST_TARGET]/debug/build/foo-[HASH]/fingerprint/dep-bin-foo
+[ROOT]/foo/build-dir/[HOST_TARGET]/debug/build/foo-[HASH]/fingerprint/bin-foo
+[ROOT]/foo/build-dir/[HOST_TARGET]/debug/build/foo-[HASH]/fingerprint/bin-foo.json
 
 "#]]);
 
@@ -70,31 +72,22 @@ fn binary_with_release() {
         )
         .build();
 
-    p.cargo("build --release").enable_mac_dsym().run();
+    p.cargo("-Zbuild-dir-new-layout build --release")
+        .masquerade_as_nightly_cargo(&["new build-dir layout"])
+        .enable_mac_dsym()
+        .run();
 
-    assert_build_dir_layout(p.root().join("build-dir"), "release");
     assert_exists(&p.root().join(format!("target-dir/release/foo{EXE_SUFFIX}")));
-    assert_exists_patterns_with_base_dir(
-        &p.root(),
-        &[
-            // Check the pre-uplifted binary in the build-dir
-            &format!("build-dir/release/deps/foo*{EXE_SUFFIX}"),
-            "build-dir/release/deps/foo*.d",
-            // Verify the binary was copied to the target-dir
-            &format!("target-dir/release/foo{EXE_SUFFIX}"),
-            "target-dir/release/foo.d",
-        ],
-    );
     p.root().join("build-dir").assert_file_layout(str![[r#"
-[ROOT]/foo/build-dir/CACHEDIR.TAG
-[ROOT]/foo/build-dir/release/.cargo-lock
-[ROOT]/foo/build-dir/release/deps/foo[..].d
-[ROOT]/foo/build-dir/release/deps/foo[..][EXE]
-[ROOT]/foo/build-dir/release/.fingerprint/foo-[HASH]/invoked.timestamp
-[ROOT]/foo/build-dir/release/.fingerprint/foo-[HASH]/dep-bin-foo
-[ROOT]/foo/build-dir/release/.fingerprint/foo-[HASH]/bin-foo
-[ROOT]/foo/build-dir/release/.fingerprint/foo-[HASH]/bin-foo.json
 [ROOT]/foo/build-dir/.rustc_info.json
+[ROOT]/foo/build-dir/[HOST_TARGET]/CACHEDIR.TAG
+[ROOT]/foo/build-dir/[HOST_TARGET]/release/.cargo-lock
+[ROOT]/foo/build-dir/[HOST_TARGET]/release/build/foo-[HASH]/deps/foo[..].d
+[ROOT]/foo/build-dir/[HOST_TARGET]/release/build/foo-[HASH]/deps/foo[..][EXE]
+[ROOT]/foo/build-dir/[HOST_TARGET]/release/build/foo-[HASH]/fingerprint/invoked.timestamp
+[ROOT]/foo/build-dir/[HOST_TARGET]/release/build/foo-[HASH]/fingerprint/dep-bin-foo
+[ROOT]/foo/build-dir/[HOST_TARGET]/release/build/foo-[HASH]/fingerprint/bin-foo
+[ROOT]/foo/build-dir/[HOST_TARGET]/release/build/foo-[HASH]/fingerprint/bin-foo.json
 
 "#]]);
 
@@ -171,9 +164,10 @@ fn libs() {
             )
             .build();
 
-        p.cargo("build").enable_mac_dsym().run();
-
-        assert_build_dir_layout(p.root().join("build-dir"), "debug");
+        p.cargo("-Zbuild-dir-new-layout build")
+            .masquerade_as_nightly_cargo(&["new build-dir layout"])
+            .enable_mac_dsym()
+            .run();
 
         // Verify lib artifacts were copied into the artifact dir
         assert_exists_patterns_with_base_dir(&p.root().join("target-dir/debug"), &expected_files);
@@ -186,22 +180,26 @@ fn should_default_to_target() {
         .file("src/main.rs", r#"fn main() { println!("Hello, World!") }"#)
         .build();
 
-    p.cargo("build").enable_mac_dsym().run();
+    p.cargo("-Zbuild-dir-new-layout build")
+        .masquerade_as_nightly_cargo(&["new build-dir layout"])
+        .enable_mac_dsym()
+        .run();
 
-    assert_build_dir_layout(p.root().join("target"), "debug");
     assert_exists(&p.root().join(format!("target/debug/foo{EXE_SUFFIX}")));
     p.root().join("target").assert_file_layout(str![[r#"
 [ROOT]/foo/target/CACHEDIR.TAG
 [ROOT]/foo/target/debug/.cargo-lock
-[ROOT]/foo/target/debug/deps/foo[..].d
-[ROOT]/foo/target/debug/deps/foo[..][EXE]
-[ROOT]/foo/target/debug/.fingerprint/foo-[HASH]/invoked.timestamp
-[ROOT]/foo/target/debug/.fingerprint/foo-[HASH]/dep-bin-foo
-[ROOT]/foo/target/debug/.fingerprint/foo-[HASH]/bin-foo
-[ROOT]/foo/target/debug/.fingerprint/foo-[HASH]/bin-foo.json
 [ROOT]/foo/target/debug/foo[EXE]
 [ROOT]/foo/target/debug/foo.d
 [ROOT]/foo/target/.rustc_info.json
+[ROOT]/foo/target/[HOST_TARGET]/CACHEDIR.TAG
+[ROOT]/foo/target/[HOST_TARGET]/debug/.cargo-lock
+[ROOT]/foo/target/[HOST_TARGET]/debug/build/foo-[HASH]/deps/foo[..].d
+[ROOT]/foo/target/[HOST_TARGET]/debug/build/foo-[HASH]/deps/foo[..][EXE]
+[ROOT]/foo/target/[HOST_TARGET]/debug/build/foo-[HASH]/fingerprint/invoked.timestamp
+[ROOT]/foo/target/[HOST_TARGET]/debug/build/foo-[HASH]/fingerprint/dep-bin-foo
+[ROOT]/foo/target/[HOST_TARGET]/debug/build/foo-[HASH]/fingerprint/bin-foo
+[ROOT]/foo/target/[HOST_TARGET]/debug/build/foo-[HASH]/fingerprint/bin-foo.json
 
 "#]]);
 }
@@ -212,23 +210,23 @@ fn should_respect_env_var() {
         .file("src/main.rs", r#"fn main() { println!("Hello, World!") }"#)
         .build();
 
-    p.cargo("build")
+    p.cargo("-Zbuild-dir-new-layout build")
+        .masquerade_as_nightly_cargo(&["new build-dir layout"])
         .env("CARGO_BUILD_BUILD_DIR", "build-dir")
         .enable_mac_dsym()
         .run();
 
-    assert_build_dir_layout(p.root().join("build-dir"), "debug");
     assert_exists(&p.root().join(format!("target/debug/foo{EXE_SUFFIX}")));
     p.root().join("build-dir").assert_file_layout(str![[r#"
-[ROOT]/foo/build-dir/CACHEDIR.TAG
-[ROOT]/foo/build-dir/debug/.cargo-lock
-[ROOT]/foo/build-dir/debug/deps/foo[..].d
-[ROOT]/foo/build-dir/debug/deps/foo[..][EXE]
-[ROOT]/foo/build-dir/debug/.fingerprint/foo-[HASH]/invoked.timestamp
-[ROOT]/foo/build-dir/debug/.fingerprint/foo-[HASH]/dep-bin-foo
-[ROOT]/foo/build-dir/debug/.fingerprint/foo-[HASH]/bin-foo
-[ROOT]/foo/build-dir/debug/.fingerprint/foo-[HASH]/bin-foo.json
 [ROOT]/foo/build-dir/.rustc_info.json
+[ROOT]/foo/build-dir/[HOST_TARGET]/CACHEDIR.TAG
+[ROOT]/foo/build-dir/[HOST_TARGET]/debug/.cargo-lock
+[ROOT]/foo/build-dir/[HOST_TARGET]/debug/build/foo-[HASH]/deps/foo[..].d
+[ROOT]/foo/build-dir/[HOST_TARGET]/debug/build/foo-[HASH]/deps/foo[..][EXE]
+[ROOT]/foo/build-dir/[HOST_TARGET]/debug/build/foo-[HASH]/fingerprint/invoked.timestamp
+[ROOT]/foo/build-dir/[HOST_TARGET]/debug/build/foo-[HASH]/fingerprint/dep-bin-foo
+[ROOT]/foo/build-dir/[HOST_TARGET]/debug/build/foo-[HASH]/fingerprint/bin-foo
+[ROOT]/foo/build-dir/[HOST_TARGET]/debug/build/foo-[HASH]/fingerprint/bin-foo.json
 
 "#]]);
 }
@@ -259,16 +257,37 @@ fn build_script_should_output_to_build_dir() {
         )
         .build();
 
-    p.cargo("build").enable_mac_dsym().run();
+    p.cargo("-Zbuild-dir-new-layout build")
+        .masquerade_as_nightly_cargo(&["new build-dir layout"])
+        .enable_mac_dsym()
+        .run();
 
-    assert_build_dir_layout(p.root().join("build-dir"), "debug");
-    assert_exists_patterns_with_base_dir(
-        &p.root(),
-        &[
-            &format!("build-dir/debug/build/foo-*/build-script-build{EXE_SUFFIX}"),
-            "build-dir/debug/build/foo-*/out/foo.txt", // Verify OUT_DIR
-        ],
-    );
+    p.root().join("build-dir").assert_file_layout(str![[r#"
+[ROOT]/foo/build-dir/.rustc_info.json
+[ROOT]/foo/build-dir/[HOST_TARGET]/CACHEDIR.TAG
+[ROOT]/foo/build-dir/[HOST_TARGET]/debug/.cargo-lock
+[ROOT]/foo/build-dir/[HOST_TARGET]/debug/build/foo-[HASH]/deps/foo[..].d
+[ROOT]/foo/build-dir/[HOST_TARGET]/debug/build/foo-[HASH]/deps/foo[..][EXE]
+[ROOT]/foo/build-dir/[HOST_TARGET]/debug/build/foo-[HASH]/fingerprint/invoked.timestamp
+[ROOT]/foo/build-dir/[HOST_TARGET]/debug/build/foo-[HASH]/fingerprint/dep-bin-foo
+[ROOT]/foo/build-dir/[HOST_TARGET]/debug/build/foo-[HASH]/fingerprint/bin-foo
+[ROOT]/foo/build-dir/[HOST_TARGET]/debug/build/foo-[HASH]/fingerprint/bin-foo.json
+[ROOT]/foo/build-dir/[HOST_TARGET]/debug/build/foo-[HASH]/fingerprint/run-build-script-build-script-build
+[ROOT]/foo/build-dir/[HOST_TARGET]/debug/build/foo-[HASH]/fingerprint/run-build-script-build-script-build.json
+[ROOT]/foo/build-dir/[HOST_TARGET]/debug/build/foo-[HASH]/build-script-execution/out/foo.txt
+[ROOT]/foo/build-dir/[HOST_TARGET]/debug/build/foo-[HASH]/build-script-execution/invoked.timestamp
+[ROOT]/foo/build-dir/[HOST_TARGET]/debug/build/foo-[HASH]/build-script-execution/output
+[ROOT]/foo/build-dir/[HOST_TARGET]/debug/build/foo-[HASH]/build-script-execution/stderr
+[ROOT]/foo/build-dir/[HOST_TARGET]/debug/build/foo-[HASH]/build-script-execution/root-output
+[ROOT]/foo/build-dir/[HOST_TARGET]/debug/build/foo-[HASH]/build-script/build_script_build-[HASH].d
+[ROOT]/foo/build-dir/[HOST_TARGET]/debug/build/foo-[HASH]/build-script/build_script_build-[HASH]
+[ROOT]/foo/build-dir/[HOST_TARGET]/debug/build/foo-[HASH]/build-script/build-script-build
+[ROOT]/foo/build-dir/[HOST_TARGET]/debug/build/foo-[HASH]/fingerprint/invoked.timestamp
+[ROOT]/foo/build-dir/[HOST_TARGET]/debug/build/foo-[HASH]/fingerprint/dep-build-script-build-script-build
+[ROOT]/foo/build-dir/[HOST_TARGET]/debug/build/foo-[HASH]/fingerprint/build-script-build-script-build
+[ROOT]/foo/build-dir/[HOST_TARGET]/debug/build/foo-[HASH]/fingerprint/build-script-build-script-build.json
+
+"#]]);
 }
 
 #[cargo_test]
@@ -298,33 +317,34 @@ fn cargo_tmpdir_should_output_to_build_dir() {
         )
         .build();
 
-    p.cargo("test").enable_mac_dsym().run();
+    p.cargo("-Zbuild-dir-new-layout test")
+        .masquerade_as_nightly_cargo(&["new build-dir layout"])
+        .enable_mac_dsym()
+        .run();
 
-    assert_build_dir_layout(p.root().join("build-dir"), "debug");
-    assert_exists(&p.root().join(format!("build-dir/tmp/foo.txt")));
     p.root().join("build-dir").assert_file_layout(str![[r#"
-[ROOT]/foo/build-dir/CACHEDIR.TAG
-[ROOT]/foo/build-dir/debug/.cargo-lock
-[ROOT]/foo/build-dir/debug/deps/foo-[HASH].d
-[ROOT]/foo/build-dir/debug/deps/foo-[HASH].d
-[ROOT]/foo/build-dir/debug/deps/foo[..].d
-[ROOT]/foo/build-dir/debug/deps/foo-[HASH][EXE]
-[ROOT]/foo/build-dir/debug/deps/foo-[HASH][EXE]
-[ROOT]/foo/build-dir/debug/deps/foo[..][EXE]
-[ROOT]/foo/build-dir/debug/.fingerprint/foo-[HASH]/invoked.timestamp
-[ROOT]/foo/build-dir/debug/.fingerprint/foo-[HASH]/dep-test-bin-foo
-[ROOT]/foo/build-dir/debug/.fingerprint/foo-[HASH]/test-bin-foo
-[ROOT]/foo/build-dir/debug/.fingerprint/foo-[HASH]/test-bin-foo.json
-[ROOT]/foo/build-dir/debug/.fingerprint/foo-[HASH]/invoked.timestamp
-[ROOT]/foo/build-dir/debug/.fingerprint/foo-[HASH]/dep-test-integration-test-foo
-[ROOT]/foo/build-dir/debug/.fingerprint/foo-[HASH]/test-integration-test-foo
-[ROOT]/foo/build-dir/debug/.fingerprint/foo-[HASH]/test-integration-test-foo.json
-[ROOT]/foo/build-dir/debug/.fingerprint/foo-[HASH]/invoked.timestamp
-[ROOT]/foo/build-dir/debug/.fingerprint/foo-[HASH]/dep-bin-foo
-[ROOT]/foo/build-dir/debug/.fingerprint/foo-[HASH]/bin-foo
-[ROOT]/foo/build-dir/debug/.fingerprint/foo-[HASH]/bin-foo.json
-[ROOT]/foo/build-dir/tmp/foo.txt
 [ROOT]/foo/build-dir/.rustc_info.json
+[ROOT]/foo/build-dir/[HOST_TARGET]/CACHEDIR.TAG
+[ROOT]/foo/build-dir/[HOST_TARGET]/debug/.cargo-lock
+[ROOT]/foo/build-dir/[HOST_TARGET]/debug/build/foo-[HASH]/deps/foo[..].d
+[ROOT]/foo/build-dir/[HOST_TARGET]/debug/build/foo-[HASH]/deps/foo[..][EXE]
+[ROOT]/foo/build-dir/[HOST_TARGET]/debug/build/foo-[HASH]/fingerprint/invoked.timestamp
+[ROOT]/foo/build-dir/[HOST_TARGET]/debug/build/foo-[HASH]/fingerprint/dep-test-integration-test-foo
+[ROOT]/foo/build-dir/[HOST_TARGET]/debug/build/foo-[HASH]/fingerprint/test-integration-test-foo
+[ROOT]/foo/build-dir/[HOST_TARGET]/debug/build/foo-[HASH]/fingerprint/test-integration-test-foo.json
+[ROOT]/foo/build-dir/[HOST_TARGET]/debug/build/foo-[HASH]/deps/foo-[HASH].d
+[ROOT]/foo/build-dir/[HOST_TARGET]/debug/build/foo-[HASH]/deps/foo-[HASH][EXE]
+[ROOT]/foo/build-dir/[HOST_TARGET]/debug/build/foo-[HASH]/fingerprint/invoked.timestamp
+[ROOT]/foo/build-dir/[HOST_TARGET]/debug/build/foo-[HASH]/fingerprint/dep-test-bin-foo
+[ROOT]/foo/build-dir/[HOST_TARGET]/debug/build/foo-[HASH]/fingerprint/test-bin-foo
+[ROOT]/foo/build-dir/[HOST_TARGET]/debug/build/foo-[HASH]/fingerprint/test-bin-foo.json
+[ROOT]/foo/build-dir/[HOST_TARGET]/debug/build/foo-[HASH]/deps/foo-[HASH].d
+[ROOT]/foo/build-dir/[HOST_TARGET]/debug/build/foo-[HASH]/deps/foo-[HASH][EXE]
+[ROOT]/foo/build-dir/[HOST_TARGET]/debug/build/foo-[HASH]/fingerprint/invoked.timestamp
+[ROOT]/foo/build-dir/[HOST_TARGET]/debug/build/foo-[HASH]/fingerprint/dep-bin-foo
+[ROOT]/foo/build-dir/[HOST_TARGET]/debug/build/foo-[HASH]/fingerprint/bin-foo
+[ROOT]/foo/build-dir/[HOST_TARGET]/debug/build/foo-[HASH]/fingerprint/bin-foo.json
+[ROOT]/foo/build-dir/[HOST_TARGET]/tmp/foo.txt
 
 "#]]);
 
@@ -351,30 +371,21 @@ fn examples_should_output_to_build_dir_and_uplift_to_target_dir() {
         )
         .build();
 
-    p.cargo("build --examples").enable_mac_dsym().run();
+    p.cargo("-Zbuild-dir-new-layout build --examples")
+        .masquerade_as_nightly_cargo(&["new build-dir layout"])
+        .enable_mac_dsym()
+        .run();
 
-    assert_build_dir_layout(p.root().join("build-dir"), "debug");
-    assert_exists_patterns_with_base_dir(
-        &p.root(),
-        &[
-            // uplifted (target-dir)
-            &format!("target-dir/debug/examples/foo{EXE_SUFFIX}"),
-            "target-dir/debug/examples/foo.d",
-            // pre-uplifted (build-dir)
-            &format!("build-dir/debug/examples/foo*{EXE_SUFFIX}"),
-            "build-dir/debug/examples/foo*.d",
-        ],
-    );
     p.root().join("build-dir").assert_file_layout(str![[r#"
-[ROOT]/foo/build-dir/CACHEDIR.TAG
-[ROOT]/foo/build-dir/debug/.cargo-lock
-[ROOT]/foo/build-dir/debug/.fingerprint/foo-[HASH]/invoked.timestamp
-[ROOT]/foo/build-dir/debug/.fingerprint/foo-[HASH]/dep-example-foo
-[ROOT]/foo/build-dir/debug/.fingerprint/foo-[HASH]/example-foo
-[ROOT]/foo/build-dir/debug/.fingerprint/foo-[HASH]/example-foo.json
-[ROOT]/foo/build-dir/debug/examples/foo[..].d
-[ROOT]/foo/build-dir/debug/examples/foo[..][EXE]
 [ROOT]/foo/build-dir/.rustc_info.json
+[ROOT]/foo/build-dir/[HOST_TARGET]/CACHEDIR.TAG
+[ROOT]/foo/build-dir/[HOST_TARGET]/debug/.cargo-lock
+[ROOT]/foo/build-dir/[HOST_TARGET]/debug/examples/foo[..].d
+[ROOT]/foo/build-dir/[HOST_TARGET]/debug/examples/foo[..][EXE]
+[ROOT]/foo/build-dir/[HOST_TARGET]/debug/build/foo-[HASH]/fingerprint/invoked.timestamp
+[ROOT]/foo/build-dir/[HOST_TARGET]/debug/build/foo-[HASH]/fingerprint/dep-example-foo
+[ROOT]/foo/build-dir/[HOST_TARGET]/debug/build/foo-[HASH]/fingerprint/example-foo
+[ROOT]/foo/build-dir/[HOST_TARGET]/debug/build/foo-[HASH]/fingerprint/example-foo.json
 
 "#]]);
 
@@ -402,32 +413,27 @@ fn benches_should_output_to_build_dir() {
         )
         .build();
 
-    p.cargo("build --bench=foo").enable_mac_dsym().run();
+    p.cargo("-Zbuild-dir-new-layout build --bench=foo")
+        .masquerade_as_nightly_cargo(&["new build-dir layout"])
+        .enable_mac_dsym()
+        .run();
 
-    assert_build_dir_layout(p.root().join("build-dir"), "debug");
-    assert_exists_patterns_with_base_dir(
-        &p.root(),
-        &[
-            &format!("build-dir/debug/deps/foo*{EXE_SUFFIX}"),
-            "build-dir/debug/deps/foo*.d",
-        ],
-    );
     p.root().join("build-dir").assert_file_layout(str![[r#"
-[ROOT]/foo/build-dir/CACHEDIR.TAG
-[ROOT]/foo/build-dir/debug/.cargo-lock
-[ROOT]/foo/build-dir/debug/deps/foo-[HASH].d
-[ROOT]/foo/build-dir/debug/deps/foo[..].d
-[ROOT]/foo/build-dir/debug/deps/foo-[HASH][EXE]
-[ROOT]/foo/build-dir/debug/deps/foo[..][EXE]
-[ROOT]/foo/build-dir/debug/.fingerprint/foo-[HASH]/invoked.timestamp
-[ROOT]/foo/build-dir/debug/.fingerprint/foo-[HASH]/dep-test-bench-foo
-[ROOT]/foo/build-dir/debug/.fingerprint/foo-[HASH]/test-bench-foo
-[ROOT]/foo/build-dir/debug/.fingerprint/foo-[HASH]/test-bench-foo.json
-[ROOT]/foo/build-dir/debug/.fingerprint/foo-[HASH]/invoked.timestamp
-[ROOT]/foo/build-dir/debug/.fingerprint/foo-[HASH]/dep-bin-foo
-[ROOT]/foo/build-dir/debug/.fingerprint/foo-[HASH]/bin-foo
-[ROOT]/foo/build-dir/debug/.fingerprint/foo-[HASH]/bin-foo.json
 [ROOT]/foo/build-dir/.rustc_info.json
+[ROOT]/foo/build-dir/[HOST_TARGET]/CACHEDIR.TAG
+[ROOT]/foo/build-dir/[HOST_TARGET]/debug/.cargo-lock
+[ROOT]/foo/build-dir/[HOST_TARGET]/debug/build/foo-[HASH]/deps/foo[..].d
+[ROOT]/foo/build-dir/[HOST_TARGET]/debug/build/foo-[HASH]/deps/foo[..][EXE]
+[ROOT]/foo/build-dir/[HOST_TARGET]/debug/build/foo-[HASH]/fingerprint/invoked.timestamp
+[ROOT]/foo/build-dir/[HOST_TARGET]/debug/build/foo-[HASH]/fingerprint/dep-bin-foo
+[ROOT]/foo/build-dir/[HOST_TARGET]/debug/build/foo-[HASH]/fingerprint/bin-foo
+[ROOT]/foo/build-dir/[HOST_TARGET]/debug/build/foo-[HASH]/fingerprint/bin-foo.json
+[ROOT]/foo/build-dir/[HOST_TARGET]/debug/build/foo-[HASH]/deps/foo-[HASH].d
+[ROOT]/foo/build-dir/[HOST_TARGET]/debug/build/foo-[HASH]/deps/foo-[HASH]
+[ROOT]/foo/build-dir/[HOST_TARGET]/debug/build/foo-[HASH]/fingerprint/invoked.timestamp
+[ROOT]/foo/build-dir/[HOST_TARGET]/debug/build/foo-[HASH]/fingerprint/dep-test-bench-foo
+[ROOT]/foo/build-dir/[HOST_TARGET]/debug/build/foo-[HASH]/fingerprint/test-bench-foo
+[ROOT]/foo/build-dir/[HOST_TARGET]/debug/build/foo-[HASH]/fingerprint/test-bench-foo.json
 
 "#]]);
 
@@ -453,7 +459,10 @@ fn cargo_doc_should_output_to_target_dir() {
         )
         .build();
 
-    p.cargo("doc").enable_mac_dsym().run();
+    p.cargo("-Zbuild-dir-new-layout doc")
+        .masquerade_as_nightly_cargo(&["new build-dir layout"])
+        .enable_mac_dsym()
+        .run();
 
     let docs_dir = p.root().join("target-dir/doc");
 
@@ -475,14 +484,11 @@ fn cargo_package_should_build_in_build_dir_and_output_to_target_dir() {
         )
         .build();
 
-    p.cargo("package").enable_mac_dsym().run();
+    p.cargo("-Zbuild-dir-new-layout package")
+        .masquerade_as_nightly_cargo(&["new build-dir layout"])
+        .enable_mac_dsym()
+        .run();
 
-    assert_build_dir_layout(p.root().join("build-dir"), "debug");
-
-    let package_artifact_dir = p.root().join("target-dir/package");
-    assert_exists(&package_artifact_dir);
-    assert_exists(&package_artifact_dir.join("foo-0.0.1.crate"));
-    assert!(package_artifact_dir.join("foo-0.0.1.crate").is_file());
     p.root().join("build-dir").assert_file_layout(str![[r#"
 [ROOT]/foo/build-dir/package/foo-0.0.1.crate
 [ROOT]/foo/build-dir/package/foo-0.0.1/Cargo.lock
@@ -491,14 +497,16 @@ fn cargo_package_should_build_in_build_dir_and_output_to_target_dir() {
 [ROOT]/foo/build-dir/package/foo-0.0.1/src/main.rs
 [ROOT]/foo/build-dir/.rustc_info.json
 [ROOT]/foo/build-dir/debug/.cargo-lock
-[ROOT]/foo/build-dir/debug/deps/foo[..].d
-[ROOT]/foo/build-dir/debug/deps/foo[..][EXE]
-[ROOT]/foo/build-dir/debug/.fingerprint/foo-[HASH]/invoked.timestamp
-[ROOT]/foo/build-dir/debug/.fingerprint/foo-[HASH]/dep-bin-foo
-[ROOT]/foo/build-dir/debug/.fingerprint/foo-[HASH]/bin-foo
-[ROOT]/foo/build-dir/debug/.fingerprint/foo-[HASH]/bin-foo.json
 [ROOT]/foo/build-dir/debug/foo[EXE]
 [ROOT]/foo/build-dir/debug/foo.d
+[ROOT]/foo/build-dir/[HOST_TARGET]/CACHEDIR.TAG
+[ROOT]/foo/build-dir/[HOST_TARGET]/debug/.cargo-lock
+[ROOT]/foo/build-dir/[HOST_TARGET]/debug/build/foo-[HASH]/deps/foo[..].d
+[ROOT]/foo/build-dir/[HOST_TARGET]/debug/build/foo-[HASH]/deps/foo[..][EXE]
+[ROOT]/foo/build-dir/[HOST_TARGET]/debug/build/foo-[HASH]/fingerprint/invoked.timestamp
+[ROOT]/foo/build-dir/[HOST_TARGET]/debug/build/foo-[HASH]/fingerprint/dep-bin-foo
+[ROOT]/foo/build-dir/[HOST_TARGET]/debug/build/foo-[HASH]/fingerprint/bin-foo
+[ROOT]/foo/build-dir/[HOST_TARGET]/debug/build/foo-[HASH]/fingerprint/bin-foo.json
 
 "#]]);
 
@@ -524,12 +532,32 @@ fn cargo_publish_should_only_touch_build_dir() {
         )
         .build();
 
-    p.cargo("publish")
+    p.cargo("-Zbuild-dir-new-layout publish")
+        .masquerade_as_nightly_cargo(&["new build-dir layout"])
         .replace_crates_io(registry.index_url())
         .enable_mac_dsym()
         .run();
 
-    assert_build_dir_layout(p.root().join("build-dir"), "debug");
+    p.root().join("build-dir").assert_file_layout(str![[r#"
+[ROOT]/foo/build-dir/.rustc_info.json
+[ROOT]/foo/build-dir/[HOST_TARGET]/CACHEDIR.TAG
+[ROOT]/foo/build-dir/[HOST_TARGET]/debug/.cargo-lock
+[ROOT]/foo/build-dir/[HOST_TARGET]/debug/build/foo-[HASH]/deps/foo[..].d
+[ROOT]/foo/build-dir/[HOST_TARGET]/debug/build/foo-[HASH]/deps/foo[..][EXE]
+[ROOT]/foo/build-dir/[HOST_TARGET]/debug/build/foo-[HASH]/fingerprint/invoked.timestamp
+[ROOT]/foo/build-dir/[HOST_TARGET]/debug/build/foo-[HASH]/fingerprint/dep-bin-foo
+[ROOT]/foo/build-dir/[HOST_TARGET]/debug/build/foo-[HASH]/fingerprint/bin-foo
+[ROOT]/foo/build-dir/[HOST_TARGET]/debug/build/foo-[HASH]/fingerprint/bin-foo.json
+[ROOT]/foo/build-dir/package/foo-0.0.1.crate
+[ROOT]/foo/build-dir/package/foo-0.0.1/Cargo.lock
+[ROOT]/foo/build-dir/package/foo-0.0.1/Cargo.toml
+[ROOT]/foo/build-dir/package/foo-0.0.1/Cargo.toml.orig
+[ROOT]/foo/build-dir/package/foo-0.0.1/src/main.rs
+[ROOT]/foo/build-dir/debug/.cargo-lock
+[ROOT]/foo/build-dir/debug/foo[EXE]
+[ROOT]/foo/build-dir/debug/foo[EXE].d
+
+"#]]);
 
     let package_artifact_dir = p.root().join("target-dir/package");
     assert!(!package_artifact_dir.exists());
@@ -554,19 +582,21 @@ fn cargo_clean_should_clean_the_target_dir_and_build_dir() {
         )
         .build();
 
-    p.cargo("build").enable_mac_dsym().run();
+    p.cargo("-Zbuild-dir-new-layout build")
+        .masquerade_as_nightly_cargo(&["new build-dir layout"])
+        .enable_mac_dsym()
+        .run();
 
-    assert_build_dir_layout(p.root().join("build-dir"), "debug");
     p.root().join("build-dir").assert_file_layout(str![[r#"
-[ROOT]/foo/build-dir/CACHEDIR.TAG
-[ROOT]/foo/build-dir/debug/.cargo-lock
-[ROOT]/foo/build-dir/debug/deps/foo[..].d
-[ROOT]/foo/build-dir/debug/deps/foo[..][EXE]
-[ROOT]/foo/build-dir/debug/.fingerprint/foo-[HASH]/invoked.timestamp
-[ROOT]/foo/build-dir/debug/.fingerprint/foo-[HASH]/dep-bin-foo
-[ROOT]/foo/build-dir/debug/.fingerprint/foo-[HASH]/bin-foo
-[ROOT]/foo/build-dir/debug/.fingerprint/foo-[HASH]/bin-foo.json
 [ROOT]/foo/build-dir/.rustc_info.json
+[ROOT]/foo/build-dir/[HOST_TARGET]/CACHEDIR.TAG
+[ROOT]/foo/build-dir/[HOST_TARGET]/debug/.cargo-lock
+[ROOT]/foo/build-dir/[HOST_TARGET]/debug/build/foo-[HASH]/deps/foo[..].d
+[ROOT]/foo/build-dir/[HOST_TARGET]/debug/build/foo-[HASH]/deps/foo[..][EXE]
+[ROOT]/foo/build-dir/[HOST_TARGET]/debug/build/foo-[HASH]/fingerprint/invoked.timestamp
+[ROOT]/foo/build-dir/[HOST_TARGET]/debug/build/foo-[HASH]/fingerprint/dep-bin-foo
+[ROOT]/foo/build-dir/[HOST_TARGET]/debug/build/foo-[HASH]/fingerprint/bin-foo
+[ROOT]/foo/build-dir/[HOST_TARGET]/debug/build/foo-[HASH]/fingerprint/bin-foo.json
 
 "#]]);
 
@@ -598,7 +628,10 @@ fn timings_report_should_output_to_target_dir() {
         )
         .build();
 
-    p.cargo("build --timings").enable_mac_dsym().run();
+    p.cargo("-Zbuild-dir-new-layout build --timings")
+        .masquerade_as_nightly_cargo(&["new build-dir layout"])
+        .enable_mac_dsym()
+        .run();
 
     assert_exists(&p.root().join("target-dir/cargo-timings/cargo-timing.html"));
 }
@@ -620,7 +653,8 @@ fn future_incompat_should_output_to_build_dir() {
         )
         .build();
 
-    p.cargo("build")
+    p.cargo("-Zbuild-dir-new-layout build")
+        .masquerade_as_nightly_cargo(&["new build-dir layout"])
         .arg("--future-incompat-report")
         .env("RUSTFLAGS", "-Zfuture-incompat-test")
         .run();
@@ -642,7 +676,8 @@ fn template_should_error_for_invalid_variables() {
         )
         .build();
 
-    p.cargo("build")
+    p.cargo("-Zbuild-dir-new-layout build")
+        .masquerade_as_nightly_cargo(&["new build-dir layout"])
         .enable_mac_dsym()
         .with_status(101)
         .with_stderr_data(str![[r#"
@@ -667,7 +702,8 @@ fn template_should_suggest_nearest_variable() {
         )
         .build();
 
-    p.cargo("build")
+    p.cargo("-Zbuild-dir-new-layout build")
+        .masquerade_as_nightly_cargo(&["new build-dir layout"])
         .with_status(101)
         .with_stderr_data(str![[r#"
 [ERROR] unexpected variable `workspace-ro` in build.build-dir path `{workspace-ro}/build-dir`
@@ -692,23 +728,23 @@ fn template_workspace_root() {
         )
         .build();
 
-    p.cargo("build").enable_mac_dsym().run();
-
-    assert_build_dir_layout(p.root().join("build-dir"), "debug");
-    assert_artifact_dir_layout(p.root().join("target-dir"), "debug");
+    p.cargo("-Zbuild-dir-new-layout build")
+        .masquerade_as_nightly_cargo(&["new build-dir layout"])
+        .enable_mac_dsym()
+        .run();
 
     // Verify the binary was uplifted to the target-dir
     assert_exists(&p.root().join(&format!("target-dir/debug/foo{EXE_SUFFIX}")));
     p.root().join("build-dir").assert_file_layout(str![[r#"
-[ROOT]/foo/build-dir/CACHEDIR.TAG
-[ROOT]/foo/build-dir/debug/.cargo-lock
-[ROOT]/foo/build-dir/debug/deps/foo[..].d
-[ROOT]/foo/build-dir/debug/deps/foo[..][EXE]
-[ROOT]/foo/build-dir/debug/.fingerprint/foo-[HASH]/invoked.timestamp
-[ROOT]/foo/build-dir/debug/.fingerprint/foo-[HASH]/dep-bin-foo
-[ROOT]/foo/build-dir/debug/.fingerprint/foo-[HASH]/bin-foo
-[ROOT]/foo/build-dir/debug/.fingerprint/foo-[HASH]/bin-foo.json
 [ROOT]/foo/build-dir/.rustc_info.json
+[ROOT]/foo/build-dir/[HOST_TARGET]/CACHEDIR.TAG
+[ROOT]/foo/build-dir/[HOST_TARGET]/debug/.cargo-lock
+[ROOT]/foo/build-dir/[HOST_TARGET]/debug/build/foo-[HASH]/deps/foo[..].d
+[ROOT]/foo/build-dir/[HOST_TARGET]/debug/build/foo-[HASH]/deps/foo[..][EXE]
+[ROOT]/foo/build-dir/[HOST_TARGET]/debug/build/foo-[HASH]/fingerprint/invoked.timestamp
+[ROOT]/foo/build-dir/[HOST_TARGET]/debug/build/foo-[HASH]/fingerprint/dep-bin-foo
+[ROOT]/foo/build-dir/[HOST_TARGET]/debug/build/foo-[HASH]/fingerprint/bin-foo
+[ROOT]/foo/build-dir/[HOST_TARGET]/debug/build/foo-[HASH]/fingerprint/bin-foo.json
 
 "#]]);
 
@@ -735,25 +771,25 @@ fn template_cargo_cache_home() {
         )
         .build();
 
-    p.cargo("build").enable_mac_dsym().run();
-
-    assert_build_dir_layout(paths::home().join(".cargo/build-dir"), "debug");
-    assert_artifact_dir_layout(p.root().join("target-dir"), "debug");
+    p.cargo("-Zbuild-dir-new-layout build")
+        .masquerade_as_nightly_cargo(&["new build-dir layout"])
+        .enable_mac_dsym()
+        .run();
 
     // Verify the binary was uplifted to the target-dir
     assert_exists(&p.root().join(&format!("target-dir/debug/foo{EXE_SUFFIX}")));
     paths::cargo_home()
         .join("build-dir")
         .assert_file_layout(str![[r#"
-[ROOT]/home/.cargo/build-dir/CACHEDIR.TAG
-[ROOT]/home/.cargo/build-dir/debug/.cargo-lock
-[ROOT]/home/.cargo/build-dir/debug/deps/foo[..].d
-[ROOT]/home/.cargo/build-dir/debug/deps/foo[..][EXE]
-[ROOT]/home/.cargo/build-dir/debug/.fingerprint/foo-[HASH]/invoked.timestamp
-[ROOT]/home/.cargo/build-dir/debug/.fingerprint/foo-[HASH]/dep-bin-foo
-[ROOT]/home/.cargo/build-dir/debug/.fingerprint/foo-[HASH]/bin-foo
-[ROOT]/home/.cargo/build-dir/debug/.fingerprint/foo-[HASH]/bin-foo.json
 [ROOT]/home/.cargo/build-dir/.rustc_info.json
+[ROOT]/home/.cargo/build-dir/[HOST_TARGET]/CACHEDIR.TAG
+[ROOT]/home/.cargo/build-dir/[HOST_TARGET]/debug/.cargo-lock
+[ROOT]/home/.cargo/build-dir/[HOST_TARGET]/debug/build/foo-[HASH]/deps/foo[..].d
+[ROOT]/home/.cargo/build-dir/[HOST_TARGET]/debug/build/foo-[HASH]/deps/foo[..][EXE]
+[ROOT]/home/.cargo/build-dir/[HOST_TARGET]/debug/build/foo-[HASH]/fingerprint/invoked.timestamp
+[ROOT]/home/.cargo/build-dir/[HOST_TARGET]/debug/build/foo-[HASH]/fingerprint/dep-bin-foo
+[ROOT]/home/.cargo/build-dir/[HOST_TARGET]/debug/build/foo-[HASH]/fingerprint/bin-foo
+[ROOT]/home/.cargo/build-dir/[HOST_TARGET]/debug/build/foo-[HASH]/fingerprint/bin-foo.json
 
 "#]]);
 
@@ -790,7 +826,10 @@ fn template_workspace_path_hash() {
         )
         .build();
 
-    p.cargo("build").enable_mac_dsym().run();
+    p.cargo("-Zbuild-dir-new-layout build")
+        .masquerade_as_nightly_cargo(&["new build-dir layout"])
+        .enable_mac_dsym()
+        .run();
 
     let foo_dir = p.root().join("foo");
     assert_exists(&foo_dir);
@@ -801,15 +840,15 @@ fn template_workspace_path_hash() {
     // Verify the binary was uplifted to the target-dir
     assert_exists(&p.root().join(&format!("target-dir/debug/foo{EXE_SUFFIX}")));
     build_dir.assert_file_layout(str![[r#"
-[ROOT]/foo/foo/[HASH]/build-dir/CACHEDIR.TAG
-[ROOT]/foo/foo/[HASH]/build-dir/debug/.cargo-lock
-[ROOT]/foo/foo/[HASH]/build-dir/debug/deps/foo[..].d
-[ROOT]/foo/foo/[HASH]/build-dir/debug/deps/foo[..][EXE]
-[ROOT]/foo/foo/[HASH]/build-dir/debug/.fingerprint/foo-[HASH]/invoked.timestamp
-[ROOT]/foo/foo/[HASH]/build-dir/debug/.fingerprint/foo-[HASH]/dep-bin-foo
-[ROOT]/foo/foo/[HASH]/build-dir/debug/.fingerprint/foo-[HASH]/bin-foo
-[ROOT]/foo/foo/[HASH]/build-dir/debug/.fingerprint/foo-[HASH]/bin-foo.json
 [ROOT]/foo/foo/[HASH]/build-dir/.rustc_info.json
+[ROOT]/foo/foo/[HASH]/build-dir/[HOST_TARGET]/CACHEDIR.TAG
+[ROOT]/foo/foo/[HASH]/build-dir/[HOST_TARGET]/debug/.cargo-lock
+[ROOT]/foo/foo/[HASH]/build-dir/[HOST_TARGET]/debug/build/foo-[HASH]/deps/foo[..].d
+[ROOT]/foo/foo/[HASH]/build-dir/[HOST_TARGET]/debug/build/foo-[HASH]/deps/foo[..][EXE]
+[ROOT]/foo/foo/[HASH]/build-dir/[HOST_TARGET]/debug/build/foo-[HASH]/fingerprint/invoked.timestamp
+[ROOT]/foo/foo/[HASH]/build-dir/[HOST_TARGET]/debug/build/foo-[HASH]/fingerprint/dep-bin-foo
+[ROOT]/foo/foo/[HASH]/build-dir/[HOST_TARGET]/debug/build/foo-[HASH]/fingerprint/bin-foo
+[ROOT]/foo/foo/[HASH]/build-dir/[HOST_TARGET]/debug/build/foo-[HASH]/fingerprint/bin-foo.json
 
 "#]]);
 
@@ -855,7 +894,10 @@ fn template_workspace_path_hash_should_handle_symlink() {
         .build();
 
     // Build from the non-symlinked directory
-    p.cargo("check").enable_mac_dsym().run();
+    p.cargo("-Zbuild-dir-new-layout check")
+        .masquerade_as_nightly_cargo(&["new build-dir layout"])
+        .enable_mac_dsym()
+        .run();
 
     // Parse and verify the hash dir created from the non-symlinked dir
     let foo_dir = p.root().join("foo");
@@ -863,15 +905,15 @@ fn template_workspace_path_hash_should_handle_symlink() {
     let original_hash_dir = parse_workspace_manifest_path_hash(&foo_dir);
 
     original_hash_dir.assert_file_layout(str![[r#"
-[ROOT]/foo/foo/[HASH]/build-dir/CACHEDIR.TAG
-[ROOT]/foo/foo/[HASH]/build-dir/debug/.cargo-lock
-[ROOT]/foo/foo/[HASH]/build-dir/debug/deps/foo-[HASH].d
-[ROOT]/foo/foo/[HASH]/build-dir/debug/deps/libfoo-[HASH].rmeta
-[ROOT]/foo/foo/[HASH]/build-dir/debug/.fingerprint/foo-[HASH]/invoked.timestamp
-[ROOT]/foo/foo/[HASH]/build-dir/debug/.fingerprint/foo-[HASH]/dep-lib-foo
-[ROOT]/foo/foo/[HASH]/build-dir/debug/.fingerprint/foo-[HASH]/lib-foo
-[ROOT]/foo/foo/[HASH]/build-dir/debug/.fingerprint/foo-[HASH]/lib-foo.json
 [ROOT]/foo/foo/[HASH]/build-dir/.rustc_info.json
+[ROOT]/foo/foo/[HASH]/build-dir/[HOST_TARGET]/CACHEDIR.TAG
+[ROOT]/foo/foo/[HASH]/build-dir/[HOST_TARGET]/debug/.cargo-lock
+[ROOT]/foo/foo/[HASH]/build-dir/[HOST_TARGET]/debug/build/foo-[HASH]/deps/foo-[HASH].d
+[ROOT]/foo/foo/[HASH]/build-dir/[HOST_TARGET]/debug/build/foo-[HASH]/deps/libfoo-[HASH].rmeta
+[ROOT]/foo/foo/[HASH]/build-dir/[HOST_TARGET]/debug/build/foo-[HASH]/fingerprint/invoked.timestamp
+[ROOT]/foo/foo/[HASH]/build-dir/[HOST_TARGET]/debug/build/foo-[HASH]/fingerprint/dep-lib-foo
+[ROOT]/foo/foo/[HASH]/build-dir/[HOST_TARGET]/debug/build/foo-[HASH]/fingerprint/lib-foo
+[ROOT]/foo/foo/[HASH]/build-dir/[HOST_TARGET]/debug/build/foo-[HASH]/fingerprint/lib-foo.json
 
 "#]]);
 
@@ -891,22 +933,26 @@ fn template_workspace_path_hash_should_handle_symlink() {
     foo_dir.rm_rf();
 
     // Run cargo from the symlinked dir
-    p.cargo("check").cwd(&symlinked_dir).enable_mac_dsym().run();
+    p.cargo("-Zbuild-dir-new-layout check")
+        .masquerade_as_nightly_cargo(&["new build-dir layout"])
+        .cwd(&symlinked_dir)
+        .enable_mac_dsym()
+        .run();
 
     // Parse and verify the hash created from the symlinked dir
     assert_exists(&foo_dir);
     let symlink_hash_dir = parse_workspace_manifest_path_hash(&foo_dir);
 
     symlink_hash_dir.assert_file_layout(str![[r#"
-[ROOT]/foo/foo/[HASH]/build-dir/CACHEDIR.TAG
-[ROOT]/foo/foo/[HASH]/build-dir/debug/.cargo-lock
-[ROOT]/foo/foo/[HASH]/build-dir/debug/deps/foo-[HASH].d
-[ROOT]/foo/foo/[HASH]/build-dir/debug/deps/libfoo-[HASH].rmeta
-[ROOT]/foo/foo/[HASH]/build-dir/debug/.fingerprint/foo-[HASH]/invoked.timestamp
-[ROOT]/foo/foo/[HASH]/build-dir/debug/.fingerprint/foo-[HASH]/dep-lib-foo
-[ROOT]/foo/foo/[HASH]/build-dir/debug/.fingerprint/foo-[HASH]/lib-foo
-[ROOT]/foo/foo/[HASH]/build-dir/debug/.fingerprint/foo-[HASH]/lib-foo.json
 [ROOT]/foo/foo/[HASH]/build-dir/.rustc_info.json
+[ROOT]/foo/foo/[HASH]/build-dir/[HOST_TARGET]/CACHEDIR.TAG
+[ROOT]/foo/foo/[HASH]/build-dir/[HOST_TARGET]/debug/.cargo-lock
+[ROOT]/foo/foo/[HASH]/build-dir/[HOST_TARGET]/debug/build/foo-[HASH]/deps/foo-[HASH].d
+[ROOT]/foo/foo/[HASH]/build-dir/[HOST_TARGET]/debug/build/foo-[HASH]/deps/libfoo-[HASH].rmeta
+[ROOT]/foo/foo/[HASH]/build-dir/[HOST_TARGET]/debug/build/foo-[HASH]/fingerprint/invoked.timestamp
+[ROOT]/foo/foo/[HASH]/build-dir/[HOST_TARGET]/debug/build/foo-[HASH]/fingerprint/dep-lib-foo
+[ROOT]/foo/foo/[HASH]/build-dir/[HOST_TARGET]/debug/build/foo-[HASH]/fingerprint/lib-foo
+[ROOT]/foo/foo/[HASH]/build-dir/[HOST_TARGET]/debug/build/foo-[HASH]/fingerprint/lib-foo.json
 
 "#]]);
 
@@ -933,7 +979,8 @@ fn template_should_handle_reject_unmatched_brackets() {
         )
         .build();
 
-    p.cargo("build")
+    p.cargo("-Zbuild-dir-new-layout build")
+        .masquerade_as_nightly_cargo(&["new build-dir layout"])
         .with_status(101)
         .with_stderr_data(str![[r#"
 [ERROR] unexpected opening bracket `{` in build.build-dir path `foo/{bar`
@@ -952,7 +999,8 @@ fn template_should_handle_reject_unmatched_brackets() {
         )
         .build();
 
-    p.cargo("build")
+    p.cargo("-Zbuild-dir-new-layout build")
+        .masquerade_as_nightly_cargo(&["new build-dir layout"])
         .with_status(101)
         .with_stderr_data(str![[r#"
 [ERROR] unexpected closing bracket `}` in build.build-dir path `foo/}bar`
@@ -1005,71 +1053,6 @@ fn parse_workspace_manifest_path_hash(hash_dir: &PathBuf) -> PathBuf {
         inner_hash_dir.path().file_name()
     );
     return inner_hash_dir.path();
-}
-
-#[track_caller]
-fn assert_build_dir_layout(path: PathBuf, profile: &str) {
-    assert_dir_layout(path, profile, true);
-}
-
-#[allow(dead_code)]
-#[track_caller]
-fn assert_artifact_dir_layout(path: PathBuf, profile: &str) {
-    assert_dir_layout(path, profile, false);
-}
-
-#[track_caller]
-fn assert_dir_layout(path: PathBuf, profile: &str, is_build_dir: bool) {
-    println!("checking if {path:?} is a build directory ({is_build_dir})");
-    // For things that are in both `target` and the build directory we only check if they are
-    // present if `is_build_dir` is true.
-    if is_build_dir {
-        assert_eq!(
-            is_build_dir,
-            path.join(profile).is_dir(),
-            "Expected {:?} to exist and be a directory",
-            path.join(profile)
-        );
-    }
-
-    let error_message = |dir: &str| {
-        if is_build_dir {
-            format!("`{dir}` dir was expected but not found")
-        } else {
-            format!("`{dir}` dir was not expected but was found")
-        }
-    };
-
-    if is_build_dir {
-        assert_exists(&path.join(".rustc_info.json"));
-    } else {
-        assert_not_exists(&path.join(".rustc_info.json"));
-    }
-
-    assert_eq!(
-        is_build_dir,
-        path.join(profile).join("deps").is_dir(),
-        "{}",
-        error_message("deps")
-    );
-    assert_eq!(
-        is_build_dir,
-        path.join(profile).join("build").is_dir(),
-        "{}",
-        error_message("build")
-    );
-    assert_eq!(
-        is_build_dir,
-        path.join(profile).join("incremental").is_dir(),
-        "{}",
-        error_message("incremental")
-    );
-    assert_eq!(
-        is_build_dir,
-        path.join(profile).join(".fingerprint").is_dir(),
-        "{}",
-        error_message(".fingerprint")
-    );
 }
 
 #[track_caller]

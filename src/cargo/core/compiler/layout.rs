@@ -122,6 +122,7 @@ pub struct ArtifactDirLayout {
     examples: PathBuf,
     /// The directory for rustdoc output: `$root/doc`
     doc: PathBuf,
+    timings: PathBuf,
     /// The lockfile for a build (`.cargo-lock`). Will be unlocked when this
     /// struct is `drop`ped.
     _lock: FileLock,
@@ -215,6 +216,7 @@ impl Layout {
                 dest: dest.clone(),
                 examples: dest.join("examples"),
                 doc: root.join("doc"),
+                timings: root.join("cargo-timings"),
                 _lock: artifact_dir_lock,
             },
             build_dir: BuildDirLayout {
@@ -267,6 +269,10 @@ impl ArtifactDirLayout {
     /// Fetch the doc path.
     pub fn doc(&self) -> &Path {
         &self.doc
+    }
+    /// Fetch the cargo-timings path.
+    pub fn timings(&self) -> &Path {
+        &self.timings
     }
 }
 

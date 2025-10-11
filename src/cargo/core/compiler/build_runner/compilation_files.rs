@@ -282,6 +282,11 @@ impl<'a, 'gctx: 'a> CompilationFiles<'a, 'gctx> {
         self.layout(unit.kind).build_dir().incremental()
     }
 
+    /// Directory where timing output should go.
+    pub fn timings_dir(&self) -> &Path {
+        self.host.artifact_dir().timings()
+    }
+
     /// Returns the path for a file in the fingerprint directory.
     ///
     /// The "prefix" should be something to distinguish the file from other

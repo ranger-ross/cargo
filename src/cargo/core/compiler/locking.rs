@@ -1,3 +1,26 @@
+//! This module handles the locking logic during compilation.
+//!
+//! The locking scheme is based on build unit level locking.
+//! Each build unit consists of a primary and secondary lock used to represent multiple lock states.
+//!
+//! | State                  | Primary     | Secondary   |
+//! |------------------------|-------------|-------------|
+//! | Building Exclusive     | `exclusive` | `exclusive` |
+//! | Building Non-Exclusive | `shared`    | `exclusive` |
+//! | Shared                 | `shared`    | `none`      |
+//!
+//! Generally a build unit will full the following flow:
+//! 1. Acquire a "building exclusive" lock for the current build unit.
+//! 2. Acquire "shared" locks on all dependency build units.
+//! 3. Begin building with rustc
+//! 4. If we are building a library, downgrade to a "building non-exclusive" lock when the `.rmeta` has been generated.
+//! 5. Once complete release all locks.
+//!
+//! The primary reason for the complexity here it to allow dependant crates to proceed with thier
+//! compilation as possible.
+//!
+//! [`CompilationLock`] is the primary interface for locking.
+
 use std::{
     fs::{File, OpenOptions},
     path::{Path, PathBuf},
@@ -46,6 +69,7 @@ impl CompilationLock {
     }
 }
 
+/// A lock for a single build unit.
 struct UnitLock {
     primary: PathBuf,
     secondary: PathBuf,

@@ -363,8 +363,11 @@ fn rustc(
     return Ok(Work::new(move |state| {
         if let Some(lock) = &mut lock {
             lock.lock();
+
+            // TODO: We need to revalidate the fingerprint here as another Cargo instance could
+            // have already compiled the crate before we recv'd the lock.
+            // For large crates re-compiling here would be quiet costly.
         }
-        // let mut lock = lock.map(|v| v.lock());
 
         // Artifacts are in a different location than typical units,
         // hence we must assure the crate- and target-dependent

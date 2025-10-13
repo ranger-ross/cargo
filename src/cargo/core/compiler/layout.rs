@@ -348,8 +348,11 @@ impl BuildDirLayout {
             self.build().join(pkg_dir)
         }
     }
-    pub fn build_unit_lock(&self, pkg_dir: &str) -> PathBuf {
-        self.build_unit(pkg_dir).join("lock")
+    pub fn build_unit_lock(&self, pkg_dir: &str) -> (PathBuf, PathBuf) {
+        (
+            self.build_unit(pkg_dir).join("primary-lock"),
+            self.build_unit(pkg_dir).join("secondary-lock"),
+        )
     }
     /// Fetch the artifact path.
     pub fn artifact(&self) -> &Path {

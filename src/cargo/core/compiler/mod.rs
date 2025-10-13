@@ -361,7 +361,7 @@ fn rustc(
     };
 
     return Ok(Work::new(move |state| {
-        let _guard = lock.map(|v| v.lock());
+        let mut lock = lock.map(|v| v.lock());
 
         // Artifacts are in a different location than typical units,
         // hence we must assure the crate- and target-dependent
@@ -445,6 +445,7 @@ fn rustc(
                             &manifest,
                             &target,
                             &mut output_options,
+                            lock.as_mut(),
                         )
                     },
                 )
@@ -1021,6 +1022,7 @@ fn rustdoc(build_runner: &mut BuildRunner<'_, '_>, unit: &Unit) -> CargoResult<W
                         &manifest,
                         &target,
                         &mut output_options,
+                        None,
                     )
                 },
                 false,
@@ -2008,8 +2010,9 @@ fn on_stderr_line(
     manifest: &ManifestErrorContext,
     target: &Target,
     options: &mut OutputOptions,
+    lock: Option<&mut CompilationLock>,
 ) -> CargoResult<()> {
-    if on_stderr_line_inner(state, line, package_id, manifest, target, options)? {
+    if on_stderr_line_inner(state, line, package_id, manifest, target, options, lock)? {
         // Check if caching is enabled.
         if let Some((path, cell)) = &mut options.cache_cell {
             // Cache the output, which will be replayed later when Fresh.
@@ -2030,6 +2033,7 @@ fn on_stderr_line_inner(
     manifest: &ManifestErrorContext,
     target: &Target,
     options: &mut OutputOptions,
+    lock: Option<&mut CompilationLock>,
 ) -> CargoResult<bool> {
     // We primarily want to use this function to process JSON messages from
     // rustc. The compiler should always print one JSON message per line, and
@@ -2265,6 +2269,10 @@ fn on_stderr_line_inner(
         trace!("found directive from rustc: `{}`", artifact.artifact);
         if artifact.artifact.ends_with(".rmeta") {
             debug!("looks like metadata finished early!");
+            if let Some(lock) = lock {
+                println!("rmeta produced! downgrading lock!");
+                lock.rmeta_produced();
+            }
             state.rmeta_produced();
         }
         return Ok(false);
@@ -2480,7 +2488,15 @@ fn replay_output_cache(
                 break;
             }
             let trimmed = line.trim_end_matches(&['\n', '\r'][..]);
-            on_stderr_line(state, trimmed, package_id, &manifest, &target, &mut options)?;
+            on_stderr_line(
+                state,
+                trimmed,
+                package_id,
+                &manifest,
+                &target,
+                &mut options,
+                None,
+            )?;
             line.clear();
         }
         Ok(())

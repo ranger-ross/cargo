@@ -277,7 +277,7 @@ impl<'a, 'gctx: 'a> CompilationFiles<'a, 'gctx> {
         self.layout(unit.kind).build_dir().fingerprint(&dir)
     }
 
-    pub fn build_unit_lock(&self, unit: &Unit) -> PathBuf {
+    pub fn build_unit_lock(&self, unit: &Unit) -> (PathBuf, PathBuf) {
         let dir = self.pkg_dir(unit);
         self.layout(unit.kind).build_dir().build_unit_lock(&dir)
     }

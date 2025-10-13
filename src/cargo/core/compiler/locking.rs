@@ -30,22 +30,15 @@ impl CompilationLock {
         }
     }
 
-    pub fn lock(self) -> Self {
-        let unit_lock = self.unit.lock_exclusive();
+    pub fn lock(&mut self) {
+        self.unit.lock_exclusive();
 
-        let dependency_locks = self
-            .dependency_units
-            .into_iter()
-            .map(|d| d.lock_shared())
-            .collect::<Vec<_>>();
-
-        CompilationLock {
-            unit: unit_lock,
-            dependency_units: dependency_locks,
-        }
+        self.dependency_units
+            .iter_mut()
+            .for_each(|d| d.lock_shared());
     }
 
-    pub fn rmeta_produced(&self) {
+    pub fn rmeta_produced(&mut self) {
         // Downgrade the lock on the unit we are building so that we can unblock other units to
         // compile. We do not need to downgrade our dependency locks since they should always be a
         // shared lock.
@@ -65,38 +58,34 @@ struct UnitLockGuard {
 }
 
 impl UnitLock {
-    pub fn lock_exclusive(self) -> UnitLock {
+    pub fn lock_exclusive(&mut self) {
+        assert!(self.gaurd.is_none());
+
         let primary_lock = file_lock(&self.primary);
         primary_lock.lock().unwrap();
 
         let secondary_lock = file_lock(&self.secondary);
         secondary_lock.lock().unwrap();
 
-        UnitLock {
-            primary: self.primary,
-            secondary: self.secondary,
-            gaurd: Some(UnitLockGuard {
-                primary: primary_lock,
-                _secondary: Some(secondary_lock),
-            }),
-        }
+        self.gaurd = Some(UnitLockGuard {
+            primary: primary_lock,
+            _secondary: Some(secondary_lock),
+        });
     }
 
-    pub fn lock_shared(self) -> UnitLock {
+    pub fn lock_shared(&mut self) {
+        assert!(self.gaurd.is_none());
+
         let primary_lock = file_lock(&self.primary);
         primary_lock.lock_shared().unwrap();
 
-        UnitLock {
-            primary: self.primary,
-            secondary: self.secondary,
-            gaurd: Some(UnitLockGuard {
-                primary: primary_lock,
-                _secondary: None,
-            }),
-        }
+        self.gaurd = Some(UnitLockGuard {
+            primary: primary_lock,
+            _secondary: None,
+        });
     }
 
-    pub fn downgrade(&self) {
+    pub fn downgrade(&mut self) {
         let gaurd = self.gaurd.as_ref().unwrap();
 
         // TODO: Add debug asserts to verify the lock state?

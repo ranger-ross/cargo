@@ -354,14 +354,17 @@ fn rustc(
     }
     let env_config = Arc::clone(build_runner.bcx.gctx.env_config()?);
 
-    let lock = if build_runner.bcx.gctx.cli_unstable().build_dir_new_layout {
+    let mut lock = if build_runner.bcx.gctx.cli_unstable().build_dir_new_layout {
         Some(CompilationLock::new(build_runner, unit))
     } else {
         None
     };
 
     return Ok(Work::new(move |state| {
-        let mut lock = lock.map(|v| v.lock());
+        if let Some(lock) = &mut lock {
+            lock.lock();
+        }
+        // let mut lock = lock.map(|v| v.lock());
 
         // Artifacts are in a different location than typical units,
         // hence we must assure the crate- and target-dependent

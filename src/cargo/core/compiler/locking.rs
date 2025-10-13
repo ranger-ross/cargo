@@ -114,8 +114,14 @@ impl UnitLock {
 
         // TODO: Add debug asserts to verify the lock state?
 
-        // We know we have an exclusive lock here so we should never block.
-        // This is not super well documented but `lock_shared()` should downgrade the lock.
+        // NOTE:
+        // > Subsequent flock() calls on an already locked file will convert an existing lock to the new lock mode.
+        // https://man7.org/linux/man-pages/man2/flock.2.html
+        //
+        // However, the `std::file::File::lock/lock_shared` is allowed to change this in the
+        // future. So its probably up to us if we are okay with using this or if we want to use a
+        // different interace to flock.
+        //
         // TODO: Need to validate on other platforms...
         gaurd.primary.lock_shared().unwrap();
     }

@@ -72,7 +72,7 @@ use cargo_platform::{Cfg, Platform};
 use itertools::Itertools;
 use lazycell::LazyCell;
 use regex::Regex;
-use tracing::{debug, instrument, trace};
+use tracing::{debug, instrument, trace, warn};
 
 pub use self::build_config::UserIntent;
 pub use self::build_config::{BuildConfig, CompileMode, MessageFormat, TimingOutput};
@@ -314,6 +314,12 @@ fn rustc(
     exec.init(build_runner, unit);
     let exec = exec.clone();
 
+    let is_new_layout = build_runner.bcx.gctx.cli_unstable().build_dir_new_layout;
+    let pkg_dir = build_runner.files().pkg_dir(unit);
+    let layout = build_runner.files().host_layout();
+    let wd = layout.working_dir().build_unit(&pkg_dir);
+    let bd = layout.build_dir().build_unit(&pkg_dir);
+
     let root_output = build_runner.files().host_dest().to_path_buf();
     let build_dir = build_runner.bcx.ws.build_dir().into_path_unlocked();
     let pkg_root = unit.pkg.root().to_path_buf();
@@ -497,6 +503,15 @@ fn rustc(
             // This mtime shift allows Cargo to detect if a source file was
             // modified in the middle of the build.
             paths::set_file_time_no_err(dep_info_loc, timestamp);
+        }
+
+        // Uplift completed build unit compilation from the working dir to the build dir
+        if is_new_layout {
+            if let Err(err) = paths::hardlink_dir_all(&wd, &bd)
+                && err.kind() != std::io::ErrorKind::AlreadyExists
+            {
+                warn!("Failed to uplift build unit artifacts: {err}");
+            }
         }
 
         Ok(())

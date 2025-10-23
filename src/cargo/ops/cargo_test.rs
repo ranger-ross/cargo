@@ -77,7 +77,13 @@ pub fn run_tests(ws: &Workspace<'_>, options: &TestOptions, test_args: &[&str]) 
 
     let doctest_errors = run_doc_tests(ws, options, test_args, &compilation)?;
     errors.extend(doctest_errors);
-    no_fail_fast_err(ws, &options.compile_opts, &errors)
+    let result = no_fail_fast_err(ws, &options.compile_opts, &errors);
+
+    if let Some(working_dir) = compilation.working_dir {
+        std::fs::remove_dir_all(working_dir)?;
+    }
+
+    return result;
 }
 
 /// Compiles and runs benchmarks.
@@ -98,7 +104,13 @@ pub fn run_benches(ws: &Workspace<'_>, options: &TestOptions, args: &[&str]) -> 
     args.push("--bench");
 
     let errors = run_unit_tests(ws, options, &args, &compilation, TestKind::Bench)?;
-    no_fail_fast_err(ws, &options.compile_opts, &errors)
+    let result = no_fail_fast_err(ws, &options.compile_opts, &errors);
+
+    if let Some(working_dir) = compilation.working_dir {
+        std::fs::remove_dir_all(working_dir)?;
+    }
+
+    return result;
 }
 
 fn compile_tests<'a>(ws: &Workspace<'a>, options: &TestOptions) -> CargoResult<Compilation<'a>> {

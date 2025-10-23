@@ -234,7 +234,7 @@ impl<'a, 'gctx: 'a> CompilationFiles<'a, 'gctx> {
     ///
     /// Note that some units may share the same directory, so care should be
     /// taken in those cases!
-    fn pkg_dir(&self, unit: &Unit) -> String {
+    pub fn pkg_dir(&self, unit: &Unit) -> String {
         let seperator = match self.ws.gctx().cli_unstable().build_dir_new_layout {
             true => "/",
             false => "-",
@@ -246,6 +246,10 @@ impl<'a, 'gctx: 'a> CompilationFiles<'a, 'gctx> {
         } else {
             format!("{}{}{}", name, seperator, self.target_short_hash(unit))
         }
+    }
+
+    pub fn host_layout(&self) -> &Layout {
+        &self.host
     }
 
     /// Returns the final artifact path for the host (`/…/target/debug`)
@@ -261,12 +265,27 @@ impl<'a, 'gctx: 'a> CompilationFiles<'a, 'gctx> {
     /// Returns the host `deps` directory path.
     pub fn host_deps(&self, unit: &Unit) -> PathBuf {
         let dir = self.pkg_dir(unit);
-        self.host.build_dir().deps(&dir)
+        if self.ws.gctx().cli_unstable().build_dir_new_layout {
+            self.host.working_dir().deps(&dir)
+        } else {
+            self.host.build_dir().deps(&dir)
+        }
     }
 
     /// Returns the directories where Rust crate dependencies are found for the
     /// specified unit.
     pub fn deps_dir(&self, unit: &Unit) -> PathBuf {
+        let dir = self.pkg_dir(unit);
+        if self.ws.gctx().cli_unstable().build_dir_new_layout {
+            self.layout(unit.kind).working_dir().deps(&dir)
+        } else {
+            self.build_dir_deps(unit)
+        }
+    }
+
+    /// Returns the directories where Rust crate dependencies are found for the
+    /// specified unit.
+    pub fn build_dir_deps(&self, unit: &Unit) -> PathBuf {
         let dir = self.pkg_dir(unit);
         self.layout(unit.kind).build_dir().deps(&dir)
     }
@@ -275,6 +294,22 @@ impl<'a, 'gctx: 'a> CompilationFiles<'a, 'gctx> {
     pub fn fingerprint_dir(&self, unit: &Unit) -> PathBuf {
         let dir = self.pkg_dir(unit);
         self.layout(unit.kind).build_dir().fingerprint(&dir)
+    }
+
+    /// Directory where the fingerprint for the given unit should go.
+    pub fn build_dir_build_unit(&self, unit: &Unit) -> PathBuf {
+        let dir = self.pkg_dir(unit);
+        self.layout(unit.kind).build_dir().build_unit(&dir)
+    }
+
+    /// Directory where the fingerprint for the given unit should go.
+    pub fn working_dir_build_unit(&self, unit: &Unit) -> PathBuf {
+        let dir = self.pkg_dir(unit);
+        self.layout(unit.kind).working_dir().build_unit(&dir)
+    }
+
+    pub fn working_dir_root(&self) -> &Path {
+        self.host.working_dir().root()
     }
 
     /// Directory where incremental output for the given unit should go.

@@ -310,6 +310,17 @@ impl<'a, 'gctx> BuildRunner<'a, 'gctx> {
                     .insert(dir.clone().into_path_buf());
             }
         }
+
+        if self.bcx.gctx.cli_unstable().build_dir_new_layout {
+            let working_dir = self.files().working_dir_root();
+            if self.bcx.build_config.auto_remove_working_dir {
+                // Clean up working dir after build is complete
+                std::fs::remove_dir_all(&working_dir)?;
+            } else {
+                self.compilation.working_dir = Some(working_dir.to_path_buf());
+            }
+        }
+
         Ok(self.compilation)
     }
 
@@ -407,6 +418,12 @@ impl<'a, 'gctx> BuildRunner<'a, 'gctx> {
                 for (unit, _) in self.bcx.unit_graph.iter() {
                     let dep_dir = self.files().deps_dir(unit);
                     paths::create_dir_all(&dep_dir)?;
+                    // Downlift build-dir build units into the working directory
+                    let build_dir_unit = self.files().build_dir_build_unit(unit);
+                    if build_dir_unit.exists() {
+                        let working_dir_unit = self.files().working_dir_build_unit(unit);
+                        paths::hardlink_dir_all(build_dir_unit, &working_dir_unit)?;
+                    }
                     self.compilation.deps_output.insert(kind, dep_dir);
                 }
             } else {

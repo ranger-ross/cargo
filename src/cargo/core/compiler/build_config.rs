@@ -52,6 +52,8 @@ pub struct BuildConfig {
     pub sbom: bool,
     /// Build compile time dependencies only, e.g., build scripts and proc macros
     pub compile_time_deps_only: bool,
+    /// Whether the working directory used for compilation should be automatically be deleted.
+    pub auto_remove_working_dir: bool,
 }
 
 fn default_parallelism() -> CargoResult<u32> {
@@ -127,6 +129,12 @@ impl BuildConfig {
             _ => Vec::new(),
         };
 
+        let auto_remove_working_dir = match intent {
+            UserIntent::Build | UserIntent::Check { .. } | UserIntent::Doc { .. } => true,
+            // Benches and tests need to run prior to being deleted.
+            UserIntent::Bench | UserIntent::Doctest | UserIntent::Test => false,
+        };
+
         Ok(BuildConfig {
             requested_kinds,
             jobs,
@@ -145,6 +153,7 @@ impl BuildConfig {
             timing_outputs,
             sbom,
             compile_time_deps_only: false,
+            auto_remove_working_dir,
         })
     }
 

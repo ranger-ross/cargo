@@ -113,6 +113,8 @@ use std::path::{Path, PathBuf};
 pub struct Layout {
     artifact_dir: ArtifactDirLayout,
     build_dir: BuildDirLayout,
+    working_dir: WorkingDirLayout,
+    is_new_layout: bool,
 }
 
 impl Layout {
@@ -171,6 +173,10 @@ impl Layout {
         let deps = build_dest.join("deps");
         let artifact = deps.join("artifact");
 
+        let working_root = build_root
+            .join("processes")
+            .join(std::process::id().to_string());
+
         Ok(Layout {
             artifact_dir: ArtifactDirLayout {
                 dest: dest.clone(),
@@ -191,6 +197,12 @@ impl Layout {
                 _lock: build_dir_lock,
                 is_new_layout,
             },
+            working_dir: WorkingDirLayout {
+                deps: working_root.join("deps"),
+                build: working_root.join("build"),
+                root: working_root,
+            },
+            is_new_layout,
         })
     }
 
@@ -198,6 +210,9 @@ impl Layout {
     pub fn prepare(&mut self) -> CargoResult<()> {
         self.artifact_dir.prepare()?;
         self.build_dir.prepare()?;
+        if self.is_new_layout {
+            self.working_dir.prepare()?;
+        }
 
         Ok(())
     }
@@ -208,6 +223,10 @@ impl Layout {
 
     pub fn build_dir(&self) -> &BuildDirLayout {
         &self.build_dir
+    }
+
+    pub fn working_dir(&self) -> &WorkingDirLayout {
+        &self.working_dir
     }
 }
 
@@ -357,5 +376,34 @@ impl BuildDirLayout {
     pub fn prepare_tmp(&self) -> CargoResult<&Path> {
         paths::create_dir_all(&self.tmp)?;
         Ok(&self.tmp)
+    }
+}
+
+pub struct WorkingDirLayout {
+    root: PathBuf,
+    deps: PathBuf,
+    build: PathBuf,
+}
+
+impl WorkingDirLayout {
+    pub fn prepare(&mut self) -> CargoResult<()> {
+        paths::create_dir_all(&self.root)?;
+        paths::create_dir_all(&self.deps)?;
+        paths::create_dir_all(&self.build)?;
+
+        Ok(())
+    }
+    pub fn deps(&self, pkg_dir: &str) -> PathBuf {
+        self.build_unit(pkg_dir).join("deps")
+    }
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+    pub fn build(&self) -> &Path {
+        &self.build
+    }
+    /// Fetch the build unit path
+    pub fn build_unit(&self, pkg_dir: &str) -> PathBuf {
+        self.build().join(pkg_dir)
     }
 }

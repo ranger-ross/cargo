@@ -105,7 +105,7 @@ use crate::util::errors::{CargoResult, VerboseError};
 use crate::util::interning::InternedString;
 use crate::util::lints::get_key_value;
 use crate::util::machine_message::{self, Message};
-use crate::util::{add_path_args, internal, path_args};
+use crate::util::{FileLock, add_path_args, internal, path_args};
 use cargo_util::{ProcessBuilder, ProcessError, paths};
 use cargo_util_schemas::manifest::TomlDebugInfo;
 use cargo_util_schemas::manifest::TomlTrimPaths;
@@ -319,6 +319,7 @@ fn rustc(
     let layout = build_runner.files().host_layout();
     let wd = layout.working_dir().build_unit(&pkg_dir);
     let bd = layout.build_dir().build_unit(&pkg_dir);
+    let build_unit_lock_path = layout.build_dir().build_unit_lock(&pkg_dir);
 
     let root_output = build_runner.files().host_dest().to_path_buf();
     let build_dir = build_runner.bcx.ws.build_dir().into_path_unlocked();
@@ -507,6 +508,7 @@ fn rustc(
 
         // Uplift completed build unit compilation from the working dir to the build dir
         if is_new_layout {
+            let _lock = FileLock::lock(build_unit_lock_path)?;
             if let Err(err) = paths::hardlink_dir_all(&wd, &bd)
                 && err.kind() != std::io::ErrorKind::AlreadyExists
             {

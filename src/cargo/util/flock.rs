@@ -99,6 +99,38 @@ impl FileLock {
         self.path = new_path.to_path_buf();
         Ok(())
     }
+
+    /// Standalone (blocking) method to create an exclusive [`FileLock`].
+    /// Note that this function does not provide feedback to users while blocked
+    /// and is meant for usecases where displaying feedback in to the user is unneeded.
+    pub fn lock<P: AsRef<Path>>(path: P) -> CargoResult<FileLock> {
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .create(true)
+            .write(true)
+            .open(&path)?;
+        lock.lock()?;
+
+        Ok(FileLock {
+            f: Some(lock),
+            path: path.as_ref().to_path_buf(),
+        })
+    }
+
+    /// Same as [`FileLock::lock`] but with a shared lock.
+    pub fn lock_shared<P: AsRef<Path>>(path: P) -> CargoResult<FileLock> {
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .create(true)
+            .write(true)
+            .open(&path)?;
+        lock.lock_shared()?;
+
+        Ok(FileLock {
+            f: Some(lock),
+            path: path.as_ref().to_path_buf(),
+        })
+    }
 }
 
 impl Read for FileLock {

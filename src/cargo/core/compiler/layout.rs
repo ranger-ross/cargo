@@ -154,10 +154,13 @@ impl Layout {
         // For now we don't do any more finer-grained locking on the artifact
         // directory, so just lock the entire thing for the duration of this
         // compile.
-        let artifact_dir_lock =
-            dest.open_rw_exclusive_create(".cargo-lock", ws.gctx(), "build directory")?;
+        let artifact_dir_lock = if !is_new_layout {
+            Some(dest.open_rw_exclusive_create(".cargo-lock", ws.gctx(), "build directory")?)
+        } else {
+            None
+        };
 
-        let build_dir_lock = if root != build_root {
+        let build_dir_lock = if root != build_root && !is_new_layout {
             Some(build_dest.open_rw_exclusive_create(
                 ".cargo-lock",
                 ws.gctx(),
@@ -241,7 +244,7 @@ pub struct ArtifactDirLayout {
     timings: PathBuf,
     /// The lockfile for a build (`.cargo-lock`). Will be unlocked when this
     /// struct is `drop`ped.
-    _lock: FileLock,
+    _lock: Option<FileLock>,
 }
 
 impl ArtifactDirLayout {
@@ -363,6 +366,9 @@ impl BuildDirLayout {
         } else {
             self.build().join(pkg_dir)
         }
+    }
+    pub fn build_unit_lock(&self, pkg_dir: &str) -> PathBuf {
+        self.build_unit(pkg_dir).join(".cargo-lock")
     }
     /// Fetch the artifact path.
     pub fn artifact(&self) -> &Path {

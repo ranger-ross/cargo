@@ -7,6 +7,7 @@ use std::sync::{Arc, Mutex};
 use crate::core::PackageId;
 use crate::core::compiler::compilation::{self, UnitOutput};
 use crate::core::compiler::{self, Unit, artifact};
+use crate::util::FileLock;
 use crate::util::cache_lock::CacheLockMode;
 use crate::util::errors::CargoResult;
 use annotate_snippets::{Level, Message};
@@ -421,6 +422,9 @@ impl<'a, 'gctx> BuildRunner<'a, 'gctx> {
                     // Downlift build-dir build units into the working directory
                     let build_dir_unit = self.files().build_dir_build_unit(unit);
                     if build_dir_unit.exists() {
+                        let build_unit_lock_path = self.files().build_unit_lock(unit);
+                        let _lock = FileLock::lock(build_unit_lock_path)?;
+
                         let working_dir_unit = self.files().working_dir_build_unit(unit);
                         paths::hardlink_dir_all(build_dir_unit, &working_dir_unit)?;
                     }

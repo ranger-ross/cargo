@@ -46,6 +46,8 @@ fn binary_with_debug() {
 [ROOT]/foo/build-dir/debug/build/foo/[HASH]/fingerprint/invoked.timestamp
 [ROOT]/foo/build-dir/debug/build/foo/[HASH]/deps/foo[..][EXE]
 [ROOT]/foo/build-dir/debug/build/foo/[HASH]/deps/foo[..].d
+[ROOT]/foo/build-dir/debug/build/foo/[HASH]/primary.lock
+[ROOT]/foo/build-dir/debug/build/foo/[HASH]/secondary.lock
 
 "#]]);
 
@@ -100,6 +102,8 @@ fn binary_with_release() {
 [ROOT]/foo/build-dir/release/build/foo/[HASH]/fingerprint/invoked.timestamp
 [ROOT]/foo/build-dir/release/build/foo/[HASH]/deps/foo[..][EXE]
 [ROOT]/foo/build-dir/release/build/foo/[HASH]/deps/foo[..].d
+[ROOT]/foo/build-dir/release/build/foo/[HASH]/primary.lock
+[ROOT]/foo/build-dir/release/build/foo/[HASH]/secondary.lock
 
 "#]]);
 
@@ -211,6 +215,8 @@ fn should_default_to_target() {
 [ROOT]/foo/target/debug/build/foo/[HASH]/deps/foo[..].d
 [ROOT]/foo/target/debug/foo[EXE]
 [ROOT]/foo/target/debug/foo.d
+[ROOT]/foo/target/debug/build/foo/[HASH]/primary.lock
+[ROOT]/foo/target/debug/build/foo/[HASH]/secondary.lock
 
 "#]]);
 }
@@ -237,6 +243,8 @@ fn should_respect_env_var() {
 [ROOT]/foo/build-dir/debug/build/foo/[HASH]/fingerprint/invoked.timestamp
 [ROOT]/foo/build-dir/debug/build/foo/[HASH]/deps/foo[..][EXE]
 [ROOT]/foo/build-dir/debug/build/foo/[HASH]/deps/foo[..].d
+[ROOT]/foo/build-dir/debug/build/foo/[HASH]/primary.lock
+[ROOT]/foo/build-dir/debug/build/foo/[HASH]/secondary.lock
 
 "#]]);
 }
@@ -296,6 +304,12 @@ fn build_script_should_output_to_build_dir() {
 [ROOT]/foo/build-dir/debug/build/foo/[HASH]/build-script-execution/output
 [ROOT]/foo/build-dir/debug/build/foo/[HASH]/build-script-execution/root-output
 [ROOT]/foo/build-dir/debug/build/foo/[HASH]/build-script-execution/stderr
+[ROOT]/foo/build-dir/debug/build/foo/[HASH]/primary.lock
+[ROOT]/foo/build-dir/debug/build/foo/[HASH]/secondary.lock
+[ROOT]/foo/build-dir/debug/build/foo/[HASH]/primary.lock
+[ROOT]/foo/build-dir/debug/build/foo/[HASH]/secondary.lock
+[ROOT]/foo/build-dir/debug/build/foo/[HASH]/primary.lock
+[ROOT]/foo/build-dir/debug/build/foo/[HASH]/secondary.lock
 
 "#]]);
 }
@@ -355,6 +369,12 @@ fn cargo_tmpdir_should_output_to_build_dir() {
 [ROOT]/foo/build-dir/debug/build/foo/[HASH]/fingerprint/bin-foo.json
 [ROOT]/foo/build-dir/tmp/foo.txt
 [ROOT]/foo/build-dir/.rustc_info.json
+[ROOT]/foo/build-dir/debug/build/foo/[HASH]/primary.lock
+[ROOT]/foo/build-dir/debug/build/foo/[HASH]/secondary.lock
+[ROOT]/foo/build-dir/debug/build/foo/[HASH]/primary.lock
+[ROOT]/foo/build-dir/debug/build/foo/[HASH]/secondary.lock
+[ROOT]/foo/build-dir/debug/build/foo/[HASH]/primary.lock
+[ROOT]/foo/build-dir/debug/build/foo/[HASH]/secondary.lock
 
 "#]]);
 
@@ -398,6 +418,8 @@ fn examples_should_output_to_build_dir_and_uplift_to_target_dir() {
 [ROOT]/foo/build-dir/debug/build/foo/[HASH]/fingerprint/invoked.timestamp
 [ROOT]/foo/build-dir/debug/examples/foo[..][EXE]
 [ROOT]/foo/build-dir/debug/examples/foo[..].d
+[ROOT]/foo/build-dir/debug/build/foo/[HASH]/primary.lock
+[ROOT]/foo/build-dir/debug/build/foo/[HASH]/secondary.lock
 
 "#]]);
 
@@ -448,6 +470,10 @@ fn benches_should_output_to_build_dir() {
 [ROOT]/foo/build-dir/debug/build/foo/[HASH]/fingerprint/bin-foo
 [ROOT]/foo/build-dir/debug/build/foo/[HASH]/fingerprint/bin-foo.json
 [ROOT]/foo/build-dir/.rustc_info.json
+[ROOT]/foo/build-dir/debug/build/foo/[HASH]/primary.lock
+[ROOT]/foo/build-dir/debug/build/foo/[HASH]/secondary.lock
+[ROOT]/foo/build-dir/debug/build/foo/[HASH]/primary.lock
+[ROOT]/foo/build-dir/debug/build/foo/[HASH]/secondary.lock
 
 "#]]);
 
@@ -525,6 +551,8 @@ fn cargo_package_should_build_in_build_dir_and_output_to_target_dir() {
 [ROOT]/foo/build-dir/package/foo-0.0.1/Cargo.toml.orig
 [ROOT]/foo/build-dir/package/foo-0.0.1/src/main.rs
 [ROOT]/foo/build-dir/package/foo-0.0.1.crate
+[ROOT]/foo/build-dir/debug/build/foo/[HASH]/primary.lock
+[ROOT]/foo/build-dir/debug/build/foo/[HASH]/secondary.lock
 
 "#]]);
 
@@ -596,6 +624,8 @@ fn cargo_clean_should_clean_the_target_dir_and_build_dir() {
 [ROOT]/foo/build-dir/debug/build/foo/[HASH]/fingerprint/invoked.timestamp
 [ROOT]/foo/build-dir/debug/build/foo/[HASH]/deps/foo[..][EXE]
 [ROOT]/foo/build-dir/debug/build/foo/[HASH]/deps/foo[..].d
+[ROOT]/foo/build-dir/debug/build/foo/[HASH]/primary.lock
+[ROOT]/foo/build-dir/debug/build/foo/[HASH]/secondary.lock
 
 "#]]);
 
@@ -672,6 +702,10 @@ fn cargo_clean_should_remove_correct_files() {
 [ROOT]/foo/build-dir/debug/build/foo/[HASH]/fingerprint/bin-foo.json
 [ROOT]/foo/build-dir/debug/build/foo/[HASH]/fingerprint/dep-bin-foo
 [ROOT]/foo/build-dir/debug/build/foo/[HASH]/fingerprint/invoked.timestamp
+[ROOT]/foo/build-dir/debug/build/bar/[HASH]/primary.lock
+[ROOT]/foo/build-dir/debug/build/bar/[HASH]/secondary.lock
+[ROOT]/foo/build-dir/debug/build/foo/[HASH]/primary.lock
+[ROOT]/foo/build-dir/debug/build/foo/[HASH]/secondary.lock
 
 "#]]);
 
@@ -690,6 +724,8 @@ fn cargo_clean_should_remove_correct_files() {
 [ROOT]/foo/build-dir/debug/build/foo/[HASH]/fingerprint/bin-foo.json
 [ROOT]/foo/build-dir/debug/build/foo/[HASH]/fingerprint/dep-bin-foo
 [ROOT]/foo/build-dir/debug/build/foo/[HASH]/fingerprint/invoked.timestamp
+[ROOT]/foo/build-dir/debug/build/foo/[HASH]/primary.lock
+[ROOT]/foo/build-dir/debug/build/foo/[HASH]/secondary.lock
 
 "#]]);
 }
@@ -825,6 +861,8 @@ fn template_workspace_root() {
 [ROOT]/foo/build-dir/debug/build/foo/[HASH]/fingerprint/invoked.timestamp
 [ROOT]/foo/build-dir/debug/build/foo/[HASH]/deps/foo[..][EXE]
 [ROOT]/foo/build-dir/debug/build/foo/[HASH]/deps/foo[..].d
+[ROOT]/foo/build-dir/debug/build/foo/[HASH]/primary.lock
+[ROOT]/foo/build-dir/debug/build/foo/[HASH]/secondary.lock
 
 "#]]);
 
@@ -872,6 +910,8 @@ fn template_cargo_cache_home() {
 [ROOT]/home/.cargo/build-dir/debug/build/foo/[HASH]/fingerprint/invoked.timestamp
 [ROOT]/home/.cargo/build-dir/debug/build/foo/[HASH]/deps/foo[..][EXE]
 [ROOT]/home/.cargo/build-dir/debug/build/foo/[HASH]/deps/foo[..].d
+[ROOT]/home/.cargo/build-dir/debug/build/foo/[HASH]/primary.lock
+[ROOT]/home/.cargo/build-dir/debug/build/foo/[HASH]/secondary.lock
 
 "#]]);
 
@@ -933,6 +973,8 @@ fn template_workspace_path_hash() {
 [ROOT]/foo/foo/[HASH]/build-dir/debug/build/foo/[HASH]/fingerprint/invoked.timestamp
 [ROOT]/foo/foo/[HASH]/build-dir/debug/build/foo/[HASH]/deps/foo[..][EXE]
 [ROOT]/foo/foo/[HASH]/build-dir/debug/build/foo/[HASH]/deps/foo[..].d
+[ROOT]/foo/foo/[HASH]/build-dir/debug/build/foo/[HASH]/primary.lock
+[ROOT]/foo/foo/[HASH]/build-dir/debug/build/foo/[HASH]/secondary.lock
 
 "#]]);
 
@@ -1000,6 +1042,8 @@ fn template_workspace_path_hash_should_handle_symlink() {
 [ROOT]/foo/foo/[HASH]/build-dir/debug/build/foo/[HASH]/fingerprint/lib-foo.json
 [ROOT]/foo/foo/[HASH]/build-dir/debug/build/foo/[HASH]/deps/foo-[HASH].d
 [ROOT]/foo/foo/[HASH]/build-dir/debug/build/foo/[HASH]/deps/libfoo-[HASH].rmeta
+[ROOT]/foo/foo/[HASH]/build-dir/debug/build/foo/[HASH]/primary.lock
+[ROOT]/foo/foo/[HASH]/build-dir/debug/build/foo/[HASH]/secondary.lock
 
 "#]]);
 
@@ -1039,6 +1083,8 @@ fn template_workspace_path_hash_should_handle_symlink() {
 [ROOT]/foo/foo/[HASH]/build-dir/debug/build/foo/[HASH]/fingerprint/lib-foo.json
 [ROOT]/foo/foo/[HASH]/build-dir/debug/build/foo/[HASH]/deps/foo-[HASH].d
 [ROOT]/foo/foo/[HASH]/build-dir/debug/build/foo/[HASH]/deps/libfoo-[HASH].rmeta
+[ROOT]/foo/foo/[HASH]/build-dir/debug/build/foo/[HASH]/primary.lock
+[ROOT]/foo/foo/[HASH]/build-dir/debug/build/foo/[HASH]/secondary.lock
 
 "#]]);
 

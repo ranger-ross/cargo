@@ -39,13 +39,13 @@ fn binary_with_debug() {
     p.root().join("build-dir").assert_build_dir_layout(str![[r#"
 [ROOT]/foo/build-dir/.rustc_info.json
 [ROOT]/foo/build-dir/CACHEDIR.TAG
-[ROOT]/foo/build-dir/debug/.cargo-lock
 [ROOT]/foo/build-dir/debug/build/foo/[HASH]/fingerprint/bin-foo
 [ROOT]/foo/build-dir/debug/build/foo/[HASH]/fingerprint/bin-foo.json
 [ROOT]/foo/build-dir/debug/build/foo/[HASH]/fingerprint/dep-bin-foo
 [ROOT]/foo/build-dir/debug/build/foo/[HASH]/fingerprint/invoked.timestamp
 [ROOT]/foo/build-dir/debug/build/foo/[HASH]/deps/foo[..][EXE]
 [ROOT]/foo/build-dir/debug/build/foo/[HASH]/deps/foo[..].d
+[ROOT]/foo/build-dir/debug/build/foo/[HASH]/.cargo-lock
 
 "#]]);
 
@@ -53,7 +53,6 @@ fn binary_with_debug() {
         .join("target-dir")
         .assert_build_dir_layout(str![[r#"
 [ROOT]/foo/target-dir/CACHEDIR.TAG
-[ROOT]/foo/target-dir/debug/.cargo-lock
 [ROOT]/foo/target-dir/debug/foo[EXE]
 [ROOT]/foo/target-dir/debug/foo.d
 
@@ -93,13 +92,13 @@ fn binary_with_release() {
     p.root().join("build-dir").assert_build_dir_layout(str![[r#"
 [ROOT]/foo/build-dir/.rustc_info.json
 [ROOT]/foo/build-dir/CACHEDIR.TAG
-[ROOT]/foo/build-dir/release/.cargo-lock
 [ROOT]/foo/build-dir/release/build/foo/[HASH]/fingerprint/bin-foo
 [ROOT]/foo/build-dir/release/build/foo/[HASH]/fingerprint/bin-foo.json
 [ROOT]/foo/build-dir/release/build/foo/[HASH]/fingerprint/dep-bin-foo
 [ROOT]/foo/build-dir/release/build/foo/[HASH]/fingerprint/invoked.timestamp
 [ROOT]/foo/build-dir/release/build/foo/[HASH]/deps/foo[..][EXE]
 [ROOT]/foo/build-dir/release/build/foo/[HASH]/deps/foo[..].d
+[ROOT]/foo/build-dir/release/build/foo/[HASH]/.cargo-lock
 
 "#]]);
 
@@ -107,7 +106,6 @@ fn binary_with_release() {
         .join("target-dir")
         .assert_build_dir_layout(str![[r#"
 [ROOT]/foo/target-dir/CACHEDIR.TAG
-[ROOT]/foo/target-dir/release/.cargo-lock
 [ROOT]/foo/target-dir/release/foo[EXE]
 [ROOT]/foo/target-dir/release/foo.d
 
@@ -202,7 +200,6 @@ fn should_default_to_target() {
     p.root().join("target").assert_build_dir_layout(str![[r#"
 [ROOT]/foo/target/.rustc_info.json
 [ROOT]/foo/target/CACHEDIR.TAG
-[ROOT]/foo/target/debug/.cargo-lock
 [ROOT]/foo/target/debug/build/foo/[HASH]/fingerprint/bin-foo
 [ROOT]/foo/target/debug/build/foo/[HASH]/fingerprint/bin-foo.json
 [ROOT]/foo/target/debug/build/foo/[HASH]/fingerprint/dep-bin-foo
@@ -211,6 +208,7 @@ fn should_default_to_target() {
 [ROOT]/foo/target/debug/build/foo/[HASH]/deps/foo[..].d
 [ROOT]/foo/target/debug/foo[EXE]
 [ROOT]/foo/target/debug/foo.d
+[ROOT]/foo/target/debug/build/foo/[HASH]/.cargo-lock
 
 "#]]);
 }
@@ -230,13 +228,13 @@ fn should_respect_env_var() {
     p.root().join("build-dir").assert_build_dir_layout(str![[r#"
 [ROOT]/foo/build-dir/.rustc_info.json
 [ROOT]/foo/build-dir/CACHEDIR.TAG
-[ROOT]/foo/build-dir/debug/.cargo-lock
 [ROOT]/foo/build-dir/debug/build/foo/[HASH]/fingerprint/bin-foo
 [ROOT]/foo/build-dir/debug/build/foo/[HASH]/fingerprint/bin-foo.json
 [ROOT]/foo/build-dir/debug/build/foo/[HASH]/fingerprint/dep-bin-foo
 [ROOT]/foo/build-dir/debug/build/foo/[HASH]/fingerprint/invoked.timestamp
 [ROOT]/foo/build-dir/debug/build/foo/[HASH]/deps/foo[..][EXE]
 [ROOT]/foo/build-dir/debug/build/foo/[HASH]/deps/foo[..].d
+[ROOT]/foo/build-dir/debug/build/foo/[HASH]/.cargo-lock
 
 "#]]);
 }
@@ -274,7 +272,6 @@ fn build_script_should_output_to_build_dir() {
 
     p.root().join("build-dir").assert_build_dir_layout(str![[r#"
 [ROOT]/foo/build-dir/CACHEDIR.TAG
-[ROOT]/foo/build-dir/debug/.cargo-lock
 [ROOT]/foo/build-dir/debug/build/foo/[HASH]/deps/foo[..][EXE]
 [ROOT]/foo/build-dir/debug/build/foo/[HASH]/deps/foo[..].d
 [ROOT]/foo/build-dir/debug/build/foo/[HASH]/fingerprint/invoked.timestamp
@@ -296,6 +293,8 @@ fn build_script_should_output_to_build_dir() {
 [ROOT]/foo/build-dir/debug/build/foo/[HASH]/build-script-execution/output
 [ROOT]/foo/build-dir/debug/build/foo/[HASH]/build-script-execution/root-output
 [ROOT]/foo/build-dir/debug/build/foo/[HASH]/build-script-execution/stderr
+[ROOT]/foo/build-dir/debug/build/foo/[HASH]/.cargo-lock
+[ROOT]/foo/build-dir/debug/build/foo/[HASH]/.cargo-lock
 
 "#]]);
 }
@@ -334,7 +333,6 @@ fn cargo_tmpdir_should_output_to_build_dir() {
 
     p.root().join("build-dir").assert_build_dir_layout(str![[r#"
 [ROOT]/foo/build-dir/CACHEDIR.TAG
-[ROOT]/foo/build-dir/debug/.cargo-lock
 [ROOT]/foo/build-dir/debug/build/foo/[HASH]/deps/foo-[HASH].d
 [ROOT]/foo/build-dir/debug/build/foo/[HASH]/deps/foo-[HASH].d
 [ROOT]/foo/build-dir/debug/build/foo/[HASH]/deps/foo[..].d
@@ -355,6 +353,9 @@ fn cargo_tmpdir_should_output_to_build_dir() {
 [ROOT]/foo/build-dir/debug/build/foo/[HASH]/fingerprint/bin-foo.json
 [ROOT]/foo/build-dir/tmp/foo.txt
 [ROOT]/foo/build-dir/.rustc_info.json
+[ROOT]/foo/build-dir/debug/build/foo/[HASH]/.cargo-lock
+[ROOT]/foo/build-dir/debug/build/foo/[HASH]/.cargo-lock
+[ROOT]/foo/build-dir/debug/build/foo/[HASH]/.cargo-lock
 
 "#]]);
 
@@ -362,7 +363,6 @@ fn cargo_tmpdir_should_output_to_build_dir() {
         .join("target-dir")
         .assert_build_dir_layout(str![[r#"
 [ROOT]/foo/target-dir/CACHEDIR.TAG
-[ROOT]/foo/target-dir/debug/.cargo-lock
 [ROOT]/foo/target-dir/debug/foo[EXE]
 
 "#]]);
@@ -391,13 +391,13 @@ fn examples_should_output_to_build_dir_and_uplift_to_target_dir() {
     p.root().join("build-dir").assert_build_dir_layout(str![[r#"
 [ROOT]/foo/build-dir/.rustc_info.json
 [ROOT]/foo/build-dir/CACHEDIR.TAG
-[ROOT]/foo/build-dir/debug/.cargo-lock
 [ROOT]/foo/build-dir/debug/build/foo/[HASH]/fingerprint/dep-example-foo
 [ROOT]/foo/build-dir/debug/build/foo/[HASH]/fingerprint/example-foo
 [ROOT]/foo/build-dir/debug/build/foo/[HASH]/fingerprint/example-foo.json
 [ROOT]/foo/build-dir/debug/build/foo/[HASH]/fingerprint/invoked.timestamp
 [ROOT]/foo/build-dir/debug/examples/foo[..][EXE]
 [ROOT]/foo/build-dir/debug/examples/foo[..].d
+[ROOT]/foo/build-dir/debug/build/foo/[HASH]/.cargo-lock
 
 "#]]);
 
@@ -405,7 +405,6 @@ fn examples_should_output_to_build_dir_and_uplift_to_target_dir() {
         .join("target-dir")
         .assert_build_dir_layout(str![[r#"
 [ROOT]/foo/target-dir/CACHEDIR.TAG
-[ROOT]/foo/target-dir/debug/.cargo-lock
 [ROOT]/foo/target-dir/debug/examples/foo[EXE]
 [ROOT]/foo/target-dir/debug/examples/foo.d
 
@@ -434,7 +433,6 @@ fn benches_should_output_to_build_dir() {
 
     p.root().join("build-dir").assert_build_dir_layout(str![[r#"
 [ROOT]/foo/build-dir/CACHEDIR.TAG
-[ROOT]/foo/build-dir/debug/.cargo-lock
 [ROOT]/foo/build-dir/debug/build/foo/[HASH]/deps/foo-[HASH].d
 [ROOT]/foo/build-dir/debug/build/foo/[HASH]/deps/foo[..].d
 [ROOT]/foo/build-dir/debug/build/foo/[HASH]/deps/foo-[HASH][EXE]
@@ -448,6 +446,8 @@ fn benches_should_output_to_build_dir() {
 [ROOT]/foo/build-dir/debug/build/foo/[HASH]/fingerprint/bin-foo
 [ROOT]/foo/build-dir/debug/build/foo/[HASH]/fingerprint/bin-foo.json
 [ROOT]/foo/build-dir/.rustc_info.json
+[ROOT]/foo/build-dir/debug/build/foo/[HASH]/.cargo-lock
+[ROOT]/foo/build-dir/debug/build/foo/[HASH]/.cargo-lock
 
 "#]]);
 
@@ -455,7 +455,6 @@ fn benches_should_output_to_build_dir() {
         .join("target-dir")
         .assert_build_dir_layout(str![[r#"
 [ROOT]/foo/target-dir/CACHEDIR.TAG
-[ROOT]/foo/target-dir/debug/.cargo-lock
 [ROOT]/foo/target-dir/debug/foo[EXE]
 
 "#]]);
@@ -511,7 +510,6 @@ fn cargo_package_should_build_in_build_dir_and_output_to_target_dir() {
     assert!(package_artifact_dir.join("foo-0.0.1.crate").is_file());
     p.root().join("build-dir").assert_build_dir_layout(str![[r#"
 [ROOT]/foo/build-dir/.rustc_info.json
-[ROOT]/foo/build-dir/debug/.cargo-lock
 [ROOT]/foo/build-dir/debug/build/foo/[HASH]/fingerprint/bin-foo
 [ROOT]/foo/build-dir/debug/build/foo/[HASH]/fingerprint/bin-foo.json
 [ROOT]/foo/build-dir/debug/build/foo/[HASH]/fingerprint/dep-bin-foo
@@ -525,6 +523,7 @@ fn cargo_package_should_build_in_build_dir_and_output_to_target_dir() {
 [ROOT]/foo/build-dir/package/foo-0.0.1/Cargo.toml.orig
 [ROOT]/foo/build-dir/package/foo-0.0.1/src/main.rs
 [ROOT]/foo/build-dir/package/foo-0.0.1.crate
+[ROOT]/foo/build-dir/debug/build/foo/[HASH]/.cargo-lock
 
 "#]]);
 
@@ -589,13 +588,13 @@ fn cargo_clean_should_clean_the_target_dir_and_build_dir() {
     p.root().join("build-dir").assert_build_dir_layout(str![[r#"
 [ROOT]/foo/build-dir/.rustc_info.json
 [ROOT]/foo/build-dir/CACHEDIR.TAG
-[ROOT]/foo/build-dir/debug/.cargo-lock
 [ROOT]/foo/build-dir/debug/build/foo/[HASH]/fingerprint/bin-foo
 [ROOT]/foo/build-dir/debug/build/foo/[HASH]/fingerprint/bin-foo.json
 [ROOT]/foo/build-dir/debug/build/foo/[HASH]/fingerprint/dep-bin-foo
 [ROOT]/foo/build-dir/debug/build/foo/[HASH]/fingerprint/invoked.timestamp
 [ROOT]/foo/build-dir/debug/build/foo/[HASH]/deps/foo[..][EXE]
 [ROOT]/foo/build-dir/debug/build/foo/[HASH]/deps/foo[..].d
+[ROOT]/foo/build-dir/debug/build/foo/[HASH]/.cargo-lock
 
 "#]]);
 
@@ -603,7 +602,6 @@ fn cargo_clean_should_clean_the_target_dir_and_build_dir() {
         .join("target-dir")
         .assert_build_dir_layout(str![[r#"
 [ROOT]/foo/target-dir/CACHEDIR.TAG
-[ROOT]/foo/target-dir/debug/.cargo-lock
 [ROOT]/foo/target-dir/debug/foo[EXE]
 [ROOT]/foo/target-dir/debug/foo.d
 
@@ -658,7 +656,6 @@ fn cargo_clean_should_remove_correct_files() {
     p.root().join("build-dir").assert_build_dir_layout(str![[r#"
 [ROOT]/foo/build-dir/.rustc_info.json
 [ROOT]/foo/build-dir/CACHEDIR.TAG
-[ROOT]/foo/build-dir/debug/.cargo-lock
 [ROOT]/foo/build-dir/debug/build/bar/[HASH]/deps/bar-[HASH].d
 [ROOT]/foo/build-dir/debug/build/bar/[HASH]/deps/libbar-[HASH].rlib
 [ROOT]/foo/build-dir/debug/build/bar/[HASH]/deps/libbar-[HASH].rmeta
@@ -672,6 +669,8 @@ fn cargo_clean_should_remove_correct_files() {
 [ROOT]/foo/build-dir/debug/build/foo/[HASH]/fingerprint/bin-foo.json
 [ROOT]/foo/build-dir/debug/build/foo/[HASH]/fingerprint/dep-bin-foo
 [ROOT]/foo/build-dir/debug/build/foo/[HASH]/fingerprint/invoked.timestamp
+[ROOT]/foo/build-dir/debug/build/bar/[HASH]/.cargo-lock
+[ROOT]/foo/build-dir/debug/build/foo/[HASH]/.cargo-lock
 
 "#]]);
 
@@ -683,13 +682,13 @@ fn cargo_clean_should_remove_correct_files() {
     p.root().join("build-dir").assert_build_dir_layout(str![[r#"
 [ROOT]/foo/build-dir/.rustc_info.json
 [ROOT]/foo/build-dir/CACHEDIR.TAG
-[ROOT]/foo/build-dir/debug/.cargo-lock
 [ROOT]/foo/build-dir/debug/build/foo/[HASH]/deps/foo[..][EXE]
 [ROOT]/foo/build-dir/debug/build/foo/[HASH]/deps/foo[..].d
 [ROOT]/foo/build-dir/debug/build/foo/[HASH]/fingerprint/bin-foo
 [ROOT]/foo/build-dir/debug/build/foo/[HASH]/fingerprint/bin-foo.json
 [ROOT]/foo/build-dir/debug/build/foo/[HASH]/fingerprint/dep-bin-foo
 [ROOT]/foo/build-dir/debug/build/foo/[HASH]/fingerprint/invoked.timestamp
+[ROOT]/foo/build-dir/debug/build/foo/[HASH]/.cargo-lock
 
 "#]]);
 }
@@ -818,13 +817,13 @@ fn template_workspace_root() {
     p.root().join("build-dir").assert_build_dir_layout(str![[r#"
 [ROOT]/foo/build-dir/.rustc_info.json
 [ROOT]/foo/build-dir/CACHEDIR.TAG
-[ROOT]/foo/build-dir/debug/.cargo-lock
 [ROOT]/foo/build-dir/debug/build/foo/[HASH]/fingerprint/bin-foo
 [ROOT]/foo/build-dir/debug/build/foo/[HASH]/fingerprint/bin-foo.json
 [ROOT]/foo/build-dir/debug/build/foo/[HASH]/fingerprint/dep-bin-foo
 [ROOT]/foo/build-dir/debug/build/foo/[HASH]/fingerprint/invoked.timestamp
 [ROOT]/foo/build-dir/debug/build/foo/[HASH]/deps/foo[..][EXE]
 [ROOT]/foo/build-dir/debug/build/foo/[HASH]/deps/foo[..].d
+[ROOT]/foo/build-dir/debug/build/foo/[HASH]/.cargo-lock
 
 "#]]);
 
@@ -832,7 +831,6 @@ fn template_workspace_root() {
         .join("target-dir")
         .assert_build_dir_layout(str![[r#"
 [ROOT]/foo/target-dir/CACHEDIR.TAG
-[ROOT]/foo/target-dir/debug/.cargo-lock
 [ROOT]/foo/target-dir/debug/foo[EXE]
 [ROOT]/foo/target-dir/debug/foo.d
 
@@ -865,13 +863,13 @@ fn template_cargo_cache_home() {
         .assert_build_dir_layout(str![[r#"
 [ROOT]/home/.cargo/build-dir/.rustc_info.json
 [ROOT]/home/.cargo/build-dir/CACHEDIR.TAG
-[ROOT]/home/.cargo/build-dir/debug/.cargo-lock
 [ROOT]/home/.cargo/build-dir/debug/build/foo/[HASH]/fingerprint/bin-foo
 [ROOT]/home/.cargo/build-dir/debug/build/foo/[HASH]/fingerprint/bin-foo.json
 [ROOT]/home/.cargo/build-dir/debug/build/foo/[HASH]/fingerprint/dep-bin-foo
 [ROOT]/home/.cargo/build-dir/debug/build/foo/[HASH]/fingerprint/invoked.timestamp
 [ROOT]/home/.cargo/build-dir/debug/build/foo/[HASH]/deps/foo[..][EXE]
 [ROOT]/home/.cargo/build-dir/debug/build/foo/[HASH]/deps/foo[..].d
+[ROOT]/home/.cargo/build-dir/debug/build/foo/[HASH]/.cargo-lock
 
 "#]]);
 
@@ -879,7 +877,6 @@ fn template_cargo_cache_home() {
         .join("target-dir")
         .assert_build_dir_layout(str![[r#"
 [ROOT]/foo/target-dir/CACHEDIR.TAG
-[ROOT]/foo/target-dir/debug/.cargo-lock
 [ROOT]/foo/target-dir/debug/foo[EXE]
 [ROOT]/foo/target-dir/debug/foo.d
 
@@ -926,13 +923,13 @@ fn template_workspace_path_hash() {
     build_dir.assert_build_dir_layout(str![[r#"
 [ROOT]/foo/foo/[HASH]/build-dir/.rustc_info.json
 [ROOT]/foo/foo/[HASH]/build-dir/CACHEDIR.TAG
-[ROOT]/foo/foo/[HASH]/build-dir/debug/.cargo-lock
 [ROOT]/foo/foo/[HASH]/build-dir/debug/build/foo/[HASH]/fingerprint/bin-foo
 [ROOT]/foo/foo/[HASH]/build-dir/debug/build/foo/[HASH]/fingerprint/bin-foo.json
 [ROOT]/foo/foo/[HASH]/build-dir/debug/build/foo/[HASH]/fingerprint/dep-bin-foo
 [ROOT]/foo/foo/[HASH]/build-dir/debug/build/foo/[HASH]/fingerprint/invoked.timestamp
 [ROOT]/foo/foo/[HASH]/build-dir/debug/build/foo/[HASH]/deps/foo[..][EXE]
 [ROOT]/foo/foo/[HASH]/build-dir/debug/build/foo/[HASH]/deps/foo[..].d
+[ROOT]/foo/foo/[HASH]/build-dir/debug/build/foo/[HASH]/.cargo-lock
 
 "#]]);
 
@@ -940,7 +937,6 @@ fn template_workspace_path_hash() {
         .join("target-dir")
         .assert_build_dir_layout(str![[r#"
 [ROOT]/foo/target-dir/CACHEDIR.TAG
-[ROOT]/foo/target-dir/debug/.cargo-lock
 [ROOT]/foo/target-dir/debug/foo[EXE]
 [ROOT]/foo/target-dir/debug/foo.d
 
@@ -993,19 +989,18 @@ fn template_workspace_path_hash_should_handle_symlink() {
     original_hash_dir.assert_build_dir_layout(str![[r#"
 [ROOT]/foo/foo/[HASH]/build-dir/.rustc_info.json
 [ROOT]/foo/foo/[HASH]/build-dir/CACHEDIR.TAG
-[ROOT]/foo/foo/[HASH]/build-dir/debug/.cargo-lock
 [ROOT]/foo/foo/[HASH]/build-dir/debug/build/foo/[HASH]/fingerprint/dep-lib-foo
 [ROOT]/foo/foo/[HASH]/build-dir/debug/build/foo/[HASH]/fingerprint/invoked.timestamp
 [ROOT]/foo/foo/[HASH]/build-dir/debug/build/foo/[HASH]/fingerprint/lib-foo
 [ROOT]/foo/foo/[HASH]/build-dir/debug/build/foo/[HASH]/fingerprint/lib-foo.json
 [ROOT]/foo/foo/[HASH]/build-dir/debug/build/foo/[HASH]/deps/foo-[HASH].d
 [ROOT]/foo/foo/[HASH]/build-dir/debug/build/foo/[HASH]/deps/libfoo-[HASH].rmeta
+[ROOT]/foo/foo/[HASH]/build-dir/debug/build/foo/[HASH]/.cargo-lock
 
 "#]]);
 
     p.root().join("target").assert_build_dir_layout(str![[r#"
 [ROOT]/foo/target/CACHEDIR.TAG
-[ROOT]/foo/target/debug/.cargo-lock
 
 "#]]);
 
@@ -1032,19 +1027,18 @@ fn template_workspace_path_hash_should_handle_symlink() {
     symlink_hash_dir.assert_build_dir_layout(str![[r#"
 [ROOT]/foo/foo/[HASH]/build-dir/.rustc_info.json
 [ROOT]/foo/foo/[HASH]/build-dir/CACHEDIR.TAG
-[ROOT]/foo/foo/[HASH]/build-dir/debug/.cargo-lock
 [ROOT]/foo/foo/[HASH]/build-dir/debug/build/foo/[HASH]/fingerprint/dep-lib-foo
 [ROOT]/foo/foo/[HASH]/build-dir/debug/build/foo/[HASH]/fingerprint/invoked.timestamp
 [ROOT]/foo/foo/[HASH]/build-dir/debug/build/foo/[HASH]/fingerprint/lib-foo
 [ROOT]/foo/foo/[HASH]/build-dir/debug/build/foo/[HASH]/fingerprint/lib-foo.json
 [ROOT]/foo/foo/[HASH]/build-dir/debug/build/foo/[HASH]/deps/foo-[HASH].d
 [ROOT]/foo/foo/[HASH]/build-dir/debug/build/foo/[HASH]/deps/libfoo-[HASH].rmeta
+[ROOT]/foo/foo/[HASH]/build-dir/debug/build/foo/[HASH]/.cargo-lock
 
 "#]]);
 
     p.root().join("target").assert_build_dir_layout(str![[r#"
 [ROOT]/foo/target/CACHEDIR.TAG
-[ROOT]/foo/target/debug/.cargo-lock
 
 "#]]);
 

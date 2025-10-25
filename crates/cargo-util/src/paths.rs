@@ -696,6 +696,23 @@ pub fn copy<P: AsRef<Path>, Q: AsRef<Path>>(from: P, to: Q) -> Result<u64> {
         .with_context(|| format!("failed to copy `{}` to `{}`", from.display(), to.display()))
 }
 
+/// Hardlinks a directory recursively.
+///
+/// Directories are created and files are hardlinked.
+pub fn hardlink_dir_all(src: impl AsRef<Path>, dst: impl AsRef<Path>) -> io::Result<()> {
+    fs::create_dir_all(&dst)?;
+    for entry in fs::read_dir(src)? {
+        let entry = entry?;
+        let ty = entry.file_type()?;
+        if ty.is_dir() {
+            hardlink_dir_all(entry.path(), dst.as_ref().join(entry.file_name()))?;
+        } else {
+            std::fs::hard_link(entry.path(), dst.as_ref().join(entry.file_name()))?;
+        }
+    }
+    Ok(())
+}
+
 /// Changes the filesystem mtime (and atime if possible) for the given file.
 ///
 /// This intentionally does not return an error, as this is sometimes not

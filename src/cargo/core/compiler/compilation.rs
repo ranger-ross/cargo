@@ -93,6 +93,11 @@ pub struct Compilation<'gctx> {
     /// May be for the host or for a specific target.
     pub deps_output: HashMap<CompileKind, PathBuf>,
 
+    /// The working directory used during compilation.
+    /// This will be `None` when [`super::build_config::BuildConfig::auto_remove_working_dir`] is
+    /// set to `false`
+    pub working_dir: Option<PathBuf>,
+
     /// The path to libstd for each target
     sysroot_target_libdir: HashMap<CompileKind, PathBuf>,
 
@@ -136,6 +141,7 @@ impl<'gctx> Compilation<'gctx> {
             native_dirs: BTreeSet::new(),
             root_output: HashMap::new(),
             deps_output: HashMap::new(),
+            working_dir: None,
             sysroot_target_libdir: get_sysroot_target_libdir(bcx)?,
             tests: Vec::new(),
             binaries: Vec::new(),

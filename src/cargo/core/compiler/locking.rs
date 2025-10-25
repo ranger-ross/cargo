@@ -31,9 +31,10 @@
 //! [`CompilationLock`] is the primary interface for locking.
 
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fs::{File, OpenOptions},
     path::{Path, PathBuf},
+    sync::{Arc, Condvar, LazyLock, Mutex},
 };
 
 use itertools::Itertools;
@@ -118,23 +119,32 @@ struct UnitLock {
 }
 
 struct UnitLockGuard {
-    primary: File,
-    _secondary: Option<File>,
+    primary: Arc<RcFileLock>,
+    secondary: Option<Arc<RcFileLock>>,
+}
+
+impl Drop for UnitLockGuard {
+    fn drop(&mut self) {
+        self.primary.unlock().unwrap();
+        if let Some(secondary) = &self.secondary {
+            secondary.unlock().unwrap();
+        }
+    }
 }
 
 impl UnitLock {
     pub fn lock_exclusive(&mut self) -> CargoResult<()> {
         assert!(self.guard.is_none());
 
-        let primary_lock = open_file(&self.primary)?;
+        let primary_lock = FileLockInterner::get_or_create_lock(&self.primary)?;
         primary_lock.lock()?;
 
-        let secondary_lock = open_file(&self.secondary)?;
+        let secondary_lock = FileLockInterner::get_or_create_lock(&self.secondary)?;
         secondary_lock.lock()?;
 
         self.guard = Some(UnitLockGuard {
             primary: primary_lock,
-            _secondary: Some(secondary_lock),
+            secondary: Some(secondary_lock),
         });
         Ok(())
     }
@@ -142,11 +152,11 @@ impl UnitLock {
     pub fn lock_shared(&mut self, ty: &SharedLockType) -> CargoResult<()> {
         assert!(self.guard.is_none());
 
-        let primary_lock = open_file(&self.primary)?;
+        let primary_lock = FileLockInterner::get_or_create_lock(&self.primary)?;
         primary_lock.lock_shared()?;
 
         let secondary_lock = if matches!(ty, SharedLockType::Full) {
-            let secondary_lock = open_file(&self.secondary)?;
+            let secondary_lock = FileLockInterner::get_or_create_lock(&self.secondary)?;
             secondary_lock.lock_shared()?;
             Some(secondary_lock)
         } else {
@@ -155,24 +165,14 @@ impl UnitLock {
 
         self.guard = Some(UnitLockGuard {
             primary: primary_lock,
-            _secondary: secondary_lock,
+            secondary: secondary_lock,
         });
         Ok(())
     }
 
     pub fn downgrade(&mut self) {
         let guard = self.guard.as_ref().unwrap();
-
-        // NOTE:
-        // > Subsequent flock() calls on an already locked file will convert an existing lock to the new lock mode.
-        // https://man7.org/linux/man-pages/man2/flock.2.html
-        //
-        // However, the `std::file::File::lock/lock_shared` is allowed to change this in the
-        // future. So its probably up to us if we are okay with using this or if we want to use a
-        // different interface to flock.
-        //
-        // TODO: Need to validate on other platforms...
-        guard.primary.lock_shared().unwrap();
+        guard.primary.downgrade().unwrap();
     }
 }
 
@@ -214,4 +214,132 @@ fn all_dependency_units<'a>(
     let mut results = HashSet::new();
     inner(build_runner, unit, &mut results);
     return results;
+}
+
+pub struct FileLockInterner {
+    locks: Mutex<HashMap<PathBuf, Arc<RcFileLock>>>,
+}
+
+impl FileLockInterner {
+    pub fn new() -> Self {
+        Self {
+            locks: Mutex::new(HashMap::new()),
+        }
+    }
+
+    pub fn get_or_create_lock(path: &Path) -> CargoResult<Arc<RcFileLock>> {
+        static GLOBAL: LazyLock<FileLockInterner> = LazyLock::new(FileLockInterner::new);
+
+        let mut locks = GLOBAL.locks.lock().unwrap();
+
+        if let Some(lock) = locks.get(path) {
+            return Ok(Arc::clone(lock));
+        }
+
+        let file = open_file(&path)?;
+
+        let lock = Arc::new(RcFileLock {
+            inner: Mutex::new(RcFileLockInner {
+                file,
+                share_count: 0,
+                exclusive: false,
+            }),
+            condvar: Condvar::new(),
+        });
+
+        locks.insert(path.to_path_buf(), Arc::clone(&lock));
+
+        return Ok(lock);
+    }
+}
+
+/// A reference counted file lock.
+///
+/// This lock is designed to reduce file descriptors by sharing a single file descriptor for a
+/// given lock when the lock is shared. The motivation for this is to avoid hitting file descriptor
+/// limits when fine grain locking is enabled.
+pub struct RcFileLock {
+    inner: Mutex<RcFileLockInner>,
+    condvar: Condvar,
+}
+
+pub struct RcFileLockInner {
+    file: File,
+    exclusive: bool,
+    share_count: u32,
+}
+
+impl RcFileLock {
+    pub fn lock(&self) -> CargoResult<()> {
+        let mut inner = self.inner.lock().unwrap();
+
+        while inner.exclusive || inner.share_count > 0 {
+            inner = self.condvar.wait(inner).unwrap();
+        }
+
+        inner.file.lock()?;
+        inner.exclusive = true;
+
+        Ok(())
+    }
+
+    pub fn lock_shared(&self) -> CargoResult<()> {
+        let mut inner = self.inner.lock().unwrap();
+
+        while inner.exclusive {
+            inner = self.condvar.wait(inner).unwrap();
+        }
+
+        if inner.share_count == 0 {
+            inner.file.lock_shared()?;
+            inner.share_count = 1;
+        } else {
+            inner.share_count += 1;
+        }
+
+        Ok(())
+    }
+
+    pub fn unlock(&self) -> CargoResult<()> {
+        let mut inner = self.inner.lock().unwrap();
+
+        if inner.exclusive {
+            assert!(inner.share_count == 0);
+            inner.file.unlock()?;
+            self.condvar.notify_all();
+            inner.exclusive = false;
+        } else {
+            if inner.share_count > 1 {
+                inner.share_count -= 1;
+            } else {
+                inner.file.unlock()?;
+                inner.share_count = 0;
+                self.condvar.notify_all();
+            }
+        }
+
+        Ok(())
+    }
+
+    pub fn downgrade(&self) -> CargoResult<()> {
+        let mut inner = self.inner.lock().unwrap();
+
+        assert!(inner.exclusive);
+        assert!(inner.share_count == 0);
+
+        // NOTE:
+        // > Subsequent flock() calls on an already locked file will convert an existing lock to the new lock mode.
+        // https://man7.org/linux/man-pages/man2/flock.2.html
+        //
+        // However, the `std::file::File::lock/lock_shared` is allowed to change this in the
+        // future. So its probably up to us if we are okay with using this or if we want to use a
+        // different interface to flock.
+        //
+        inner.file.lock_shared()?;
+
+        inner.exclusive = false;
+        inner.share_count = 1;
+
+        Ok(())
+    }
 }

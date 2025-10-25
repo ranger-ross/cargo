@@ -10,12 +10,14 @@ use crate::core::compiler::locking::LockingMode;
 use crate::core::compiler::{self, Unit, artifact};
 use crate::util::cache_lock::CacheLockMode;
 use crate::util::errors::CargoResult;
+use crate::util::rlimit;
 use annotate_snippets::{Level, Message};
 use anyhow::{Context as _, bail};
 use cargo_util::paths;
 use filetime::FileTime;
 use itertools::Itertools;
 use jobserver::Client;
+use tracing::{debug, warn};
 
 use super::build_plan::BuildPlan;
 use super::custom_build::{self, BuildDeps, BuildScriptOutputs, BuildScripts};
@@ -117,7 +119,13 @@ impl<'a, 'gctx> BuildRunner<'a, 'gctx> {
         };
 
         let locking_mode = if bcx.gctx.cli_unstable().build_dir_new_layout {
-            LockingMode::Fine
+            match try_raise_fd_limit(bcx) {
+                true => LockingMode::Fine,
+                false => {
+                    bcx.gctx.shell().warn("ulimit was to low to safely enable fine grain locking. falling back to coarse grain locking")?;
+                    LockingMode::Coarse
+                }
+            }
         } else {
             LockingMode::Coarse
         };
@@ -735,4 +743,37 @@ impl<'a, 'gctx> BuildRunner<'a, 'gctx> {
                 .insert(unit.clone(), self.files().metadata(metadata_unit));
         }
     }
+}
+
+/// Raises the number of max number file descriptors the current process can have open at once
+/// to make sure we are able to compile without running out of fds.
+///
+/// Returns `true` if we have enough fd's or the limit was successfully raised.
+///         `false` if we do not have enough fd's to confidently build the current build units
+pub fn try_raise_fd_limit(bcx: &BuildContext<'_, '_>) -> bool {
+    let total_units = bcx.unit_graph.keys().len() as u64;
+
+    // This is a bit arbitrary but if we do not have at least 10 times the remaining file
+    // descriptors than total build units there is a chance we could hit the limit.
+    // This is a fairly conservative estimate to make sure we don't hit max fd errors.
+    let safe_threshold = total_units * 10;
+
+    let Ok(mut limit) = rlimit::get_max_file_descriptors() else {
+        return false;
+    };
+
+    if limit.soft_limit < safe_threshold {
+        if limit.hard_limit > safe_threshold {
+            limit.soft_limit = safe_threshold;
+            debug!("raising fd limit to {safe_threshold}");
+            if let Err(err) = rlimit::set_max_file_descriptors(limit) {
+                warn!("failed to raise max fds: {err}");
+                return false;
+            }
+        } else {
+            return false;
+        }
+    }
+
+    return true;
 }

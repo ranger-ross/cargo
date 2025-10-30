@@ -114,6 +114,7 @@ use std::path::{Path, PathBuf};
 pub struct Layout {
     artifact_dir: ArtifactDirLayout,
     build_dir: BuildDirLayout,
+    build_cache: BuildCacheLayout,
 }
 
 impl Layout {
@@ -184,6 +185,8 @@ impl Layout {
         let deps = build_dest.join("deps");
         let artifact = deps.join("artifact");
 
+        let cache_root = ws.gctx().home().join("build-cache").into_path_unlocked();
+
         Ok(Layout {
             artifact_dir: ArtifactDirLayout {
                 dest: dest.clone(),
@@ -204,6 +207,7 @@ impl Layout {
                 _lock: build_dir_lock,
                 is_new_layout,
             },
+            build_cache: BuildCacheLayout { root: cache_root },
         })
     }
 
@@ -211,6 +215,7 @@ impl Layout {
     pub fn prepare(&mut self) -> CargoResult<()> {
         self.artifact_dir.prepare()?;
         self.build_dir.prepare()?;
+        self.build_cache.prepare()?;
 
         Ok(())
     }
@@ -221,6 +226,10 @@ impl Layout {
 
     pub fn build_dir(&self) -> &BuildDirLayout {
         &self.build_dir
+    }
+
+    pub fn build_cache(&self) -> &BuildCacheLayout {
+        &self.build_cache
     }
 }
 
@@ -370,5 +379,22 @@ impl BuildDirLayout {
     pub fn prepare_tmp(&self) -> CargoResult<&Path> {
         paths::create_dir_all(&self.tmp)?;
         Ok(&self.tmp)
+    }
+}
+
+pub struct BuildCacheLayout {
+    root: PathBuf,
+}
+
+impl BuildCacheLayout {
+    /// Makes sure all directories stored in the Layout exist on the filesystem.
+    pub fn prepare(&mut self) -> CargoResult<()> {
+        paths::create_dir_all(&self.root)?;
+
+        Ok(())
+    }
+    /// Fetch the build unit path
+    pub fn build_unit(&self, pkg_dir: &str) -> PathBuf {
+        self.root.join(pkg_dir)
     }
 }

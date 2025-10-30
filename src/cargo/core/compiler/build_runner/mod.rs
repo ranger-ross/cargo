@@ -12,7 +12,7 @@ use crate::util::cache_lock::CacheLockMode;
 use crate::util::errors::CargoResult;
 use annotate_snippets::{Level, Message};
 use anyhow::{Context as _, bail};
-use cargo_util::paths;
+use cargo_util::paths::{self, has_files};
 use filetime::FileTime;
 use itertools::Itertools;
 use jobserver::Client;
@@ -730,5 +730,53 @@ impl<'a, 'gctx> BuildRunner<'a, 'gctx> {
             self.metadata_for_doc_units
                 .insert(unit.clone(), self.files().metadata(metadata_unit));
         }
+    }
+
+    /// Upload a build unit to the cache
+    pub fn cache_build_unit(&self, unit: &Unit) -> CargoResult<()> {
+        let destination = self.files().build_unit_cache(unit);
+        let source = self.files().build_unit(unit);
+
+        if destination.exists() {
+            // The unit is already cached
+            return Ok(());
+        }
+
+        // TODO: Lock
+
+        // If we ever try to save a non-existent build unit, its probably a bug with cargo.
+        // Use `debug_assert` as we don't want to waste time getting the file metadata in real
+        // operation.
+        debug_assert!(source.exists());
+
+        paths::hardlink_dir_all(source, destination)?;
+
+        // TODO: Unlock
+
+        Ok(())
+    }
+
+    pub fn load_from_cache(&self, unit: &Unit) -> CargoResult<bool> {
+        let destination = self.files().build_unit(unit);
+        let source = self.files().build_unit_cache(unit);
+
+        if destination.exists() && has_files(&destination)? {
+            // The unit is already in the build-dir
+            println!("{} already in build dir", destination.display());
+            return Ok(false);
+        }
+
+        if source.exists() {
+            // TODO: Lock
+
+            paths::hardlink_dir_all(source, destination)?;
+
+            // TODO: Unlock
+
+            return Ok(true);
+        }
+
+        println!("{} not found in build cache", source.display());
+        Ok(false)
     }
 }

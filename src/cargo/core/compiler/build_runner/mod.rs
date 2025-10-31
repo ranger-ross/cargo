@@ -91,8 +91,9 @@ pub struct BuildRunner<'a, 'gctx> {
     /// because it is continuously updated as the job progresses.
     pub failed_scrape_units: Arc<Mutex<HashSet<UnitHash>>>,
 
-    /// The locking mode to use for this build.
-    /// By default we use coarse grain locking, but disable locking on some filesystems like NFS
+    /// By default we use fine grain locking, but disable locking on some filesystems like NFS
+    /// or fallback to coarse grain locking based if we detected we cannot suport fine grain
+    /// locking in the current environment.
     pub locking_strategy: LockingStrategy,
 }
 

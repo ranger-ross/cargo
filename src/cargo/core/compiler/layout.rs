@@ -151,11 +151,11 @@ impl Layout {
         // actual destination (sub)subdirectory.
         paths::create_dir_all(dest.as_path_unlocked())?;
 
-        // For now we don't do any more finer-grained locking on the artifact
-        // directory, so just lock the entire thing for the duration of this
-        // compile.
         let artifact_dir_lock = match locking_strategy.artifact_dir() {
             LockingMode::Disabled => None,
+            LockingMode::Fine => {
+                Some(dest.open_ro_shared_create(".cargo-lock", ws.gctx(), "build directory")?)
+            }
             LockingMode::Coarse => Some(dest.open_rw_exclusive_create(
                 ".cargo-lock",
                 ws.gctx(),
@@ -167,6 +167,11 @@ impl Layout {
         let build_dir_lock = if !locking_strategy.is_unified_output_dir() {
             match locking_strategy.build_dir() {
                 LockingMode::Disabled => None,
+                LockingMode::Fine => Some(build_dest.open_ro_shared_create(
+                    ".cargo-lock",
+                    ws.gctx(),
+                    "build directory",
+                )?),
                 LockingMode::Coarse => Some(build_dest.open_rw_exclusive_create(
                     ".cargo-lock",
                     ws.gctx(),
@@ -358,6 +363,14 @@ impl BuildDirLayout {
             self.build().join(pkg_dir)
         }
     }
+    /// Fetch the lock paths for a build unit
+    pub fn build_unit_lock(&self, pkg_dir: &str) -> BuildUnitLockLocation {
+        let dir = self.build_unit(pkg_dir);
+        BuildUnitLockLocation {
+            partial: dir.join("partial.lock"),
+            full: dir.join("full.lock"),
+        }
+    }
     /// Fetch the artifact path.
     pub fn artifact(&self) -> &Path {
         &self.artifact
@@ -371,4 +384,11 @@ impl BuildDirLayout {
         paths::create_dir_all(&self.tmp)?;
         Ok(&self.tmp)
     }
+}
+
+/// See [crate::core::compiler::locking] module docs for details about build system locking
+/// structure.
+pub struct BuildUnitLockLocation {
+    pub partial: PathBuf,
+    pub full: PathBuf,
 }

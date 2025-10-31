@@ -117,7 +117,7 @@ fn clean_specs(
     let target_data = RustcTargetData::new(ws, &requested_kinds)?;
     let (pkg_set, resolve) = ops::resolve_ws(ws, dry_run)?;
     let prof_dir_name = profiles.get_dir_name();
-    let locking_strategy = LockingStrategy::determine_locking_strategy(&ws)?;
+    let locking_strategy = LockingStrategy::determine_locking_strategy(&ws, None)?;
     let host_layout = Layout::new(ws, None, &prof_dir_name, &locking_strategy)?;
     // Convert requested kinds to a Vec of layouts.
     let target_layouts: Vec<(CompileKind, Layout)> = requested_kinds

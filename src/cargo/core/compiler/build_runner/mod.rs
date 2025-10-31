@@ -16,6 +16,7 @@ use cargo_util::paths;
 use filetime::FileTime;
 use itertools::Itertools;
 use jobserver::Client;
+use tracing::warn;
 
 use super::build_plan::BuildPlan;
 use super::custom_build::{self, BuildDeps, BuildScriptOutputs, BuildScripts};
@@ -117,7 +118,7 @@ impl<'a, 'gctx> BuildRunner<'a, 'gctx> {
             }
         };
 
-        let locking_strategy = LockingStrategy::determine_locking_strategy(&bcx.ws)?;
+        let locking_strategy = LockingStrategy::determine_locking_strategy(&bcx.ws, Some(&bcx))?;
 
         Ok(Self {
             bcx,

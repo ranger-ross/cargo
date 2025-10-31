@@ -38,13 +38,15 @@ use std::{
 
 use anyhow::Context;
 use itertools::Itertools;
-use tracing::{debug, instrument, trace};
+use tracing::{debug, instrument, trace, warn};
 
 use crate::{
     CargoResult,
-    core::Workspace,
-    core::compiler::{BuildRunner, Unit, layout::BuildUnitLockLocation},
-    util::flock::is_on_nfs_mount,
+    core::{
+        Workspace,
+        compiler::{BuildContext, BuildRunner, Unit, layout::BuildUnitLockLocation},
+    },
+    util::{flock::is_on_nfs_mount, rlimit},
 };
 
 /// The strategy to use for locking during a build.
@@ -60,9 +62,58 @@ pub struct LockingStrategy {
     build_dir: Option<LockingMode>,
 }
 
+/// Determines if we have enough resources to safely use fine grain locking.
+/// This function will raises the number of max number file descriptors the current process
+/// can have open at once to make sure we are able to compile without running out of fds.
+///
+/// If we cannot acquire a safe max number of file descriptors, we fallback to coarse grain
+/// locking.
+pub fn determine_locking_mode(bcx: &BuildContext<'_, '_>) -> CargoResult<LockingMode> {
+    let total_units = bcx.unit_graph.keys().len() as u64;
+
+    // This is a bit arbitrary but if we do not have at least 10 times the remaining file
+    // descriptors than total build units there is a chance we could hit the limit.
+    // This is a fairly conservative estimate to make sure we don't hit max fd errors.
+    let safe_threshold = total_units * 10;
+
+    let Ok(mut limit) = rlimit::get_max_file_descriptors() else {
+        return Ok(LockingMode::Coarse);
+    };
+
+    if limit.soft_limit >= safe_threshold {
+        // The limit is higher or equal to what we deemed safe, so
+        // there is no need to raise the limit.
+        return Ok(LockingMode::Fine);
+    }
+
+    let display_fd_warning = || -> CargoResult<()> {
+        bcx.gctx.shell().verbose(|shell| shell.warn("ulimit was to low to safely enable fine grain locking, falling back to coarse grain locking"))
+    };
+
+    if limit.hard_limit < safe_threshold {
+        // The max we could raise the limit to is still not enough to safely compile.
+        display_fd_warning()?;
+        return Ok(LockingMode::Coarse);
+    }
+
+    limit.soft_limit = safe_threshold;
+
+    debug!("raising fd limit to {safe_threshold}");
+    if let Err(err) = rlimit::set_max_file_descriptors(limit) {
+        warn!("failed to raise max fds: {err}");
+        display_fd_warning()?;
+        return Ok(LockingMode::Coarse);
+    }
+
+    return Ok(LockingMode::Fine);
+}
+
 impl LockingStrategy {
     /// Determines the locking strategy the current environment can support.
-    pub fn determine_locking_strategy(ws: &Workspace<'_>) -> CargoResult<Self> {
+    pub fn determine_locking_strategy(
+        ws: &Workspace<'_>,
+        bcx: Option<&BuildContext<'_, '_>>,
+    ) -> CargoResult<Self> {
         let artifact_dir_locking_mode = match is_on_nfs_mount(ws.target_dir().as_path_unlocked()) {
             true => {
                 debug!("NFS detected. Disabling file system locking for artifact-dir");
@@ -73,19 +124,67 @@ impl LockingStrategy {
         let build_dir_locking_mode = if ws.target_dir() == ws.build_dir() {
             None
         } else {
-            Some(match is_on_nfs_mount(ws.build_dir().as_path_unlocked()) {
-                true => {
-                    debug!("NFS detected. Disabling file system locking for build-dir");
-                    LockingMode::Disabled
+            let locking_mode = if is_on_nfs_mount(ws.build_dir().as_path_unlocked()) {
+                debug!("NFS detected. Disabling file system locking for build-dir");
+                LockingMode::Disabled
+            } else {
+                if let Some(bcx) = bcx {
+                    Self::determine_build_dir_locking_mode(bcx)?
+                } else {
+                    LockingMode::Coarse
                 }
-                false if ws.gctx().cli_unstable().fine_grain_locking => LockingMode::Fine,
-                false => LockingMode::Coarse,
-            })
+            };
+
+            Some(locking_mode)
         };
         Ok(Self {
             artifact_dir: artifact_dir_locking_mode,
             build_dir: build_dir_locking_mode,
         })
+    }
+
+    fn determine_build_dir_locking_mode(bcx: &BuildContext<'_, '_>) -> CargoResult<LockingMode> {
+        if bcx.ws.gctx().cli_unstable().fine_grain_locking {
+            return Ok(LockingMode::Fine);
+        }
+
+        let total_units = bcx.unit_graph.keys().len() as u64;
+
+        // This is a bit arbitrary but if we do not have at least 10 times the remaining file
+        // descriptors than total build units there is a chance we could hit the limit.
+        // This is a fairly conservative estimate to make sure we don't hit max fd errors.
+        let safe_threshold = total_units * 10;
+
+        let Ok(mut limit) = rlimit::get_max_file_descriptors() else {
+            return Ok(LockingMode::Coarse);
+        };
+
+        if limit.soft_limit >= safe_threshold {
+            // The limit is higher or equal to what we deemed safe, so
+            // there is no need to raise the limit.
+            return Ok(LockingMode::Fine);
+        }
+
+        let display_fd_warning = || -> CargoResult<()> {
+            bcx.gctx.shell().verbose(|shell| shell.warn("ulimit was to low to safely enable fine grain locking, falling back to coarse grain locking"))
+        };
+
+        if limit.hard_limit < safe_threshold {
+            // The max we could raise the limit to is still not enough to safely compile.
+            display_fd_warning()?;
+            return Ok(LockingMode::Coarse);
+        }
+
+        limit.soft_limit = safe_threshold;
+
+        debug!("raising fd limit to {safe_threshold}");
+        if let Err(err) = rlimit::set_max_file_descriptors(limit) {
+            warn!("failed to raise max fds: {err}");
+            display_fd_warning()?;
+            return Ok(LockingMode::Coarse);
+        }
+
+        return Ok(LockingMode::Fine);
     }
 
     pub fn artifact_dir(&self) -> &LockingMode {

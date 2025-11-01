@@ -881,11 +881,9 @@ pub fn hardlink_dir_all(src: impl AsRef<Path>, dst: impl AsRef<Path>) -> io::Res
             hardlink_dir_all(entry.path(), dst.as_ref().join(entry.file_name()))?;
         } else {
             if let Err(err) = std::fs::hard_link(entry.path(), dst.as_ref().join(entry.file_name()))
+                && !matches!(err.kind(), io::ErrorKind::AlreadyExists)
             {
-                match err.kind() {
-                    io::ErrorKind::AlreadyExists => continue,
-                    _ => return Err(err),
-                }
+                return Err(err);
             }
         }
     }

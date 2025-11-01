@@ -213,34 +213,40 @@ fn compile<'gctx>(
             )
         } else {
             let force = exec.force_rebuild(unit) || force_rebuild;
-            let mut job = fingerprint::prepare_target(build_runner, unit, force)?;
-            job.before(if job.freshness().is_dirty() {
-                let work = if unit.mode.is_doc() || unit.mode.is_doc_scrape() {
-                    rustdoc(build_runner, unit)?
-                } else {
-                    rustc(build_runner, unit, exec)?
-                };
-                work.then(link_targets(build_runner, unit, false)?)
-                    .then(save_to_cache(build_runner, unit)?)
+            if let Some(work) = load_from_cache(build_runner, unit)?
+                && !force
+            {
+                Job::new_cached(work)
             } else {
-                // We always replay the output cache,
-                // since it might contain future-incompat-report messages
-                let show_diagnostics = unit.show_warnings(bcx.gctx)
-                    && build_runner.bcx.gctx.warning_handling()? != WarningHandling::Allow;
-                let manifest = ManifestErrorContext::new(build_runner, unit);
-                let work = replay_output_cache(
-                    unit.pkg.package_id(),
-                    manifest,
-                    &unit.target,
-                    build_runner.files().message_cache_path(unit),
-                    build_runner.bcx.build_config.message_format,
-                    show_diagnostics,
-                );
-                // Need to link targets on both the dirty and fresh.
-                work.then(link_targets(build_runner, unit, true)?)
-            });
+                let mut job = fingerprint::prepare_target(build_runner, unit, force)?;
+                job.before(if job.freshness().is_dirty() {
+                    let work = if unit.mode.is_doc() || unit.mode.is_doc_scrape() {
+                        rustdoc(build_runner, unit)?
+                    } else {
+                        rustc(build_runner, unit, exec)?
+                    };
+                    work.then(link_targets(build_runner, unit, false)?)
+                        .then(save_to_cache(build_runner, unit)?)
+                } else {
+                    // We always replay the output cache,
+                    // since it might contain future-incompat-report messages
+                    let show_diagnostics = unit.show_warnings(bcx.gctx)
+                        && build_runner.bcx.gctx.warning_handling()? != WarningHandling::Allow;
+                    let manifest = ManifestErrorContext::new(build_runner, unit);
+                    let work = replay_output_cache(
+                        unit.pkg.package_id(),
+                        manifest,
+                        &unit.target,
+                        build_runner.files().message_cache_path(unit),
+                        build_runner.bcx.build_config.message_format,
+                        show_diagnostics,
+                    );
+                    // Need to link targets on both the dirty and fresh.
+                    work.then(link_targets(build_runner, unit, true)?)
+                });
 
-            job
+                job
+            }
         };
         jobs.enqueue(build_runner, unit, job)?;
     }
@@ -255,6 +261,32 @@ fn compile<'gctx>(
     }
 
     Ok(())
+}
+
+fn load_from_cache<'gctx>(
+    build_runner: &mut BuildRunner<'_, 'gctx>,
+    unit: &Unit,
+) -> CargoResult<Option<Work>> {
+    let build_dir_unit = build_runner.files().build_unit(unit);
+    let cache_location = build_runner.files().build_unit_cache(unit);
+    let cache_populated = build_runner.files().build_unit_cache_populated(unit);
+    let cache_lock = build_runner.files().build_unit_lock(unit);
+
+    if !build_dir_unit.exists() || !has_files(&build_dir_unit)? {
+        if cache_populated.exists() {
+            return Ok(Some(Work::new(move |_state| {
+                let _lock = BuildCacheLock::shared(&cache_lock)?;
+                paths::hardlink_dir_all(cache_location, build_dir_unit)?;
+
+                // TODO: Do we need to trigger something on state here?
+
+                return Ok(());
+            })));
+        }
+    }
+
+    debug!("{} not found in build cache", cache_location.display());
+    Ok(None)
 }
 
 /// Generates the warning message used when fallible doc-scrape units fail,
@@ -374,11 +406,6 @@ fn rustc(
         false => SharedLockType::Partial,
     };
 
-    let build_dir_unit = build_runner.files().build_unit(unit);
-    let cache_location = build_runner.files().build_unit_cache(unit);
-    let cache_populated = build_runner.files().build_unit_cache_populated(unit);
-    let cache_lock = build_runner.files().build_unit_lock(unit);
-
     return Ok(Work::new(move |state| {
         if let Some(lock) = &mut lock {
             lock.lock(&dependency_locking_mode)
@@ -388,18 +415,6 @@ fn rustc(
             // have already compiled the crate before we recv'd the lock.
             // For large crates re-compiling here would be quiet costly.
         }
-
-        if !build_dir_unit.exists() || !has_files(&build_dir_unit)? {
-            if cache_populated.exists() {
-                let _lock = BuildCacheLock::shared(&cache_lock)?;
-
-                paths::hardlink_dir_all(cache_location, build_dir_unit)?;
-
-                return Ok(());
-            }
-        }
-
-        debug!("{} not found in build cache", cache_location.display());
 
         // Artifacts are in a different location than typical units,
         // hence we must assure the crate- and target-dependent

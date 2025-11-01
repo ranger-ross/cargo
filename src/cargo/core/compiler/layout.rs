@@ -103,6 +103,7 @@
 
 use crate::core::Workspace;
 use crate::core::compiler::CompileTarget;
+use crate::core::compiler::locking::{LockingMode, LockingStrategy};
 use crate::util::{CargoResult, FileLock};
 use cargo_util::paths;
 use std::path::{Path, PathBuf};
@@ -113,6 +114,7 @@ use std::path::{Path, PathBuf};
 pub struct Layout {
     artifact_dir: ArtifactDirLayout,
     build_dir: BuildDirLayout,
+    build_cache: BuildCacheLayout,
 }
 
 impl Layout {
@@ -126,6 +128,7 @@ impl Layout {
         ws: &Workspace<'_>,
         target: Option<CompileTarget>,
         dest: &str,
+        locking_strategy: &LockingStrategy,
     ) -> CargoResult<Layout> {
         let is_new_layout = ws.gctx().cli_unstable().build_dir_new_layout;
         let mut root = ws.target_dir();
@@ -152,24 +155,37 @@ impl Layout {
         // For now we don't do any more finer-grained locking on the artifact
         // directory, so just lock the entire thing for the duration of this
         // compile.
-        let artifact_dir_lock =
-            dest.open_rw_exclusive_create(".cargo-lock", ws.gctx(), "build directory")?;
-
-        let build_dir_lock = if root != build_root {
-            Some(build_dest.open_rw_exclusive_create(
+        let artifact_dir_lock = match locking_strategy.artifact_dir() {
+            LockingMode::Disabled => None,
+            LockingMode::Coarse => Some(dest.open_rw_exclusive_create(
                 ".cargo-lock",
                 ws.gctx(),
-                "build directory",
-            )?)
+                "artifact directory",
+            )?),
+        };
+
+        assert_eq!(locking_strategy.is_unified_output_dir(), root == build_root);
+        let build_dir_lock = if !locking_strategy.is_unified_output_dir() {
+            match locking_strategy.build_dir() {
+                LockingMode::Disabled => None,
+                LockingMode::Coarse => Some(build_dest.open_rw_exclusive_create(
+                    ".cargo-lock",
+                    ws.gctx(),
+                    "build directory",
+                )?),
+            }
         } else {
             None
         };
+
         let root = root.into_path_unlocked();
         let build_root = build_root.into_path_unlocked();
         let dest = dest.into_path_unlocked();
         let build_dest = build_dest.as_path_unlocked();
         let deps = build_dest.join("deps");
         let artifact = deps.join("artifact");
+
+        let cache_root = ws.gctx().home().join("build-cache").into_path_unlocked();
 
         Ok(Layout {
             artifact_dir: ArtifactDirLayout {
@@ -191,6 +207,7 @@ impl Layout {
                 _lock: build_dir_lock,
                 is_new_layout,
             },
+            build_cache: BuildCacheLayout { root: cache_root },
         })
     }
 
@@ -198,6 +215,7 @@ impl Layout {
     pub fn prepare(&mut self) -> CargoResult<()> {
         self.artifact_dir.prepare()?;
         self.build_dir.prepare()?;
+        self.build_cache.prepare()?;
 
         Ok(())
     }
@@ -208,6 +226,10 @@ impl Layout {
 
     pub fn build_dir(&self) -> &BuildDirLayout {
         &self.build_dir
+    }
+
+    pub fn build_cache(&self) -> &BuildCacheLayout {
+        &self.build_cache
     }
 }
 
@@ -222,7 +244,7 @@ pub struct ArtifactDirLayout {
     timings: PathBuf,
     /// The lockfile for a build (`.cargo-lock`). Will be unlocked when this
     /// struct is `drop`ped.
-    _lock: FileLock,
+    _lock: Option<FileLock>,
 }
 
 impl ArtifactDirLayout {
@@ -357,5 +379,22 @@ impl BuildDirLayout {
     pub fn prepare_tmp(&self) -> CargoResult<&Path> {
         paths::create_dir_all(&self.tmp)?;
         Ok(&self.tmp)
+    }
+}
+
+pub struct BuildCacheLayout {
+    root: PathBuf,
+}
+
+impl BuildCacheLayout {
+    /// Makes sure all directories stored in the Layout exist on the filesystem.
+    pub fn prepare(&mut self) -> CargoResult<()> {
+        paths::create_dir_all(&self.root)?;
+
+        Ok(())
+    }
+    /// Fetch the build unit path
+    pub fn build_unit(&self, pkg_dir: &str) -> PathBuf {
+        self.root.join(pkg_dir)
     }
 }

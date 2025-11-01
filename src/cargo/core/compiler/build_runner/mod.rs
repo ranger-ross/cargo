@@ -6,12 +6,13 @@ use std::sync::{Arc, Mutex};
 
 use crate::core::PackageId;
 use crate::core::compiler::compilation::{self, UnitOutput};
+use crate::core::compiler::locking::LockingStrategy;
 use crate::core::compiler::{self, Unit, artifact};
 use crate::util::cache_lock::CacheLockMode;
 use crate::util::errors::CargoResult;
 use annotate_snippets::{Level, Message};
 use anyhow::{Context as _, bail};
-use cargo_util::paths;
+use cargo_util::paths::{self, has_files};
 use filetime::FileTime;
 use itertools::Itertools;
 use jobserver::Client;
@@ -89,6 +90,10 @@ pub struct BuildRunner<'a, 'gctx> {
     /// because the target has a type error. This is in an Arc<Mutex<..>>
     /// because it is continuously updated as the job progresses.
     pub failed_scrape_units: Arc<Mutex<HashSet<UnitHash>>>,
+
+    /// The locking mode to use for this build.
+    /// By default we use coarse grain locking, but disable locking on some filesystems like NFS
+    pub locking_strategy: LockingStrategy,
 }
 
 impl<'a, 'gctx> BuildRunner<'a, 'gctx> {
@@ -111,6 +116,8 @@ impl<'a, 'gctx> BuildRunner<'a, 'gctx> {
             }
         };
 
+        let locking_strategy = LockingStrategy::determine_locking_strategy(&bcx.ws)?;
+
         Ok(Self {
             bcx,
             compilation: Compilation::new(bcx)?,
@@ -128,6 +135,7 @@ impl<'a, 'gctx> BuildRunner<'a, 'gctx> {
             lto: HashMap::new(),
             metadata_for_doc_units: HashMap::new(),
             failed_scrape_units: Arc::new(Mutex::new(HashSet::new())),
+            locking_strategy,
         })
     }
 
@@ -360,11 +368,11 @@ impl<'a, 'gctx> BuildRunner<'a, 'gctx> {
     #[tracing::instrument(skip_all)]
     pub fn prepare_units(&mut self) -> CargoResult<()> {
         let dest = self.bcx.profiles.get_dir_name();
-        let host_layout = Layout::new(self.bcx.ws, None, &dest)?;
+        let host_layout = Layout::new(self.bcx.ws, None, &dest, &self.locking_strategy)?;
         let mut targets = HashMap::new();
         for kind in self.bcx.all_kinds.iter() {
             if let CompileKind::Target(target) = *kind {
-                let layout = Layout::new(self.bcx.ws, Some(target), &dest)?;
+                let layout = Layout::new(self.bcx.ws, Some(target), &dest, &self.locking_strategy)?;
                 targets.insert(target, layout);
             }
         }
@@ -722,5 +730,53 @@ impl<'a, 'gctx> BuildRunner<'a, 'gctx> {
             self.metadata_for_doc_units
                 .insert(unit.clone(), self.files().metadata(metadata_unit));
         }
+    }
+
+    /// Upload a build unit to the cache
+    pub fn cache_build_unit(&self, unit: &Unit) -> CargoResult<()> {
+        let destination = self.files().build_unit_cache(unit);
+        let source = self.files().build_unit(unit);
+
+        if destination.exists() {
+            // The unit is already cached
+            return Ok(());
+        }
+
+        // TODO: Lock
+
+        // If we ever try to save a non-existent build unit, its probably a bug with cargo.
+        // Use `debug_assert` as we don't want to waste time getting the file metadata in real
+        // operation.
+        debug_assert!(source.exists());
+
+        paths::hardlink_dir_all(source, destination)?;
+
+        // TODO: Unlock
+
+        Ok(())
+    }
+
+    pub fn load_from_cache(&self, unit: &Unit) -> CargoResult<bool> {
+        let destination = self.files().build_unit(unit);
+        let source = self.files().build_unit_cache(unit);
+
+        if destination.exists() && has_files(&destination)? {
+            // The unit is already in the build-dir
+            println!("{} already in build dir", destination.display());
+            return Ok(false);
+        }
+
+        if source.exists() {
+            // TODO: Lock
+
+            paths::hardlink_dir_all(source, destination)?;
+
+            // TODO: Unlock
+
+            return Ok(true);
+        }
+
+        println!("{} not found in build cache", source.display());
+        Ok(false)
     }
 }

@@ -45,6 +45,7 @@ pub mod future_incompat;
 pub(crate) mod job_queue;
 pub(crate) mod layout;
 mod links;
+pub mod locking;
 mod lto;
 mod output_depinfo;
 mod output_sbom;
@@ -69,6 +70,7 @@ use std::sync::{Arc, LazyLock};
 use annotate_snippets::{AnnotationKind, Group, Level, Renderer, Snippet};
 use anyhow::{Context as _, Error};
 use cargo_platform::{Cfg, Platform};
+use cargo_util::paths::has_files;
 use itertools::Itertools;
 use lazycell::LazyCell;
 use regex::Regex;
@@ -216,6 +218,7 @@ fn compile<'gctx>(
                     rustc(build_runner, unit, exec)?
                 };
                 work.then(link_targets(build_runner, unit, false)?)
+                    .then(save_to_cache(build_runner, unit)?)
             } else {
                 // We always replay the output cache,
                 // since it might contain future-incompat-report messages
@@ -351,7 +354,28 @@ fn rustc(
         output_options.show_diagnostics = false;
     }
     let env_config = Arc::clone(build_runner.bcx.gctx.env_config()?);
+
+    let build_dir_unit = build_runner.files().build_unit(unit);
+    let cache_location = build_runner.files().build_unit_cache(unit);
+
     return Ok(Work::new(move |state| {
+        if build_dir_unit.exists() && has_files(&build_dir_unit)? {
+            debug!("{} already in build dir", build_dir_unit.display());
+            return Ok(());
+        }
+
+        if cache_location.exists() {
+            // TODO: Lock
+
+            paths::hardlink_dir_all(cache_location, build_dir_unit)?;
+
+            // TODO: Unlock
+
+            return Ok(());
+        }
+
+        debug!("{} not found in build cache", cache_location.display());
+
         // Artifacts are in a different location than typical units,
         // hence we must assure the crate- and target-dependent
         // directory is present.
@@ -672,6 +696,30 @@ fn link_targets(
             .to_json_string();
             state.stdout(msg)?;
         }
+        Ok(())
+    }))
+}
+
+fn save_to_cache(build_runner: &mut BuildRunner<'_, '_>, unit: &Unit) -> CargoResult<Work> {
+    let destination = build_runner.files().build_unit_cache(unit);
+    let source = build_runner.files().build_unit(unit);
+    Ok(Work::new(move |_| {
+        if destination.exists() {
+            // The unit is already cached
+            return Ok(());
+        }
+
+        // TODO: Lock
+
+        // If we ever try to save a non-existent build unit, its probably a bug with cargo.
+        // Use `debug_assert` as we don't want to waste time getting the file metadata in real
+        // operation.
+        debug_assert!(source.exists(), "missing {:?}", source);
+
+        paths::hardlink_dir_all(source, destination)?;
+
+        // TODO: Unlock
+
         Ok(())
     }))
 }

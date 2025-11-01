@@ -97,7 +97,9 @@ use self::output_depinfo::output_depinfo;
 use self::output_sbom::build_sbom;
 use self::unit_graph::UnitDep;
 use crate::core::compiler::future_incompat::FutureIncompatReport;
-use crate::core::compiler::locking::{CompilationLock, LockingMode, SharedLockType};
+use crate::core::compiler::locking::{
+    BuildCacheLock, CompilationLock, LockingMode, SharedLockType,
+};
 use crate::core::compiler::timings::SectionTiming;
 pub use crate::core::compiler::unit::{Unit, UnitInterner};
 use crate::core::manifest::TargetSourcePath;
@@ -391,11 +393,9 @@ fn rustc(
         }
 
         if cache_location.exists() {
-            // TODO: Lock
+            let _lock = BuildCacheLock::shared(&cache_location)?;
 
             paths::hardlink_dir_all(cache_location, build_dir_unit)?;
-
-            // TODO: Unlock
 
             return Ok(());
         }
@@ -736,7 +736,7 @@ fn save_to_cache(build_runner: &mut BuildRunner<'_, '_>, unit: &Unit) -> CargoRe
             return Ok(());
         }
 
-        // TODO: Lock
+        let _lock = BuildCacheLock::write(&source)?;
 
         // If we ever try to save a non-existent build unit, its probably a bug with cargo.
         // Use `debug_assert` as we don't want to waste time getting the file metadata in real
@@ -744,8 +744,6 @@ fn save_to_cache(build_runner: &mut BuildRunner<'_, '_>, unit: &Unit) -> CargoRe
         debug_assert!(source.exists(), "missing {:?}", source);
 
         paths::hardlink_dir_all(source, destination)?;
-
-        // TODO: Unlock
 
         Ok(())
     }))

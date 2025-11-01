@@ -526,3 +526,29 @@ impl RcFileLock {
         Ok(())
     }
 }
+
+pub struct BuildCacheLock {
+    _file: File,
+}
+
+impl BuildCacheLock {
+    pub fn write(path: impl AsRef<Path>) -> CargoResult<Self> {
+        let path = path.as_ref().join("partial.lock"); // TODO: Move to layout
+
+        let file = open_file(&path)?;
+
+        file.lock()?;
+
+        Ok(Self { _file: file })
+    }
+
+    pub fn shared(path: impl AsRef<Path>) -> CargoResult<Self> {
+        let path = path.as_ref().join("partial.lock"); // TODO: Move to layout
+
+        let file = open_file(&path)?;
+
+        file.lock_shared()?;
+
+        Ok(Self { _file: file })
+    }
+}

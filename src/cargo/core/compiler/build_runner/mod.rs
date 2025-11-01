@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::core::PackageId;
 use crate::core::compiler::compilation::{self, UnitOutput};
-use crate::core::compiler::locking::LockingStrategy;
+use crate::core::compiler::locking::{BuildCacheLock, LockingStrategy};
 use crate::core::compiler::{self, Unit, artifact};
 use crate::util::cache_lock::CacheLockMode;
 use crate::util::errors::CargoResult;
@@ -320,7 +320,36 @@ impl<'a, 'gctx> BuildRunner<'a, 'gctx> {
                     .insert(dir.clone().into_path_buf());
             }
         }
+
+        for (unit, _) in &self.bcx.unit_graph {
+            self.save_to_cache(unit)?;
+        }
+
         Ok(self.compilation)
+    }
+
+    fn save_to_cache(&self, unit: &Unit) -> CargoResult<()> {
+        let destination = self.files().build_unit_cache(unit);
+        let destination_populated = self.files().build_unit_cache_populated(unit);
+        let destination_lock = self.files().build_unit_lock(unit);
+        let source = self.files().build_unit(unit);
+        if destination_populated.exists() {
+            // The unit is already cached
+            return Ok(());
+        }
+
+        let _lock = BuildCacheLock::write(&destination_lock)?;
+
+        // If we ever try to save a non-existent build unit, its probably a bug with cargo.
+        // Use `debug_assert` as we don't want to waste time getting the file metadata in real
+        // operation.
+        debug_assert!(source.exists(), "missing {:?}", source);
+
+        paths::hardlink_dir_all(source, destination)?;
+
+        std::fs::File::create(destination_populated)?;
+
+        Ok(())
     }
 
     fn collect_tests_and_executables(&mut self, unit: &Unit) -> CargoResult<()> {

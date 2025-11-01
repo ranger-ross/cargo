@@ -226,7 +226,6 @@ fn compile<'gctx>(
                         rustc(build_runner, unit, exec)?
                     };
                     work.then(link_targets(build_runner, unit, false)?)
-                        .then(save_to_cache(build_runner, unit)?)
                 } else {
                     // We always replay the output cache,
                     // since it might contain future-incompat-report messages
@@ -737,32 +736,6 @@ fn link_targets(
             .to_json_string();
             state.stdout(msg)?;
         }
-        Ok(())
-    }))
-}
-
-fn save_to_cache(build_runner: &mut BuildRunner<'_, '_>, unit: &Unit) -> CargoResult<Work> {
-    let destination = build_runner.files().build_unit_cache(unit);
-    let destination_populated = build_runner.files().build_unit_cache_populated(unit);
-    let destination_lock = build_runner.files().build_unit_lock(unit);
-    let source = build_runner.files().build_unit(unit);
-    Ok(Work::new(move |_| {
-        if destination_populated.exists() {
-            // The unit is already cached
-            return Ok(());
-        }
-
-        let _lock = BuildCacheLock::write(&destination_lock)?;
-
-        // If we ever try to save a non-existent build unit, its probably a bug with cargo.
-        // Use `debug_assert` as we don't want to waste time getting the file metadata in real
-        // operation.
-        debug_assert!(source.exists(), "missing {:?}", source);
-
-        paths::hardlink_dir_all(source, destination)?;
-
-        std::fs::File::create(destination_populated)?;
-
         Ok(())
     }))
 }

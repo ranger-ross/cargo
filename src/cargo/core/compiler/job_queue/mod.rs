@@ -128,7 +128,7 @@ use jobserver::{Acquired, HelperThread};
 use semver::Version;
 use tracing::{debug, trace};
 
-pub use self::job::Freshness::{self, Dirty, Fresh};
+pub use self::job::Freshness::{self, Cached, Dirty, Fresh};
 pub use self::job::{Job, Work};
 pub use self::job_state::JobState;
 use super::build_runner::OutputFile;
@@ -1189,6 +1189,9 @@ impl<'gctx> DrainState<'gctx> {
                     self.compiled.insert(unit.pkg.package_id());
                     gctx.shell().verbose(|c| c.status("Fresh", &unit.pkg))?;
                 }
+            }
+            Cached => {
+                gctx.shell().status("Cached", &unit.pkg)?;
             }
         }
         Ok(())

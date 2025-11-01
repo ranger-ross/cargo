@@ -67,6 +67,14 @@ impl Job {
         }
     }
 
+    /// Creates a new job representing a cache hit.
+    pub fn new_cached(work: Work) -> Job {
+        Job {
+            work,
+            fresh: Freshness::Cached,
+        }
+    }
+
     /// Consumes this job by running it, returning the result of the
     /// computation.
     pub fn run(self, state: &JobState<'_, '_>) -> CargoResult<()> {
@@ -100,6 +108,7 @@ impl fmt::Debug for Job {
 #[derive(Debug, Clone)]
 pub enum Freshness {
     Fresh,
+    Cached,
     Dirty(DirtyReason),
 }
 
@@ -110,5 +119,9 @@ impl Freshness {
 
     pub fn is_fresh(&self) -> bool {
         matches!(self, Freshness::Fresh)
+    }
+
+    pub fn is_cached(&self) -> bool {
+        matches!(self, Freshness::Cached)
     }
 }

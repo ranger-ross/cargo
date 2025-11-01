@@ -417,4 +417,16 @@ impl BuildCacheLayout {
     pub fn build_unit(&self, pkg_dir: &str) -> PathBuf {
         self.root.join(pkg_dir)
     }
+    /// Fetch the lock paths for a build unit
+    pub fn build_unit_lock(&self, pkg_dir: &str) -> BuildUnitLockLocation {
+        let dir = self.build_unit(pkg_dir);
+        BuildUnitLockLocation {
+            partial: dir.join("partial.lock"),
+            full: dir.join("full.lock"),
+        }
+    }
+    /// Fetch the file the determines if a cache is populated
+    pub fn build_unit_populated(&self, pkg_dir: &str) -> PathBuf {
+        self.build_unit(pkg_dir).join(".cache-populated")
+    }
 }

@@ -269,6 +269,18 @@ impl<'a, 'gctx: 'a> CompilationFiles<'a, 'gctx> {
         self.layout(unit.kind).build_cache().build_unit(&dir)
     }
 
+    pub fn build_unit_cache_populated(&self, unit: &Unit) -> PathBuf {
+        let dir = self.pkg_dir(unit);
+        self.layout(unit.kind)
+            .build_cache()
+            .build_unit_populated(&dir)
+    }
+
+    pub fn build_unit_cache_lock(&self, unit: &Unit) -> BuildUnitLockLocation {
+        let dir = self.pkg_dir(unit);
+        self.layout(unit.kind).build_cache().build_unit_lock(&dir)
+    }
+
     /// Returns the host `deps` directory path.
     pub fn host_deps(&self, unit: &Unit) -> PathBuf {
         let dir = self.pkg_dir(unit);

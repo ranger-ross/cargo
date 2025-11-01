@@ -532,20 +532,16 @@ pub struct BuildCacheLock {
 }
 
 impl BuildCacheLock {
-    pub fn write(path: impl AsRef<Path>) -> CargoResult<Self> {
-        let path = path.as_ref().join("partial.lock"); // TODO: Move to layout
-
-        let file = open_file(&path)?;
+    pub fn write(location: &BuildUnitLockLocation) -> CargoResult<Self> {
+        let file = open_file(&location.partial)?;
 
         file.lock()?;
 
         Ok(Self { _file: file })
     }
 
-    pub fn shared(path: impl AsRef<Path>) -> CargoResult<Self> {
-        let path = path.as_ref().join("partial.lock"); // TODO: Move to layout
-
-        let file = open_file(&path)?;
+    pub fn shared(location: &BuildUnitLockLocation) -> CargoResult<Self> {
+        let file = open_file(&location.partial)?;
 
         file.lock_shared()?;
 

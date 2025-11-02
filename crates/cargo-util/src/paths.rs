@@ -869,6 +869,41 @@ fn exclude_from_time_machine(path: &Path) {
     // doesn't prevent Cargo from working
 }
 
+/// Hardlinks a directory recursively.
+///
+/// Directories are created and files are hardlinked.
+pub fn hardlink_dir_all(src: impl AsRef<Path>, dst: impl AsRef<Path>) -> io::Result<()> {
+    fs::create_dir_all(&dst)?;
+    for entry in fs::read_dir(src)? {
+        let entry = entry?;
+        let ty = entry.file_type()?;
+        if ty.is_dir() {
+            hardlink_dir_all(entry.path(), dst.as_ref().join(entry.file_name()))?;
+        } else {
+            if let Err(err) = std::fs::hard_link(entry.path(), dst.as_ref().join(entry.file_name()))
+                && !matches!(err.kind(), io::ErrorKind::AlreadyExists)
+            {
+                return Err(err);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Checks if a directory has a least one file including in nested directories.
+pub fn has_files(path: impl AsRef<Path>) -> Result<bool> {
+    for entry in fs::read_dir(path)? {
+        let entry = entry?;
+        let ty = entry.file_type()?;
+        if ty.is_dir() {
+            has_files(entry.path())?;
+        } else {
+            return Ok(true);
+        }
+    }
+    return Ok(false);
+}
+
 #[cfg(test)]
 mod tests {
     use super::join_paths;

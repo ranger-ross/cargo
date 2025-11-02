@@ -45,6 +45,7 @@ pub mod future_incompat;
 pub(crate) mod job_queue;
 pub(crate) mod layout;
 mod links;
+pub mod locking;
 mod lto;
 mod output_depinfo;
 mod output_sbom;
@@ -69,6 +70,7 @@ use std::sync::{Arc, LazyLock};
 use annotate_snippets::{AnnotationKind, Group, Level, Renderer, Snippet};
 use anyhow::{Context as _, Error};
 use cargo_platform::{Cfg, Platform};
+use cargo_util::paths::has_files;
 use itertools::Itertools;
 use lazycell::LazyCell;
 use regex::Regex;
@@ -95,6 +97,9 @@ use self::output_depinfo::output_depinfo;
 use self::output_sbom::build_sbom;
 use self::unit_graph::UnitDep;
 use crate::core::compiler::future_incompat::FutureIncompatReport;
+use crate::core::compiler::locking::{
+    BuildCacheLock, CompilationLock, LockingMode, SharedLockType,
+};
 use crate::core::compiler::timings::SectionTiming;
 pub use crate::core::compiler::unit::{Unit, UnitInterner};
 use crate::core::manifest::TargetSourcePath;
@@ -197,7 +202,11 @@ fn compile<'gctx>(
         fingerprint::prepare_init(build_runner, unit)?;
 
         let job = if unit.mode.is_run_custom_build() {
-            custom_build::prepare(build_runner, unit)?
+            if let Some(work) = load_from_cache(build_runner, unit)? {
+                Job::new_cached(work)
+            } else {
+                custom_build::prepare(build_runner, unit)?
+            }
         } else if unit.mode.is_doc_test() {
             // We run these targets later, so this is just a no-op for now.
             Job::new_fresh()
@@ -208,33 +217,39 @@ fn compile<'gctx>(
             )
         } else {
             let force = exec.force_rebuild(unit) || force_rebuild;
-            let mut job = fingerprint::prepare_target(build_runner, unit, force)?;
-            job.before(if job.freshness().is_dirty() {
-                let work = if unit.mode.is_doc() || unit.mode.is_doc_scrape() {
-                    rustdoc(build_runner, unit)?
-                } else {
-                    rustc(build_runner, unit, exec)?
-                };
-                work.then(link_targets(build_runner, unit, false)?)
+            if let Some(work) = load_from_cache(build_runner, unit)?
+                && !force
+            {
+                Job::new_cached(work)
             } else {
-                // We always replay the output cache,
-                // since it might contain future-incompat-report messages
-                let show_diagnostics = unit.show_warnings(bcx.gctx)
-                    && build_runner.bcx.gctx.warning_handling()? != WarningHandling::Allow;
-                let manifest = ManifestErrorContext::new(build_runner, unit);
-                let work = replay_output_cache(
-                    unit.pkg.package_id(),
-                    manifest,
-                    &unit.target,
-                    build_runner.files().message_cache_path(unit),
-                    build_runner.bcx.build_config.message_format,
-                    show_diagnostics,
-                );
-                // Need to link targets on both the dirty and fresh.
-                work.then(link_targets(build_runner, unit, true)?)
-            });
+                let mut job = fingerprint::prepare_target(build_runner, unit, force)?;
+                job.before(if job.freshness().is_dirty() {
+                    let work = if unit.mode.is_doc() || unit.mode.is_doc_scrape() {
+                        rustdoc(build_runner, unit)?
+                    } else {
+                        rustc(build_runner, unit, exec)?
+                    };
+                    work.then(link_targets(build_runner, unit, false)?)
+                } else {
+                    // We always replay the output cache,
+                    // since it might contain future-incompat-report messages
+                    let show_diagnostics = unit.show_warnings(bcx.gctx)
+                        && build_runner.bcx.gctx.warning_handling()? != WarningHandling::Allow;
+                    let manifest = ManifestErrorContext::new(build_runner, unit);
+                    let work = replay_output_cache(
+                        unit.pkg.package_id(),
+                        manifest,
+                        &unit.target,
+                        build_runner.files().message_cache_path(unit),
+                        build_runner.bcx.build_config.message_format,
+                        show_diagnostics,
+                    );
+                    // Need to link targets on both the dirty and fresh.
+                    work.then(link_targets(build_runner, unit, true)?)
+                });
 
-            job
+                job
+            }
         };
         jobs.enqueue(build_runner, unit, job)?;
     }
@@ -249,6 +264,32 @@ fn compile<'gctx>(
     }
 
     Ok(())
+}
+
+fn load_from_cache<'gctx>(
+    build_runner: &mut BuildRunner<'_, 'gctx>,
+    unit: &Unit,
+) -> CargoResult<Option<Work>> {
+    let build_dir_unit = build_runner.files().build_unit(unit);
+    let cache_location = build_runner.files().build_unit_cache(unit);
+    let cache_populated = build_runner.files().build_unit_cache_populated(unit);
+    let cache_lock = build_runner.files().build_unit_lock(unit);
+
+    if !build_dir_unit.exists() || !has_files(&build_dir_unit)? {
+        if cache_populated.exists() {
+            return Ok(Some(Work::new(move |_state| {
+                let _lock = BuildCacheLock::shared(&cache_lock)?;
+                paths::hardlink_dir_all(cache_location, build_dir_unit)?;
+
+                // TODO: Do we need to trigger something on state here?
+
+                return Ok(());
+            })));
+        }
+    }
+
+    debug!("{} not found in build cache", cache_location.display());
+    Ok(None)
 }
 
 /// Generates the warning message used when fallible doc-scrape units fail,
@@ -351,7 +392,33 @@ fn rustc(
         output_options.show_diagnostics = false;
     }
     let env_config = Arc::clone(build_runner.bcx.gctx.env_config()?);
+
+    let mut lock = if build_runner.bcx.gctx.cli_unstable().fine_grain_locking
+        && matches!(build_runner.locking_strategy.build_dir(), LockingMode::Fine)
+    {
+        Some(CompilationLock::new(build_runner, unit))
+    } else {
+        None
+    };
+
+    // For libraries, we only need rmeta so we only need a partial shared lock, but for things like
+    // proc-macros we need the rlib so we need a full shared lock to we know the compilation is
+    // completely done.
+    let dependency_locking_mode = match unit.requires_upstream_objects() {
+        true => SharedLockType::Full,
+        false => SharedLockType::Partial,
+    };
+
     return Ok(Work::new(move |state| {
+        if let Some(lock) = &mut lock {
+            lock.lock(&dependency_locking_mode)
+                .expect("failed to take lock");
+
+            // TODO: We should probably revalidate the fingerprint here as another Cargo instance could
+            // have already compiled the crate before we recv'd the lock.
+            // For large crates re-compiling here would be quiet costly.
+        }
+
         // Artifacts are in a different location than typical units,
         // hence we must assure the crate- and target-dependent
         // directory is present.
@@ -434,6 +501,7 @@ fn rustc(
                             &manifest,
                             &target,
                             &mut output_options,
+                            lock.as_mut(),
                         )
                     },
                 )
@@ -969,7 +1037,32 @@ fn rustdoc(build_runner: &mut BuildRunner<'_, '_>, unit: &Unit) -> CargoResult<W
         output_options.show_diagnostics = false;
     }
 
+    let mut lock = if build_runner.bcx.gctx.cli_unstable().fine_grain_locking
+        && matches!(build_runner.locking_strategy.build_dir(), LockingMode::Fine)
+    {
+        Some(CompilationLock::new(build_runner, unit))
+    } else {
+        None
+    };
+
+    // For libraries, we only need rmeta so we only need a partial shared lock, but for things like
+    // proc-macros we need the rlib so we need a full shared lock to we know the compilation is
+    // completely done.
+    let dependency_locking_mode = match unit.requires_upstream_objects() {
+        true => SharedLockType::Full,
+        false => SharedLockType::Partial,
+    };
+
     Ok(Work::new(move |state| {
+        if let Some(lock) = &mut lock {
+            lock.lock(&dependency_locking_mode)
+                .expect("failed to take lock");
+
+            // TODO: We should probably revalidate the fingerprint here as another Cargo instance could
+            // have already compiled the crate before we recv'd the lock.
+            // For large crates re-compiling here would be quiet costly.
+        }
+
         add_custom_flags(
             &mut rustdoc,
             &build_script_outputs.lock().unwrap(),
@@ -1010,6 +1103,7 @@ fn rustdoc(build_runner: &mut BuildRunner<'_, '_>, unit: &Unit) -> CargoResult<W
                         &manifest,
                         &target,
                         &mut output_options,
+                        lock.as_mut(),
                     )
                 },
                 false,
@@ -1998,8 +2092,9 @@ fn on_stderr_line(
     manifest: &ManifestErrorContext,
     target: &Target,
     options: &mut OutputOptions,
+    lock: Option<&mut CompilationLock>,
 ) -> CargoResult<()> {
-    if on_stderr_line_inner(state, line, package_id, manifest, target, options)? {
+    if on_stderr_line_inner(state, line, package_id, manifest, target, options, lock)? {
         // Check if caching is enabled.
         if let Some((path, cell)) = &mut options.cache_cell {
             // Cache the output, which will be replayed later when Fresh.
@@ -2020,6 +2115,7 @@ fn on_stderr_line_inner(
     manifest: &ManifestErrorContext,
     target: &Target,
     options: &mut OutputOptions,
+    lock: Option<&mut CompilationLock>,
 ) -> CargoResult<bool> {
     // We primarily want to use this function to process JSON messages from
     // rustc. The compiler should always print one JSON message per line, and
@@ -2256,6 +2352,9 @@ fn on_stderr_line_inner(
         if artifact.artifact.ends_with(".rmeta") {
             debug!("looks like metadata finished early!");
             state.rmeta_produced();
+            if let Some(lock) = lock {
+                lock.rmeta_produced()?;
+            }
         }
         return Ok(false);
     }
@@ -2470,7 +2569,15 @@ fn replay_output_cache(
                 break;
             }
             let trimmed = line.trim_end_matches(&['\n', '\r'][..]);
-            on_stderr_line(state, trimmed, package_id, &manifest, &target, &mut options)?;
+            on_stderr_line(
+                state,
+                trimmed,
+                package_id,
+                &manifest,
+                &target,
+                &mut options,
+                None,
+            )?;
             line.clear();
         }
         Ok(())

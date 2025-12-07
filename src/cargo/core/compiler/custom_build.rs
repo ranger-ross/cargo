@@ -36,6 +36,7 @@ use crate::core::compiler::CompileMode;
 use crate::core::compiler::artifact;
 use crate::core::compiler::build_runner::UnitHash;
 use crate::core::compiler::job_queue::JobState;
+use crate::core::compiler::locking::{CompilationLockRef, LockingMode};
 use crate::core::{PackageId, Target, profiles::ProfileRoot};
 use crate::util::errors::CargoResult;
 use crate::util::internal;
@@ -279,15 +280,20 @@ impl LinkArgTarget {
 #[tracing::instrument(skip_all)]
 pub fn prepare(build_runner: &mut BuildRunner<'_, '_>, unit: &Unit) -> CargoResult<Job> {
     let metadata = build_runner.get_run_build_script_metadata(unit);
+
+    println!("PREPPING build script run");
+
     if build_runner
         .build_script_outputs
         .lock()
         .unwrap()
         .contains_key(metadata)
     {
+        println!("prep target\n");
         // The output is already set, thus the build script is overridden.
         fingerprint::prepare_target(build_runner, unit, false)
     } else {
+        println!("BWORK\n");
         build_work(build_runner, unit)
     }
 }
@@ -512,6 +518,16 @@ fn build_work(build_runner: &mut BuildRunner<'_, '_>, unit: &Unit) -> CargoResul
         .map(|dep| dep.unit.profile.debuginfo.is_turned_on())
         .unwrap_or(false);
 
+    let mut lock_for_dirty = if build_runner.bcx.gctx.cli_unstable().fine_grain_locking
+        && matches!(build_runner.locking_mode, LockingMode::Fine)
+    {
+        Some(CompilationLockRef::new(build_runner, unit))
+    } else {
+        None
+    };
+
+    let lock_for_fresh = lock_for_dirty.clone();
+
     // Prepare the unit of "dirty work" which will actually run the custom build
     // command.
     //
@@ -672,6 +688,11 @@ fn build_work(build_runner: &mut BuildRunner<'_, '_>, unit: &Unit) -> CargoResul
             .lock()
             .unwrap()
             .insert(id, metadata_hash, parsed_output);
+
+        if let Some(lock) = &lock_for_dirty {
+            state.lock_manager.unlock(&lock)?;
+        }
+
         Ok(())
     });
 
@@ -702,6 +723,10 @@ fn build_work(build_runner: &mut BuildRunner<'_, '_>, unit: &Unit) -> CargoResul
             .lock()
             .unwrap()
             .insert(id, metadata_hash, output);
+
+        if let Some(lock) = &lock_for_fresh {
+            state.lock_manager.unlock(&lock)?;
+        }
         Ok(())
     });
 

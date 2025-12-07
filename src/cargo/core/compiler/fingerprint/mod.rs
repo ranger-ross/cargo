@@ -442,6 +442,18 @@ pub fn prepare_target(
 
     debug!("fingerprint at: {}", loc.display());
 
+    println!(
+        "trying fingerprint lock, {:?} {}",
+        loc,
+        unit.target.is_custom_build()
+    );
+
+    build_runner
+        .lock_manager
+        .lock_fingerprint(build_runner, unit)?;
+
+    println!("Took fingerprint lock");
+
     // Figure out if this unit is up to date. After calculating the fingerprint
     // compare it to an old version, if any, and attempt to print diagnostic
     // information about failed comparisons to aid in debugging.

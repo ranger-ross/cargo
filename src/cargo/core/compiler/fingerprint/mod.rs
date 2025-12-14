@@ -438,7 +438,12 @@ pub fn prepare_target(
     let bcx = build_runner.bcx;
     let loc = build_runner.files().fingerprint_file_path(unit, "");
 
-    debug!("fingerprint at: {}", loc.display());
+    println!(
+        "fingerprint at: {} mode:{:?} kind:{:?}",
+        loc.display(),
+        unit.mode,
+        unit.target.kind()
+    );
 
     build_runner
         .lock_manager

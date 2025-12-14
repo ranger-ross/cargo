@@ -36,6 +36,9 @@ use crate::core::compiler::CompileMode;
 use crate::core::compiler::artifact;
 use crate::core::compiler::build_runner::UnitHash;
 use crate::core::compiler::job_queue::JobState;
+use crate::core::compiler::locking::CompilationLockRef;
+use crate::core::compiler::locking::LockingMode;
+use crate::core::compiler::locking::SharedLockType;
 use crate::core::{PackageId, Target, profiles::ProfileRoot};
 use crate::util::errors::CargoResult;
 use crate::util::internal;
@@ -512,12 +515,36 @@ fn build_work(build_runner: &mut BuildRunner<'_, '_>, unit: &Unit) -> CargoResul
         .map(|dep| dep.unit.profile.debuginfo.is_turned_on())
         .unwrap_or(false);
 
+    let mut lock = if build_runner.bcx.gctx.cli_unstable().fine_grain_locking
+        && matches!(build_runner.locking_mode, LockingMode::Fine)
+    {
+        Some(CompilationLockRef::new(build_runner, unit))
+    } else {
+        None
+    };
+
+    // For libraries, we only need rmeta so we only need a partial shared lock, but for things like
+    // proc-macros we need the rlib so we need a full shared lock to we know the compilation is
+    // completely done.
+    let dependency_locking_mode = if unit.requires_upstream_objects() {
+        SharedLockType::Full
+    } else {
+        SharedLockType::Partial
+    };
+
     // Prepare the unit of "dirty work" which will actually run the custom build
     // command.
     //
     // Note that this has to do some extra work just before running the command
     // to determine extra environment variables and such.
     let dirty = Work::new(move |state| {
+        if let Some(lock) = &mut lock {
+            state
+                .lock_manager
+                .start_compiling(lock, dependency_locking_mode)
+                .expect("failed to take lock");
+        }
+
         // Make sure that OUT_DIR exists.
         //
         // If we have an old build directory, then just move it into place,

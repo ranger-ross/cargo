@@ -39,7 +39,7 @@ use std::{
 
 use anyhow::Context;
 use itertools::Itertools;
-use tracing::{instrument, trace};
+use tracing::instrument;
 
 use crate::{
     CargoResult,
@@ -90,6 +90,7 @@ impl LockManager {
 
         let mut locks = self.locks.lock().unwrap();
 
+        println!("\tmain: {}", key.0);
         if let Some(lock) = locks.get_mut(&key) {
             lock.lock_shared(SharedLockType::Full)?;
         } else {
@@ -97,6 +98,28 @@ impl LockManager {
             lock.lock_shared(SharedLockType::Full)?;
             locks.insert(key, lock);
         }
+
+        // let mut dependency_units = all_dependency_units(build_runner, unit)
+        //     .iter()
+        //     .map(|u| build_runner.files().build_unit_lock(u))
+        //     .map(|location| (location_to_key(&location), location))
+        //     .filter_map(|(key, location)| {
+        //         if let Some(lock) = locks.get_mut(&key) {
+        //             // TODO: ???? I guess we need to lock if its unlocked.
+        //             // lock.lock_shared(SharedLockType::Partial).unwrap();
+        //             return None;
+        //         }
+        //
+        //         Some((key.clone(), UnitLock::new(location.clone())))
+        //     })
+        //     .collect_vec();
+        //
+        // for (key, lock) in dependency_units.iter_mut() {
+        //     println!("\tshare: {}", key.0);
+        //     lock.lock_shared(SharedLockType::Partial)?;
+        // }
+        //
+        // locks.extend(dependency_units);
 
         Ok(())
     }
@@ -109,7 +132,9 @@ impl LockManager {
     ) -> CargoResult<()> {
         let mut locks = self.locks.lock().unwrap();
 
-        let (key, location) = &lock_ref.unit;
+        let (key, _) = &lock_ref.unit;
+
+        println!("starting: {}", key.0);
 
         if let Some(lock) = locks.get_mut(&key) {
             lock.lock_exclusive()?;
@@ -120,7 +145,13 @@ impl LockManager {
                 .filter_map(|(key, location)| {
                     if let Some(lock) = locks.get_mut(&key) {
                         // TODO: Unwrap
-                        lock.lock_shared(ty).unwrap();
+                        // match lock.guard.as_ref().unwrap().state {
+                        //     UnitLockState::BuildingExclusive
+                        //     | UnitLockState::BuildingNonExclusive
+                        //     | UnitLockState::SharedFull => todo!(),
+                        //     UnitLockState::SharedPartial =>
+                        // }
+                        // lock.lock_shared(ty).unwrap();
                         return None;
                     }
 
@@ -151,6 +182,25 @@ impl LockManager {
             lock.downgrade()?;
         } else {
             panic!("missing lock when rmeta produced");
+        }
+
+        Ok(())
+    }
+
+    pub fn compile_complete(&self, lock_ref: &CompilationLockRef) -> CargoResult<()> {
+        let (key, _) = &lock_ref.unit;
+
+        // if key.0.contains("proc-macro2") || key.0.contains("syn") {
+        //     println!("UNLOCKING {}", key.0);
+        //     self.locks.lock().unwrap().remove(&key);
+        //     return Ok(());
+        // }
+
+        if let Some(lock) = self.locks.lock().unwrap().get_mut(&key) {
+            println!("downgrading to shared partial: {}", key.0);
+            lock.lock_shared(SharedLockType::Partial)?;
+        } else {
+            panic!("missing lock when compile_complete");
         }
 
         Ok(())
@@ -270,10 +320,14 @@ impl UnitLock {
                 UnitLockState::BuildingNonExclusive => match ty {
                     SharedLockType::Partial => {
                         guard.full = None;
+                        // // TODO: This shouldn't be needed?
+                        // guard.partial.lock_shared()?;
                         guard.state = UnitLockState::SharedPartial;
                     }
                     SharedLockType::Full => {
                         guard.full.as_mut().unwrap().lock_shared()?;
+                        // // TODO: This shouldn't be needed?
+                        // guard.partial.lock_shared()?;
                         guard.state = UnitLockState::SharedFull;
                     }
                 },
@@ -321,7 +375,7 @@ impl UnitLock {
     }
 
     pub fn downgrade(&mut self) -> CargoResult<()> {
-        let mut guard = self
+        let guard = self
             .guard
             .as_mut()
             .context("guard was None while calling downgrade")?;

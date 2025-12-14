@@ -211,6 +211,8 @@ fn compile<'gctx>(
                 };
                 work.then(link_targets(build_runner, unit, false)?)
             } else {
+                println!("===========\n FRESH");
+
                 // We always replay the output cache,
                 // since it might contain future-incompat-report messages
                 let show_diagnostics = unit.show_warnings(bcx.gctx)
@@ -527,6 +529,13 @@ fn rustc(
             for output in outputs.iter() {
                 paths::set_file_time_no_err(&output.path, timestamp);
             }
+        }
+
+        if let Some(lock) = &mut lock {
+            state
+                .lock_manager
+                .compile_complete(lock)
+                .expect("failed to take lock");
         }
 
         Ok(())

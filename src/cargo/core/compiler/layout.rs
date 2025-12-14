@@ -395,6 +395,7 @@ impl BuildDirLayout {
 
 /// See [crate::core::compiler::locking] module docs for details about build system locking
 /// structure.
+#[derive(Debug, Clone)]
 pub struct BuildUnitLockLocation {
     pub partial: PathBuf,
     pub full: PathBuf,

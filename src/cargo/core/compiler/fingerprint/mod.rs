@@ -440,6 +440,10 @@ pub fn prepare_target(
 
     debug!("fingerprint at: {}", loc.display());
 
+    build_runner
+        .lock_manager
+        .read_fingerprint(unit, build_runner)?;
+
     // Figure out if this unit is up to date. After calculating the fingerprint
     // compare it to an old version, if any, and attempt to print diagnostic
     // information about failed comparisons to aid in debugging.

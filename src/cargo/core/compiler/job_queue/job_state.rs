@@ -4,10 +4,10 @@ use std::{cell::Cell, marker, sync::Arc};
 
 use cargo_util::ProcessBuilder;
 
-use crate::CargoResult;
 use crate::core::compiler::future_incompat::FutureBreakageItem;
 use crate::core::compiler::timings::SectionTiming;
 use crate::util::Queue;
+use crate::{CargoResult, core::compiler::locking::LockManager};
 
 use super::{Artifact, DiagDedupe, Job, JobId, Message};
 
@@ -47,6 +47,8 @@ pub struct JobState<'a, 'gctx> {
     /// sending a double message later on.
     rmeta_required: Cell<bool>,
 
+    pub lock_manager: Arc<LockManager>,
+
     // Historical versions of Cargo made use of the `'a` argument here, so to
     // leave the door open to future refactorings keep it here.
     _marker: marker::PhantomData<&'a ()>,
@@ -58,12 +60,14 @@ impl<'a, 'gctx> JobState<'a, 'gctx> {
         messages: Arc<Queue<Message>>,
         output: Option<&'a DiagDedupe<'gctx>>,
         rmeta_required: bool,
+        lock_manager: Arc<LockManager>,
     ) -> Self {
         Self {
             id,
             messages,
             output,
             rmeta_required: Cell::new(rmeta_required),
+            lock_manager,
             _marker: marker::PhantomData,
         }
     }

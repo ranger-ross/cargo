@@ -94,7 +94,7 @@ use self::output_depinfo::output_depinfo;
 use self::output_sbom::build_sbom;
 use self::unit_graph::UnitDep;
 use crate::core::compiler::future_incompat::FutureIncompatReport;
-use crate::core::compiler::locking::{CompilationLock, LockingMode, SharedLockType};
+use crate::core::compiler::locking::{CompilationLockRef, LockingMode, SharedLockType};
 use crate::core::compiler::timings::SectionTiming;
 pub use crate::core::compiler::unit::{Unit, UnitInterner};
 use crate::core::manifest::TargetSourcePath;
@@ -344,7 +344,7 @@ fn rustc(
     let mut lock = if build_runner.bcx.gctx.cli_unstable().fine_grain_locking
         && matches!(build_runner.locking_mode, LockingMode::Fine)
     {
-        Some(CompilationLock::new(build_runner, unit))
+        Some(CompilationLockRef::new(build_runner, unit))
     } else {
         None
     };
@@ -360,12 +360,10 @@ fn rustc(
 
     return Ok(Work::new(move |state| {
         if let Some(lock) = &mut lock {
-            lock.lock(&dependency_locking_mode)
+            state
+                .lock_manager
+                .start_compiling(lock, dependency_locking_mode)
                 .expect("failed to take lock");
-
-            // TODO: We should probably revalidate the fingerprint here as another Cargo instance could
-            // have already compiled the crate before we recv'd the lock.
-            // For large crates re-compiling here would be quiet costly.
         }
 
         // Artifacts are in a different location than typical units,
@@ -1004,7 +1002,7 @@ fn rustdoc(build_runner: &mut BuildRunner<'_, '_>, unit: &Unit) -> CargoResult<W
     let mut lock = if build_runner.bcx.gctx.cli_unstable().fine_grain_locking
         && matches!(build_runner.locking_mode, LockingMode::Fine)
     {
-        Some(CompilationLock::new(build_runner, unit))
+        Some(CompilationLockRef::new(build_runner, unit))
     } else {
         None
     };
@@ -1019,12 +1017,10 @@ fn rustdoc(build_runner: &mut BuildRunner<'_, '_>, unit: &Unit) -> CargoResult<W
 
     Ok(Work::new(move |state| {
         if let Some(lock) = &mut lock {
-            lock.lock(&dependency_locking_mode)
+            state
+                .lock_manager
+                .start_compiling(lock, dependency_locking_mode)
                 .expect("failed to take lock");
-
-            // TODO: We should probably revalidate the fingerprint here as another Cargo instance could
-            // have already compiled the crate before we recv'd the lock.
-            // For large crates re-compiling here would be quiet costly.
         }
 
         add_custom_flags(
@@ -2064,7 +2060,7 @@ fn on_stderr_line(
     manifest: &ManifestErrorContext,
     target: &Target,
     options: &mut OutputOptions,
-    lock: Option<&mut CompilationLock>,
+    lock: Option<&mut CompilationLockRef>,
 ) -> CargoResult<()> {
     if on_stderr_line_inner(state, line, package_id, manifest, target, options, lock)? {
         // Check if caching is enabled.
@@ -2087,7 +2083,7 @@ fn on_stderr_line_inner(
     manifest: &ManifestErrorContext,
     target: &Target,
     options: &mut OutputOptions,
-    lock: Option<&mut CompilationLock>,
+    lock: Option<&mut CompilationLockRef>,
 ) -> CargoResult<bool> {
     // We primarily want to use this function to process JSON messages from
     // rustc. The compiler should always print one JSON message per line, and
@@ -2327,7 +2323,7 @@ fn on_stderr_line_inner(
             debug!("looks like metadata finished early!");
             state.rmeta_produced();
             if let Some(lock) = lock {
-                lock.rmeta_produced()?;
+                state.lock_manager.rmeta_produced(lock)?;
             }
         }
         return Ok(false);

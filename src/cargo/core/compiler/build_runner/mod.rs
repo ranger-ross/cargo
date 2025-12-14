@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::core::PackageId;
 use crate::core::compiler::compilation::{self, UnitOutput};
-use crate::core::compiler::locking::LockingMode;
+use crate::core::compiler::locking::{LockManager, LockingMode};
 use crate::core::compiler::{self, Unit, UserIntent, artifact};
 use crate::util::cache_lock::CacheLockMode;
 use crate::util::errors::CargoResult;
@@ -93,6 +93,8 @@ pub struct BuildRunner<'a, 'gctx> {
     /// The locking mode to use for this build.
     /// We use fine grain by default, but fallback to coarse grain for some systems.
     pub locking_mode: LockingMode,
+
+    pub lock_manager: Arc<LockManager>,
 }
 
 impl<'a, 'gctx> BuildRunner<'a, 'gctx> {
@@ -139,6 +141,7 @@ impl<'a, 'gctx> BuildRunner<'a, 'gctx> {
             metadata_for_doc_units: HashMap::new(),
             failed_scrape_units: Arc::new(Mutex::new(HashSet::new())),
             locking_mode,
+            lock_manager: Arc::new(LockManager::new()),
         })
     }
 

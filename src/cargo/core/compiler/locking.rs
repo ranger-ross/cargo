@@ -31,9 +31,10 @@
 //! [`CompilationLock`] is the primary interface for locking.
 
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fs::{File, OpenOptions},
     path::{Path, PathBuf},
+    sync::Mutex,
 };
 
 use anyhow::Context;
@@ -56,7 +57,7 @@ pub enum LockingMode {
 
 /// The type of lock to take when taking a shared lock.
 /// See the module documentation for more information about shared lock types.
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub enum SharedLockType {
     /// A shared lock that might still be compiling a .rlib
     Partial,
@@ -64,54 +65,134 @@ pub enum SharedLockType {
     Full,
 }
 
-/// A lock for compiling a build unit.
-///
-/// Internally this lock is made up of many [`UnitLock`]s for the unit and it's dependencies.
-pub struct CompilationLock {
-    /// The path to the lock file of the unit to compile
-    unit: UnitLock,
-    /// The paths to lock files of the unit's dependencies
-    dependency_units: Vec<UnitLock>,
+pub struct LockManager {
+    locks: Mutex<HashMap<LockKey, UnitLock>>,
 }
 
-impl CompilationLock {
-    pub fn new(build_runner: &BuildRunner<'_, '_>, unit: &Unit) -> Self {
-        let unit_lock = UnitLock::new(build_runner.files().build_unit_lock(unit));
+#[derive(Debug, Clone, Hash, Eq, PartialEq)]
+pub struct LockKey(String);
 
-        let dependency_units = all_dependency_units(build_runner, unit)
-            .into_iter()
-            .map(|unit| UnitLock::new(build_runner.files().build_unit_lock(&unit)))
-            .collect_vec();
-
+impl LockManager {
+    pub fn new() -> Self {
         Self {
-            unit: unit_lock,
-            dependency_units,
+            locks: Mutex::new(HashMap::new()),
         }
     }
 
-    #[instrument(skip(self))]
-    pub fn lock(&mut self, ty: &SharedLockType) -> CargoResult<()> {
-        self.unit.lock_exclusive()?;
+    #[instrument(skip_all)]
+    pub fn read_fingerprint(
+        &self,
+        unit: &Unit,
+        build_runner: &BuildRunner<'_, '_>,
+    ) -> CargoResult<()> {
+        let location = build_runner.files().build_unit_lock(unit);
+        let key = location_to_key(&location);
 
-        for d in self.dependency_units.iter_mut() {
-            d.lock_shared(ty)?;
+        let mut locks = self.locks.lock().unwrap();
+
+        if let Some(lock) = locks.get_mut(&key) {
+            lock.lock_shared(SharedLockType::Full)?;
+        } else {
+            let mut lock = UnitLock::new(location);
+            lock.lock_shared(SharedLockType::Full)?;
+            locks.insert(key, lock);
         }
-
-        trace!("acquired lock: {:?}", self.unit.partial.parent());
 
         Ok(())
     }
 
-    pub fn rmeta_produced(&mut self) -> CargoResult<()> {
-        trace!("downgrading lock: {:?}", self.unit.partial.parent());
+    #[instrument(skip_all)]
+    pub fn start_compiling(
+        &self,
+        lock_ref: &CompilationLockRef,
+        ty: SharedLockType,
+    ) -> CargoResult<()> {
+        let mut locks = self.locks.lock().unwrap();
 
+        let (key, location) = &lock_ref.unit;
+
+        if let Some(lock) = locks.get_mut(&key) {
+            lock.lock_exclusive()?;
+
+            let mut dependency_units = lock_ref
+                .dependency_units
+                .iter()
+                .filter_map(|(key, location)| {
+                    if let Some(lock) = locks.get_mut(&key) {
+                        // TODO: Unwrap
+                        lock.lock_shared(ty).unwrap();
+                        return None;
+                    }
+
+                    Some((key.clone(), UnitLock::new(location.clone())))
+                })
+                .collect_vec();
+
+            for (_, lock) in dependency_units.iter_mut() {
+                lock.lock_shared(ty)?;
+            }
+
+            locks.extend(dependency_units);
+        } else {
+            panic!("lock missingg when starting compile {:?}", lock_ref.unit.0)
+        }
+
+        Ok(())
+    }
+
+    pub fn rmeta_produced(&self, lock_ref: &CompilationLockRef) -> CargoResult<()> {
+        let (key, _) = &lock_ref.unit;
+
+        // trace!("downgrading lock: {:?}", self.unit.partial.parent());
         // Downgrade the lock on the unit we are building so that we can unblock other units to
         // compile. We do not need to downgrade our dependency locks since they should always be a
         // shared lock.
-        self.unit.downgrade()?;
+        if let Some(lock) = self.locks.lock().unwrap().get_mut(&key) {
+            lock.downgrade()?;
+        } else {
+            panic!("missing lock when rmeta produced");
+        }
 
         Ok(())
     }
+}
+
+fn location_to_key(location: &BuildUnitLockLocation) -> LockKey {
+    LockKey(location.partial.parent().unwrap().display().to_string())
+}
+
+/// A lock for compiling a build unit.
+///
+/// Internally this lock is made up of many [`UnitLock`]s for the unit and it's dependencies.
+#[derive(Debug, Clone)]
+pub struct CompilationLockRef {
+    /// The path to the lock file of the unit to compile
+    unit: (LockKey, BuildUnitLockLocation),
+    /// The paths to lock files of the unit's dependencies
+    dependency_units: Vec<(LockKey, BuildUnitLockLocation)>,
+}
+
+impl CompilationLockRef {
+    pub fn new(build_runner: &BuildRunner<'_, '_>, unit: &Unit) -> Self {
+        let dependency_units = all_dependency_units(build_runner, unit)
+            .into_iter()
+            .map(|u| build_runner.files().build_unit_lock(u))
+            .map(|location| (location_to_key(&location), location))
+            .collect_vec();
+        let location = build_runner.files().build_unit_lock(unit);
+        Self {
+            unit: (location_to_key(&location), location),
+            dependency_units,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UnitLockState {
+    BuildingExclusive,
+    BuildingNonExclusive,
+    SharedPartial,
+    SharedFull,
 }
 
 /// A lock for a single build unit.
@@ -123,7 +204,8 @@ struct UnitLock {
 
 struct UnitLockGuard {
     partial: File,
-    _full: Option<File>,
+    full: Option<File>,
+    state: UnitLockState,
 }
 
 impl UnitLock {
@@ -136,7 +218,25 @@ impl UnitLock {
     }
 
     pub fn lock_exclusive(&mut self) -> CargoResult<()> {
-        assert!(self.guard.is_none());
+        if let Some(guard) = self.guard.as_mut() {
+            match guard.state {
+                UnitLockState::BuildingExclusive => return Ok(()),
+                UnitLockState::BuildingNonExclusive => {
+                    let full = open_file(&self.full)?;
+                    full.lock()?;
+                    guard.full = Some(full);
+                    guard.state = UnitLockState::BuildingExclusive;
+                }
+                UnitLockState::SharedPartial => todo!(),
+                UnitLockState::SharedFull => {
+                    guard.partial.lock()?;
+                    guard.full.as_mut().unwrap().lock()?;
+                    guard.state = UnitLockState::BuildingExclusive;
+                }
+            }
+
+            return Ok(());
+        }
 
         let partial = open_file(&self.partial)?;
         partial.lock()?;
@@ -146,13 +246,57 @@ impl UnitLock {
 
         self.guard = Some(UnitLockGuard {
             partial,
-            _full: Some(full),
+            full: Some(full),
+            state: UnitLockState::BuildingExclusive,
         });
         Ok(())
     }
 
-    pub fn lock_shared(&mut self, ty: &SharedLockType) -> CargoResult<()> {
-        assert!(self.guard.is_none());
+    pub fn lock_shared(&mut self, ty: SharedLockType) -> CargoResult<()> {
+        if let Some(guard) = self.guard.as_mut() {
+            match guard.state {
+                UnitLockState::BuildingExclusive => match ty {
+                    SharedLockType::Partial => {
+                        guard.full = None;
+                        guard.partial.lock_shared()?;
+                        guard.state = UnitLockState::SharedPartial;
+                    }
+                    SharedLockType::Full => {
+                        guard.full.as_mut().unwrap().lock_shared()?;
+                        guard.partial.lock_shared()?;
+                        guard.state = UnitLockState::SharedFull;
+                    }
+                },
+                UnitLockState::BuildingNonExclusive => match ty {
+                    SharedLockType::Partial => {
+                        guard.full = None;
+                        guard.state = UnitLockState::SharedPartial;
+                    }
+                    SharedLockType::Full => {
+                        guard.full.as_mut().unwrap().lock_shared()?;
+                        guard.state = UnitLockState::SharedFull;
+                    }
+                },
+                UnitLockState::SharedPartial => match ty {
+                    SharedLockType::Partial => return Ok(()),
+                    SharedLockType::Full => {
+                        let full = open_file(&self.full)?;
+                        full.lock_shared()?;
+                        guard.full = Some(full);
+                        guard.state = UnitLockState::SharedFull;
+                    }
+                },
+                UnitLockState::SharedFull => match ty {
+                    SharedLockType::Partial => {
+                        guard.full = None;
+                        guard.state = UnitLockState::SharedPartial;
+                    }
+                    SharedLockType::Full => return Ok(()),
+                },
+            }
+
+            return Ok(());
+        }
 
         let partial = open_file(&self.partial)?;
         partial.lock_shared()?;
@@ -167,16 +311,22 @@ impl UnitLock {
 
         self.guard = Some(UnitLockGuard {
             partial,
-            _full: full,
+            full,
+            state: match ty {
+                SharedLockType::Partial => UnitLockState::SharedPartial,
+                SharedLockType::Full => UnitLockState::SharedFull,
+            },
         });
         Ok(())
     }
 
     pub fn downgrade(&mut self) -> CargoResult<()> {
-        let guard = self
+        let mut guard = self
             .guard
-            .as_ref()
+            .as_mut()
             .context("guard was None while calling downgrade")?;
+
+        assert_eq!(guard.state, UnitLockState::BuildingExclusive);
 
         // NOTE:
         // > Subsequent flock() calls on an already locked file will convert an existing lock to the new lock mode.
@@ -186,6 +336,7 @@ impl UnitLock {
         // future. So its probably up to us if we are okay with using this or if we want to use a
         // different interface to flock.
         guard.partial.lock_shared()?;
+        guard.state = UnitLockState::BuildingNonExclusive;
 
         Ok(())
     }

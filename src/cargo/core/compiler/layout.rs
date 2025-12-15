@@ -170,6 +170,7 @@ impl Layout {
         let build_dest = build_dest.as_path_unlocked();
         let deps = build_dest.join("deps");
         let artifact = deps.join("artifact");
+        let working_root = build_dest.join("work").join(std::process::id().to_string());
 
         let artifact_dir = if must_take_artifact_dir_lock {
             // For now we don't do any more finer-grained locking on the artifact
@@ -209,6 +210,15 @@ impl Layout {
                 tmp: build_root.join("tmp"),
                 _lock: build_dir_lock,
                 is_new_layout,
+                working_dir: WorkingDirLayout {
+                    root: working_root.clone(),
+                    build: working_root.join("build"),
+                    artifact: working_root.join("artifact"),
+                    // TODO: Can we share with main build dir and let rustc handle the locking?
+                    incremental: working_root.join("incremental"),
+                    examples: working_root.join("examples"),
+                    tmp: working_root.join("tmp"), // TODO: This is probably wrong
+                },
             },
         })
     }
@@ -296,6 +306,7 @@ pub struct BuildDirLayout {
     /// lock the same path twice.
     _lock: Option<FileLock>,
     is_new_layout: bool,
+    working_dir: WorkingDirLayout,
 }
 
 impl BuildDirLayout {
@@ -371,6 +382,77 @@ impl BuildDirLayout {
         } else {
             self.build().join(pkg_dir)
         }
+    }
+    /// Fetch the artifact path.
+    pub fn artifact(&self) -> &Path {
+        &self.artifact
+    }
+    /// Fetch the build unit path
+    pub fn build_unit(&self, pkg_dir: &str) -> PathBuf {
+        self.build().join(pkg_dir)
+    }
+    /// Create and return the tmp path.
+    pub fn prepare_tmp(&self) -> CargoResult<&Path> {
+        paths::create_dir_all(&self.tmp)?;
+        Ok(&self.tmp)
+    }
+}
+
+pub struct WorkingDirLayout {
+    /// The root directory: `/path/to/build-dir`.
+    /// If cross compiling: `/path/to/build-dir/$TRIPLE`.
+    root: PathBuf,
+    /// The primary directory for build files
+    build: PathBuf,
+    /// The directory for artifacts, i.e. binaries, cdylibs, staticlibs
+    artifact: PathBuf,
+    /// The directory for incremental files
+    incremental: PathBuf,
+    /// The directory for pre-uplifted examples: `build-dir/debug/examples`
+    examples: PathBuf,
+    /// The directory for temporary data of integration tests and benches
+    tmp: PathBuf,
+}
+
+impl WorkingDirLayout {
+    /// Makes sure all directories stored in the Layout exist on the filesystem.
+    pub fn prepare(&mut self) -> CargoResult<()> {
+        paths::create_dir_all(&self.incremental)?;
+        paths::create_dir_all(&self.examples)?;
+        paths::create_dir_all(&self.build)?;
+
+        Ok(())
+    }
+    /// Fetch the deps path.
+    pub fn deps(&self, pkg_dir: &str) -> PathBuf {
+        self.build_unit(pkg_dir).join("deps")
+    }
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+    /// Fetch the build examples path.
+    pub fn examples(&self) -> &Path {
+        &self.examples
+    }
+    /// Fetch the incremental path.
+    pub fn incremental(&self) -> &Path {
+        &self.incremental
+    }
+    /// Fetch the fingerprint path.
+    pub fn fingerprint(&self, pkg_dir: &str) -> PathBuf {
+        self.build_unit(pkg_dir).join("fingerprint")
+    }
+    /// Fetch the build path.
+    pub fn build(&self) -> &Path {
+        &self.build
+    }
+    /// Fetch the build script path.
+    pub fn build_script(&self, pkg_dir: &str) -> PathBuf {
+        self.build_unit(pkg_dir).join("build-script")
+    }
+    /// Fetch the build script execution path.
+    pub fn build_script_execution(&self, pkg_dir: &str) -> PathBuf {
+        self.build_unit(pkg_dir).join("build-script-execution")
     }
     /// Fetch the artifact path.
     pub fn artifact(&self) -> &Path {

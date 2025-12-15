@@ -598,6 +598,37 @@ fn set_not_readonly(p: &Path) -> io::Result<bool> {
     Ok(true)
 }
 
+/// Hardlinks a directory recursively.
+///
+/// Directories are created and files are hardlinked.
+pub fn hardlink_dir_all(src: impl AsRef<Path>, dst: impl AsRef<Path>) -> io::Result<()> {
+    fs::create_dir_all(&dst)?;
+    for entry in fs::read_dir(src)? {
+        let entry = entry?;
+        let ty = entry.file_type()?;
+        if ty.is_dir() {
+            hardlink_dir_all(entry.path(), dst.as_ref().join(entry.file_name()))?;
+        } else {
+            std::fs::hard_link(entry.path(), dst.as_ref().join(entry.file_name()))?;
+        }
+    }
+    Ok(())
+}
+
+/// Checks if a directory has a least one file including in nested directories.
+pub fn has_files(path: impl AsRef<Path>) -> Result<bool> {
+    for entry in fs::read_dir(path)? {
+        let entry = entry?;
+        let ty = entry.file_type()?;
+        if ty.is_dir() {
+            has_files(entry.path())?;
+        } else {
+            return Ok(true);
+        }
+    }
+    return Ok(false);
+}
+
 /// Hardlink (file) or symlink (dir) src to dst if possible, otherwise copy it.
 ///
 /// If the destination already exists, it is removed before linking.

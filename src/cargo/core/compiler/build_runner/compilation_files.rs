@@ -278,7 +278,7 @@ impl<'a, 'gctx: 'a> CompilationFiles<'a, 'gctx> {
     /// specified unit.
     pub fn deps_dir(&self, unit: &Unit) -> PathBuf {
         let dir = self.pkg_dir(unit);
-        self.layout(unit.kind).build_dir().deps(&dir)
+        self.layout(unit.kind).working_dir().deps(&dir)
     }
 
     /// Returns the directories where Rust crate dependencies are found for the
@@ -287,13 +287,13 @@ impl<'a, 'gctx: 'a> CompilationFiles<'a, 'gctx> {
     /// New features should consider using this so we can avoid their migrations.
     pub fn deps_dir_new_layout(&self, unit: &Unit) -> PathBuf {
         let dir = self.pkg_dir(unit);
-        self.layout(unit.kind).build_dir().deps_new_layout(&dir)
+        self.layout(unit.kind).working_dir().deps(&dir)
     }
 
     /// Directory where the fingerprint for the given unit should go.
     pub fn fingerprint_dir(&self, unit: &Unit) -> PathBuf {
         let dir = self.pkg_dir(unit);
-        self.layout(unit.kind).build_dir().fingerprint(&dir)
+        self.layout(unit.kind).working_dir().fingerprint(&dir)
     }
 
     /// Directory where incremental output for the given unit should go.
@@ -329,6 +329,18 @@ impl<'a, 'gctx: 'a> CompilationFiles<'a, 'gctx> {
     /// Path where compiler output is cached.
     pub fn message_cache_path(&self, unit: &Unit) -> PathBuf {
         self.fingerprint_file_path(unit, "output-")
+    }
+
+    pub fn build_unit_dir(&self, unit: &Unit) -> PathBuf {
+        let dir = self.pkg_dir(unit);
+        self.layout(CompileKind::Host).build_dir().build_unit(&dir)
+    }
+
+    pub fn working_unit_dir(&self, unit: &Unit) -> PathBuf {
+        let dir = self.pkg_dir(unit);
+        self.layout(CompileKind::Host)
+            .working_dir()
+            .build_unit(&dir)
     }
 
     /// Returns the directory where a compiled build script is stored.

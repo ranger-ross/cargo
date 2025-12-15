@@ -227,6 +227,9 @@ fn compile<'gctx>(
                 // Need to link targets on both the dirty and fresh.
                 work.then(link_targets(build_runner, unit, true)?)
             });
+            if job.freshness().is_dirty() {
+                job.after(uplift_from_working_dir(build_runner, unit)?);
+            }
 
             job
         };
@@ -680,6 +683,27 @@ fn link_targets(
     }))
 }
 
+fn uplift_from_working_dir(
+    build_runner: &mut BuildRunner<'_, '_>,
+    unit: &Unit,
+) -> CargoResult<Work> {
+    let build_unit_dir = build_runner.files().build_unit_dir(unit);
+    let working_unit_dir = build_runner.files().working_unit_dir(unit);
+
+    Ok(Work::new(move |_state| {
+        // TODO: Take append lock
+        if !build_unit_dir.exists() {
+            paths::create_dir_all(&build_unit_dir)?;
+
+            println!("uplifting {:?} to {:?}", working_unit_dir, build_unit_dir);
+            // std::fs::rename(working_unit_dir, build_unit_dir)?;
+            paths::hardlink_dir_all(working_unit_dir, build_unit_dir);
+            println!("RENAMED SUCCESS");
+        }
+
+        Ok(())
+    }))
+}
 // For all plugin dependencies, add their -L paths (now calculated and present
 // in `build_script_outputs`) to the dynamic library load path for the command
 // to execute.

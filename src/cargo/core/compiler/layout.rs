@@ -170,7 +170,9 @@ impl Layout {
         let build_dest = build_dest.as_path_unlocked();
         let deps = build_dest.join("deps");
         let artifact = deps.join("artifact");
-        let working_root = build_dest.join("work").join(std::process::id().to_string());
+        let working_root = build_dest
+            .join("working")
+            .join(std::process::id().to_string());
 
         let artifact_dir = if must_take_artifact_dir_lock {
             // For now we don't do any more finer-grained locking on the artifact
@@ -239,6 +241,10 @@ impl Layout {
 
     pub fn build_dir(&self) -> &BuildDirLayout {
         &self.build_dir
+    }
+
+    pub fn working_dir(&self) -> &WorkingDirLayout {
+        &self.build_dir.working_dir
     }
 }
 
@@ -468,3 +474,9 @@ impl WorkingDirLayout {
         Ok(&self.tmp)
     }
 }
+
+// impl Drop for WorkingDirLayout {
+//     fn drop(&mut self) {
+//         let _ = paths::remove_dir_all(&self.root);
+//     }
+// }

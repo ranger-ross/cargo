@@ -85,6 +85,10 @@ impl Job {
         let prev = mem::replace(&mut self.work, Work::noop());
         self.work = next.then(prev);
     }
+    pub fn after(&mut self, next: Work) {
+        let prev = mem::replace(&mut self.work, Work::noop());
+        self.work = prev.then(next);
+    }
 }
 
 impl fmt::Debug for Job {

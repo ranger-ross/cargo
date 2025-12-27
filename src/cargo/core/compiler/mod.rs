@@ -41,6 +41,7 @@ pub mod future_incompat;
 pub(crate) mod job_queue;
 pub(crate) mod layout;
 mod links;
+mod locking;
 mod lto;
 mod output_depinfo;
 mod output_sbom;
@@ -94,6 +95,7 @@ use self::output_sbom::build_sbom;
 use self::unit_graph::UnitDep;
 
 use crate::core::compiler::future_incompat::FutureIncompatReport;
+use crate::core::compiler::locking::LockKey;
 use crate::core::compiler::timings::SectionTiming;
 pub use crate::core::compiler::unit::{Unit, UnitInterner};
 use crate::core::manifest::TargetSourcePath;
@@ -187,6 +189,16 @@ fn compile<'gctx>(
         return Ok(());
     }
 
+    let lock = if build_runner.bcx.gctx.cli_unstable().fine_grain_locking
+        && !unit.mode.is_run_custom_build()
+        && !unit.target.is_custom_build()
+        && !unit.target.proc_macro()
+    {
+        Some(build_runner.lock_manager.lock_shared(build_runner, unit)?)
+    } else {
+        None
+    };
+
     // If we are in `--compile-time-deps` and the given unit is not a compile time
     // dependency, skip compiling the unit and jumps to dependencies, which still
     // have chances to be compile time dependencies
@@ -227,6 +239,14 @@ fn compile<'gctx>(
                 // Need to link targets on both the dirty and fresh.
                 work.then(link_targets(build_runner, unit, true)?)
             });
+
+            // If -Zfine-grain-locking is enabled, we wrap the job with an upgrade to exclusive
+            // lock before starting, then downgrade to a shared lock after the job is finished.
+            if build_runner.bcx.gctx.cli_unstable().fine_grain_locking && job.freshness().is_dirty()
+            {
+                job.before(upgrade_lock_to_exclusive(lock.clone()));
+                job.after(downgrade_lock_to_shared(lock));
+            }
 
             job
         };
@@ -587,6 +607,24 @@ fn verbose_if_simple_exit_code(err: Error) -> Error {
         Some(n) if cargo_util::is_simple_exit_code(n) => VerboseError::new(err).into(),
         _ => err,
     }
+}
+
+fn upgrade_lock_to_exclusive(lock: Option<LockKey>) -> Work {
+    Work::new(move |state| {
+        if let Some(lock) = lock {
+            state.upgrade_to_exclusive(&lock)?;
+        }
+        Ok(())
+    })
+}
+
+fn downgrade_lock_to_shared(lock: Option<LockKey>) -> Work {
+    Work::new(move |state| {
+        if let Some(lock) = lock {
+            state.downgrade_to_shared(&lock)?;
+        }
+        Ok(())
+    })
 }
 
 /// Link the compiled target (often of form `foo-{metadata_hash}`) to the

@@ -14,7 +14,13 @@ pub trait PackageIdSpecQuery {
         I: IntoIterator<Item = PackageId>;
 
     /// Checks whether the given `PackageId` matches the `PackageIdSpec`.
-    fn matches(&self, package_id: PackageId) -> bool;
+    fn matches(&self, package_id: PackageId) -> bool {
+        return self.matches_opts(package_id, false);
+    }
+
+    /// Checks whether the given `PackageId` matches the `PackageIdSpec` with matching options.
+    /// `normalize_name` will normalize hyphens and underscores.
+    fn matches_opts(&self, package_id: PackageId, normalize_name: bool) -> bool;
 
     /// Checks a list of `PackageId`s to find 1 that matches this `PackageIdSpec`. If 0, 2, or
     /// more are found, then this returns an error.
@@ -37,9 +43,15 @@ impl PackageIdSpecQuery for PackageIdSpec {
         spec.query(i)
     }
 
-    fn matches(&self, package_id: PackageId) -> bool {
-        if self.name() != package_id.name().as_str() {
-            return false;
+    fn matches_opts(&self, package_id: PackageId, normalized_name: bool) -> bool {
+        if normalized_name {
+            if self.name().replace("_", "-") != package_id.name().replace("_", "-") {
+                return false;
+            }
+        } else {
+            if self.name() != package_id.name().as_str() {
+                return false;
+            }
         }
 
         if let Some(ref v) = self.partial_version() {

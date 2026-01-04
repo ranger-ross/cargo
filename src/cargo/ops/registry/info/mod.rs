@@ -84,6 +84,14 @@ pub fn info(
         None => find_pkgid_in_summaries(&summaries, spec, &rustc_version, &source_ids)?,
     };
 
+    if package_id.name() != spec.name() {
+        gctx.shell().warn(format!(
+            "translating `{}` to `{}`",
+            spec.name(),
+            package_id.name(),
+        ))?;
+    }
+
     let package = registry.get(&[package_id])?;
     let package = package.get_one(package_id)?;
     pretty_view(package, &summaries, suggest_cargo_tree_command, gctx)?;
@@ -149,7 +157,7 @@ fn find_pkgid_in_summaries(
 ) -> CargoResult<PackageId> {
     let summary = summaries
         .iter()
-        .filter(|s| spec.matches(s.package_id()))
+        .filter(|s| spec.matches_opts(s.package_id(), true))
         .max_by(|s1, s2| {
             // Check the MSRV compatibility.
             let s1_matches = s1
@@ -193,7 +201,7 @@ fn query_summaries(
     let dep = Dependency::parse(spec.name(), None, source_ids.original)?;
     loop {
         // Exact to avoid returning all for path/git
-        match registry.query_vec(&dep, QueryKind::Exact) {
+        match registry.query_vec(&dep, QueryKind::Normalized) {
             std::task::Poll::Ready(res) => {
                 break res;
             }

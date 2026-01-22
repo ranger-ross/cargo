@@ -394,8 +394,12 @@ impl<'a, 'gctx: 'a> CompilationFiles<'a, 'gctx> {
 
     /// Returns the "`OUT_DIR`" directory for running a build script.
     /// `/path/to/target/{debug,release}/build/PKG-HASH/out`
-    pub fn build_script_out_dir(&self, unit: &Unit) -> PathBuf {
-        self.build_script_run_dir(unit).join("out")
+    pub fn build_script_out_dir(&self, unit: &Unit, is_new_layout: bool) -> PathBuf {
+        if is_new_layout {
+            self.out_dir(unit)
+        } else {
+            self.build_script_run_dir(unit).join("out")
+        }
     }
 
     /// Returns the path to the executable binary for the given bin target.

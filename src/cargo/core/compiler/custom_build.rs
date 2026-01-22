@@ -337,7 +337,9 @@ fn build_work(build_runner: &mut BuildRunner<'_, '_>, unit: &Unit) -> CargoResul
         .map(|d| &d.unit)
         .expect("running a script not depending on an actual script");
     let script_dir = build_runner.files().build_script_dir(build_script_unit);
-    let script_out_dir = build_runner.files().build_script_out_dir(unit);
+    let script_out_dir = build_runner
+        .files()
+        .build_script_out_dir(unit, bcx.gctx.cli_unstable().build_dir_new_layout);
     let script_run_dir = build_runner.files().build_script_run_dir(unit);
 
     if let Some(deps) = unit.pkg.manifest().metabuild() {
@@ -1367,7 +1369,10 @@ fn prev_build_output(
     build_runner: &mut BuildRunner<'_, '_>,
     unit: &Unit,
 ) -> (Option<BuildOutput>, PathBuf) {
-    let script_out_dir = build_runner.files().build_script_out_dir(unit);
+    let script_out_dir = build_runner.files().build_script_out_dir(
+        unit,
+        build_runner.bcx.gctx.cli_unstable().build_dir_new_layout,
+    );
     let script_run_dir = build_runner.files().build_script_run_dir(unit);
     let root_output_file = script_run_dir.join("root-output");
     let output_file = script_run_dir.join("output");

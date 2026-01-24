@@ -216,7 +216,10 @@ impl<'a, 'gctx> BuildRunner<'a, 'gctx> {
                 if dep.unit.mode.is_run_custom_build() {
                     let out_dir = self
                         .files()
-                        .build_script_out_dir(&dep.unit)
+                        .build_script_out_dir(
+                            &dep.unit,
+                            self.bcx.gctx.cli_unstable().build_dir_new_layout,
+                        )
                         .display()
                         .to_string();
                     let script_meta = self.get_run_build_script_metadata(&dep.unit);
@@ -476,7 +479,7 @@ impl<'a, 'gctx> BuildRunner<'a, 'gctx> {
             }
             if self.bcx.gctx.cli_unstable().build_dir_new_layout {
                 for (unit, _) in self.bcx.unit_graph.iter() {
-                    let dep_dir = self.files().deps_dir(unit);
+                    let dep_dir = self.files().out_dir(unit);
                     paths::create_dir_all(&dep_dir)?;
                     self.compilation.deps_output.insert(kind, dep_dir);
                 }

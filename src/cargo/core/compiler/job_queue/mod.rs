@@ -178,7 +178,7 @@ struct DrainState<'gctx> {
     diag_dedupe: DiagDedupe<'gctx>,
     /// Count of warnings, used to print a summary after the job succeeds
     warning_count: HashMap<JobId, WarningCount>,
-    active: HashMap<JobId, Unit>,
+    active: HashMap<JobId, ActiveJob>,
     compiled: HashSet<PackageId>,
     documented: HashSet<PackageId>,
     scraped: HashSet<PackageId>,
@@ -208,6 +208,11 @@ struct DrainState<'gctx> {
     /// How many jobs we've finished
     finished: usize,
     per_package_future_incompat_reports: Vec<FutureIncompatReportPackage>,
+}
+
+/// An active job that is currently being processed
+struct ActiveJob {
+    unit: Unit,
 }
 
 /// Count of warnings, used to print a summary after the job succeeds
@@ -621,7 +626,7 @@ impl<'gctx> DrainState<'gctx> {
                     .shell()
                     .verbose(|c| c.status("Running", &cmd))?;
                 self.timings
-                    .unit_start(build_runner, id, self.active[&id].clone());
+                    .unit_start(build_runner, id, self.active[&id].unit.clone());
             }
             Message::Stdout(out) => {
                 writeln!(build_runner.bcx.gctx.shell().out(), "{}", out)?;
@@ -680,13 +685,13 @@ impl<'gctx> DrainState<'gctx> {
                             id,
                             &build_runner.bcx.rustc().workspace_wrapper,
                         );
-                        self.active.remove(&id).unwrap()
+                        self.active.remove(&id).unwrap().unit
                     }
                     // ... otherwise if it hasn't finished we leave it
                     // in there as we'll get another `Finish` later on.
                     Artifact::Metadata => {
                         trace!("end (meta): {:?}", id);
-                        self.active[&id].clone()
+                        self.active[&id].unit.clone()
                     }
                 };
                 debug!("end ({:?}): {:?}", unit, result);
@@ -712,7 +717,7 @@ impl<'gctx> DrainState<'gctx> {
                 }
             }
             Message::FutureIncompatReport(id, items) => {
-                let unit = &self.active[&id];
+                let unit = &self.active[&id].unit;
                 let package_id = unit.pkg.package_id();
                 let is_local = unit.is_local();
                 self.per_package_future_incompat_reports
@@ -906,7 +911,7 @@ impl<'gctx> DrainState<'gctx> {
         let active_names = self
             .active
             .values()
-            .map(|u| self.name_for_progress(u))
+            .map(|job| self.name_for_progress(&job.unit))
             .collect::<Vec<_>>();
         let _ = self.progress.tick_now(
             self.finished,
@@ -960,7 +965,8 @@ impl<'gctx> DrainState<'gctx> {
 
         debug!("start {}: {:?}", id, unit);
 
-        assert!(self.active.insert(id, unit.clone()).is_none());
+        let active_job = ActiveJob { unit: unit.clone() };
+        assert!(self.active.insert(id, active_job).is_none());
 
         let messages = self.messages.clone();
         let is_fresh = job.freshness().is_fresh();
@@ -1063,7 +1069,7 @@ impl<'gctx> DrainState<'gctx> {
             None | Some(_) => return,
         };
         runner.compilation.lint_warning_count += count.lints;
-        let unit = &self.active[&id];
+        let unit = &self.active[&id].unit;
         let mut message = descriptive_pkg_name(&unit.pkg.name(), &unit.target, &unit.mode);
         message.push_str(" generated ");
         match count.total {

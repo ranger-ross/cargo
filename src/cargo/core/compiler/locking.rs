@@ -11,19 +11,19 @@ use std::{
     fmt::{Display, Formatter},
     fs::TryLockError,
     path::PathBuf,
-    sync::Mutex,
+    sync::RwLock,
 };
 use tracing::instrument;
 
 /// A struct to store the lock handles for build units during compilation.
 pub struct LockManager {
-    locks: Mutex<HashMap<LockKey, FileLock>>,
+    locks: RwLock<HashMap<LockKey, FileLock>>,
 }
 
 impl LockManager {
     pub fn new() -> Self {
         Self {
-            locks: Mutex::new(HashMap::new()),
+            locks: RwLock::new(HashMap::new()),
         }
     }
 
@@ -42,7 +42,7 @@ impl LockManager {
         let key = LockKey::from_unit(build_runner, unit);
         tracing::Span::current().record("key", key.0.to_str());
 
-        let mut locks = self.locks.lock().unwrap();
+        let mut locks = self.locks.write().unwrap();
         if let Some(lock) = locks.get_mut(&key) {
             lock.file().lock_shared()?;
         } else {
@@ -61,13 +61,12 @@ impl LockManager {
 
     #[instrument(skip(self))]
     pub fn try_lock(&self, key: &LockKey) -> CargoResult<bool> {
+        let locks = self.locks.read().unwrap();
         if key.0.to_str().unwrap().contains("libc") {
             println!("mocked {key:?}");
             return Ok(false);
         }
-
-        let mut locks = self.locks.lock().unwrap();
-        if let Some(lock) = locks.get_mut(&key) {
+        if let Some(lock) = locks.get(&key) {
             return match lock.file().try_lock() {
                 Ok(()) => Ok(true),
                 Err(TryLockError::WouldBlock) => Ok(false),
@@ -80,11 +79,11 @@ impl LockManager {
 
     #[instrument(skip(self))]
     pub fn lock(&self, key: &LockKey) -> CargoResult<()> {
+        let locks = self.locks.read().unwrap();
         if key.0.to_str().unwrap().contains("libc") {
             std::thread::sleep(std::time::Duration::from_secs(5));
         }
-        let mut locks = self.locks.lock().unwrap();
-        if let Some(lock) = locks.get_mut(&key) {
+        if let Some(lock) = locks.get(&key) {
             lock.file().lock()?;
         } else {
             bail!("lock was not found in lock manager: {key}");
@@ -96,8 +95,8 @@ impl LockManager {
     /// Upgrades an existing exclusive lock into a shared lock.
     #[instrument(skip(self))]
     pub fn downgrade_to_shared(&self, key: &LockKey) -> CargoResult<()> {
-        let mut locks = self.locks.lock().unwrap();
-        let Some(lock) = locks.get_mut(key) else {
+        let locks = self.locks.read().unwrap();
+        let Some(lock) = locks.get(key) else {
             bail!("lock was not found in lock manager: {key}");
         };
         lock.file().lock_shared()?;
@@ -106,8 +105,8 @@ impl LockManager {
 
     #[instrument(skip(self))]
     pub fn unlock(&self, key: &LockKey) -> CargoResult<()> {
-        let mut locks = self.locks.lock().unwrap();
-        if let Some(lock) = locks.get_mut(key) {
+        let locks = self.locks.read().unwrap();
+        if let Some(lock) = locks.get(key) {
             lock.file().unlock()?;
         };
 

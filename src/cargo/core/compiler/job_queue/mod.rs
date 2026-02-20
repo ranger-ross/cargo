@@ -122,7 +122,6 @@ use std::sync::{Arc, mpsc};
 use std::thread::{self, Scope};
 use std::time::Duration;
 
-use anstream::println;
 use anyhow::{Context as _, format_err};
 use jobserver::{Acquired, HelperThread};
 use semver::Version;

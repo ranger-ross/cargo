@@ -114,14 +114,15 @@ mod job;
 mod job_state;
 
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt::Write as _;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, mpsc};
 use std::thread::{self, Scope};
 use std::time::Duration;
 
+use anstream::println;
 use anyhow::{Context as _, format_err};
 use jobserver::{Acquired, HelperThread};
 use semver::Version;
@@ -178,8 +179,12 @@ struct DrainState<'gctx> {
     diag_dedupe: DiagDedupe<'gctx>,
     /// Count of warnings, used to print a summary after the job succeeds
     warning_count: HashMap<JobId, WarningCount>,
-    active: HashMap<JobId, Unit>,
+    active: HashMap<JobId, (Unit, mpsc::Sender<()>)>,
     compiled: HashSet<PackageId>,
+    /// Jobs that are currently blocked due to file lock
+    blocked: VecDeque<(JobId, Unit)>,
+    /// Jobs that were blocked but are now ready to resume
+    unblocked: VecDeque<(JobId, Unit)>,
     documented: HashSet<PackageId>,
     scraped: HashSet<PackageId>,
     counts: HashMap<PackageId, usize>,
@@ -384,6 +389,8 @@ enum Message {
     Finish(JobId, Artifact, CargoResult<()>),
     FutureIncompatReport(JobId, Vec<FutureBreakageItem>),
     SectionTiming(JobId, SectionTiming),
+    Blocked(JobId),
+    Unblocked(JobId),
 }
 
 impl<'gctx> JobQueue<'gctx> {
@@ -498,6 +505,8 @@ impl<'gctx> JobQueue<'gctx> {
             active: HashMap::new(),
             compiled: HashSet::new(),
             documented: HashSet::new(),
+            blocked: VecDeque::new(),
+            unblocked: VecDeque::new(),
             scraped: HashSet::new(),
             counts: self.counts,
             progress,
@@ -584,27 +593,49 @@ impl<'gctx> DrainState<'gctx> {
         // The `pending_queue` is sorted in ascending priority order, and we
         // remove items from its end to schedule the highest priority items
         // sooner.
-        while self.has_extra_tokens() && !self.pending_queue.is_empty() {
-            let (unit, job, _) = self.pending_queue.pop().unwrap();
-            *self.counts.get_mut(&unit.pkg.package_id()).unwrap() -= 1;
-            // Print out some nice progress information.
-            // NOTE: An error here will drop the job without starting it.
-            // That should be OK, since we want to exit as soon as
-            // possible during an error.
-            self.note_working_on(
-                build_runner.bcx.gctx,
-                build_runner.bcx.ws.root(),
-                &unit,
-                job.freshness(),
-            )?;
-            self.run(&unit, job, build_runner, scope);
+        // dbg!(self.pending_queue.len());
+        // dbg!(self.unblocked.len());
+        // println!(
+        //     "GO:: active={}, pending={}, blocked={}, unblocked={}",
+        //     self.active.len(),
+        //     self.pending_queue.len(),
+        //     self.blocked.len(),
+        //     self.unblocked.len()
+        // );
+        while self.has_extra_tokens() && !self.pending_queue.is_empty()
+            || !self.unblocked.is_empty()
+        {
+            // println!("u.len={}", self.unblocked.len());
+
+            match self.unblocked.pop_front() {
+                Some((job, unit)) => {
+                    let (_, tx) = self.active.get(&job).expect("unblocked job was not active");
+                    tx.send(())?;
+                }
+                None => {
+                    // println!("p.len={}", self.pending_queue.len());
+                    let (unit, job, _) = self.pending_queue.pop().unwrap();
+                    *self.counts.get_mut(&unit.pkg.package_id()).unwrap() -= 1;
+                    // Print out some nice progress information.
+                    // NOTE: An error here will drop the job without starting it.
+                    // That should be OK, since we want to exit as soon as
+                    // possible during an error.
+                    self.note_working_on(
+                        build_runner.bcx.gctx,
+                        build_runner.bcx.ws.root(),
+                        &unit,
+                        job.freshness(),
+                    )?;
+                    self.run(&unit, job, build_runner, scope);
+                }
+            };
         }
 
         Ok(())
     }
 
     fn has_extra_tokens(&self) -> bool {
-        self.active.len() < self.tokens.len() + 1
+        (self.active.len() - self.blocked.len()) < self.tokens.len() + 1
     }
 
     fn handle_event(
@@ -621,7 +652,7 @@ impl<'gctx> DrainState<'gctx> {
                     .shell()
                     .verbose(|c| c.status("Running", &cmd))?;
                 self.timings
-                    .unit_start(build_runner, id, self.active[&id].clone());
+                    .unit_start(build_runner, id, self.active[&id].clone().0);
             }
             Message::Stdout(out) => {
                 writeln!(build_runner.bcx.gctx.shell().out(), "{}", out)?;
@@ -669,7 +700,7 @@ impl<'gctx> DrainState<'gctx> {
                 self.print.print(&msg)?;
             }
             Message::Finish(id, artifact, result) => {
-                let unit = match artifact {
+                let (unit, _) = match artifact {
                     // If `id` has completely finished we remove it
                     // from the `active` map ...
                     Artifact::All => {
@@ -712,7 +743,7 @@ impl<'gctx> DrainState<'gctx> {
                 }
             }
             Message::FutureIncompatReport(id, items) => {
-                let unit = &self.active[&id];
+                let (unit, _) = &self.active[&id];
                 let package_id = unit.pkg.package_id();
                 let is_local = unit.is_local();
                 self.per_package_future_incompat_reports
@@ -728,6 +759,23 @@ impl<'gctx> DrainState<'gctx> {
             }
             Message::SectionTiming(id, section) => {
                 self.timings.unit_section_timing(build_runner, id, &section);
+            }
+            Message::Blocked(job_id) => {
+                // TODO: Do we want to remove the job from `active` while its blocked?
+                let (unit, _) = self
+                    .active
+                    .get(&job_id)
+                    .expect("job was blocked without being active");
+                self.blocked.push_back((job_id, unit.clone()));
+            }
+            Message::Unblocked(job_id) => {
+                let idx = self
+                    .blocked
+                    .iter()
+                    .position(|&(id, _)| id == job_id)
+                    .expect("job was unblocked that was not blocked");
+                let (job_id, unit) = self.blocked.remove(idx).unwrap();
+                self.unblocked.push_back((job_id, unit));
             }
         }
 
@@ -906,7 +954,7 @@ impl<'gctx> DrainState<'gctx> {
         let active_names = self
             .active
             .values()
-            .map(|u| self.name_for_progress(u))
+            .map(|(u, _)| self.name_for_progress(u))
             .collect::<Vec<_>>();
         let _ = self.progress.tick_now(
             self.finished,
@@ -960,7 +1008,9 @@ impl<'gctx> DrainState<'gctx> {
 
         debug!("start {}: {:?}", id, unit);
 
-        assert!(self.active.insert(id, unit.clone()).is_none());
+        let (tx, rx) = mpsc::channel();
+
+        assert!(self.active.insert(id, (unit.clone(), tx)).is_none());
 
         let messages = self.messages.clone();
         let is_fresh = job.freshness().is_fresh();
@@ -968,7 +1018,7 @@ impl<'gctx> DrainState<'gctx> {
         let lock_manager = build_runner.lock_manager.clone();
 
         let doit = move |diag_dedupe| {
-            let state = JobState::new(id, messages, diag_dedupe, rmeta_required, lock_manager);
+            let state = JobState::new(id, messages, diag_dedupe, rmeta_required, lock_manager, rx);
             state.run_to_finish(job);
         };
 
@@ -1063,7 +1113,7 @@ impl<'gctx> DrainState<'gctx> {
             None | Some(_) => return,
         };
         runner.compilation.lint_warning_count += count.lints;
-        let unit = &self.active[&id];
+        let (unit, _) = &self.active[&id];
         let mut message = descriptive_pkg_name(&unit.pkg.name(), &unit.target, &unit.mode);
         message.push_str(" generated ");
         match count.total {

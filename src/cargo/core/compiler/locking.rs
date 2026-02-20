@@ -9,6 +9,7 @@ use anyhow::bail;
 use std::{
     collections::HashMap,
     fmt::{Display, Formatter},
+    fs::TryLockError,
     path::PathBuf,
     sync::Mutex,
 };
@@ -59,7 +60,29 @@ impl LockManager {
     }
 
     #[instrument(skip(self))]
+    pub fn try_lock(&self, key: &LockKey) -> CargoResult<bool> {
+        if key.0.to_str().unwrap().contains("libc") {
+            println!("mocked {key:?}");
+            return Ok(false);
+        }
+
+        let mut locks = self.locks.lock().unwrap();
+        if let Some(lock) = locks.get_mut(&key) {
+            return match lock.file().try_lock() {
+                Ok(()) => Ok(true),
+                Err(TryLockError::WouldBlock) => Ok(false),
+                Err(TryLockError::Error(err)) => Err(anyhow::Error::new(err)),
+            };
+        } else {
+            bail!("lock was not found in lock manager: {key}");
+        }
+    }
+
+    #[instrument(skip(self))]
     pub fn lock(&self, key: &LockKey) -> CargoResult<()> {
+        if key.0.to_str().unwrap().contains("libc") {
+            std::thread::sleep(std::time::Duration::from_secs(5));
+        }
         let mut locks = self.locks.lock().unwrap();
         if let Some(lock) = locks.get_mut(&key) {
             lock.file().lock()?;

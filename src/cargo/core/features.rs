@@ -1268,6 +1268,14 @@ impl CliUnstable {
 
         self.implicitly_enable_features_if_needed();
 
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "Temporary opt out that is not part of the public interface"
+        )]
+        if std::env::var("__CARGO_TEMPORARY_BUILD_DIR_NEW_LAYOUT_OPT_OUT").as_deref() == Ok("1") {
+            self.build_dir_new_layout = false;
+        }
+
         Ok(warnings)
     }
 

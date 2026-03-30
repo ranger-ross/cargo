@@ -1219,6 +1219,52 @@ CARGO_BIN_FILE_BAR_bar=[ROOT]/foo/build-dir/debug/build/bar/[HASH]/artifact/bin/
 "#]]);
 }
 
+#[cargo_test]
+fn new_layout_opt_out() {
+    let p = project()
+        .file("src/main.rs", r#"fn main() { println!("Hello, World!") }"#)
+        .file(
+            ".cargo/config.toml",
+            r#"
+            [build]
+            target-dir = "target-dir"
+            build-dir = "build-dir"
+            "#,
+        )
+        .build();
+
+    p.cargo("-Zbuild-dir-new-layout build")
+        .env("__CARGO_TEMPORARY_BUILD_DIR_NEW_LAYOUT_OPT_OUT", "1")
+        .masquerade_as_nightly_cargo(&["new build-dir layout"])
+        .enable_mac_dsym()
+        .run();
+
+    assert_not_exists(&p.root().join("target"));
+
+    p.root().join("build-dir").assert_build_dir_layout(str![[r#"
+[ROOT]/foo/build-dir/.rustc_info.json
+[ROOT]/foo/build-dir/CACHEDIR.TAG
+[ROOT]/foo/build-dir/debug/.cargo-build-lock
+[ROOT]/foo/build-dir/debug/build/foo/[HASH]/fingerprint/bin-foo
+[ROOT]/foo/build-dir/debug/build/foo/[HASH]/fingerprint/bin-foo.json
+[ROOT]/foo/build-dir/debug/build/foo/[HASH]/fingerprint/dep-bin-foo
+[ROOT]/foo/build-dir/debug/build/foo/[HASH]/fingerprint/invoked.timestamp
+[ROOT]/foo/build-dir/debug/build/foo/[HASH]/out/foo[..][EXE]
+[ROOT]/foo/build-dir/debug/build/foo/[HASH]/out/foo[..].d
+
+"#]]);
+
+    p.root()
+        .join("target-dir")
+        .assert_build_dir_layout(str![[r#"
+[ROOT]/foo/target-dir/CACHEDIR.TAG
+[ROOT]/foo/target-dir/debug/.cargo-lock
+[ROOT]/foo/target-dir/debug/foo[EXE]
+[ROOT]/foo/target-dir/debug/foo.d
+
+"#]]);
+}
+
 fn parse_workspace_manifest_path_hash(hash_dir: &PathBuf) -> PathBuf {
     // Since the hash will change between test runs simply find the first directories and assume
     // that is the hash dir. The format is a 2 char directory followed by the remaining hash in the

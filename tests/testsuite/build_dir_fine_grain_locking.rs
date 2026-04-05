@@ -32,8 +32,8 @@ fn binary_with_debug() {
         )
         .build();
 
-    p.cargo("-Zbuild-dir-new-layout -Zfine-grain-locking build")
-        .masquerade_as_nightly_cargo(&["new build-dir layout"])
+    p.cargo("-Zfine-grain-locking build")
+        .masquerade_as_nightly_cargo(&["fine grain locking"])
         .enable_mac_dsym()
         .run();
 
@@ -78,8 +78,8 @@ fn binary_with_release() {
         )
         .build();
 
-    p.cargo("-Zbuild-dir-new-layout -Zfine-grain-locking build --release")
-        .masquerade_as_nightly_cargo(&["new build-dir layout"])
+    p.cargo("-Zfine-grain-locking build --release")
+        .masquerade_as_nightly_cargo(&["fine grain locking"])
         .enable_mac_dsym()
         .run();
 
@@ -183,8 +183,8 @@ fn libs() {
             )
             .build();
 
-        p.cargo("-Zbuild-dir-new-layout -Zfine-grain-locking build")
-            .masquerade_as_nightly_cargo(&["new build-dir layout"])
+        p.cargo("-Zfine-grain-locking build")
+            .masquerade_as_nightly_cargo(&["fine grain locking"])
             .enable_mac_dsym()
             .run();
 
@@ -199,8 +199,8 @@ fn should_default_to_target() {
         .file("src/main.rs", r#"fn main() { println!("Hello, World!") }"#)
         .build();
 
-    p.cargo("-Zbuild-dir-new-layout -Zfine-grain-locking build")
-        .masquerade_as_nightly_cargo(&["new build-dir layout"])
+    p.cargo("-Zfine-grain-locking build")
+        .masquerade_as_nightly_cargo(&["fine grain locking"])
         .enable_mac_dsym()
         .run();
 
@@ -228,8 +228,8 @@ fn should_respect_env_var() {
         .file("src/main.rs", r#"fn main() { println!("Hello, World!") }"#)
         .build();
 
-    p.cargo("-Zbuild-dir-new-layout -Zfine-grain-locking build")
-        .masquerade_as_nightly_cargo(&["new build-dir layout"])
+    p.cargo("-Zfine-grain-locking build")
+        .masquerade_as_nightly_cargo(&["fine grain locking"])
         .env("CARGO_BUILD_BUILD_DIR", "build-dir")
         .enable_mac_dsym()
         .run();
@@ -275,8 +275,8 @@ fn build_script_should_output_to_build_dir() {
         )
         .build();
 
-    p.cargo("-Zbuild-dir-new-layout -Zfine-grain-locking build")
-        .masquerade_as_nightly_cargo(&["new build-dir layout"])
+    p.cargo("-Zfine-grain-locking build")
+        .masquerade_as_nightly_cargo(&["fine grain locking"])
         .enable_mac_dsym()
         .run();
 
@@ -337,8 +337,8 @@ fn cargo_tmpdir_should_output_to_build_dir() {
         )
         .build();
 
-    p.cargo("-Zbuild-dir-new-layout -Zfine-grain-locking test")
-        .masquerade_as_nightly_cargo(&["new build-dir layout"])
+    p.cargo("-Zfine-grain-locking test")
+        .masquerade_as_nightly_cargo(&["fine grain locking"])
         .enable_mac_dsym()
         .run();
 
@@ -396,8 +396,8 @@ fn examples_should_output_to_build_dir_and_uplift_to_target_dir() {
         )
         .build();
 
-    p.cargo("-Zbuild-dir-new-layout -Zfine-grain-locking build --examples")
-        .masquerade_as_nightly_cargo(&["new build-dir layout"])
+    p.cargo("-Zfine-grain-locking build --examples")
+        .masquerade_as_nightly_cargo(&["fine grain locking"])
         .enable_mac_dsym()
         .run();
 
@@ -443,8 +443,8 @@ fn benches_should_output_to_build_dir() {
         )
         .build();
 
-    p.cargo("-Zbuild-dir-new-layout -Zfine-grain-locking build --bench=foo")
-        .masquerade_as_nightly_cargo(&["new build-dir layout"])
+    p.cargo("-Zfine-grain-locking build --bench=foo")
+        .masquerade_as_nightly_cargo(&["fine grain locking"])
         .enable_mac_dsym()
         .run();
 
@@ -493,8 +493,8 @@ fn cargo_doc_should_output_to_target_dir() {
         )
         .build();
 
-    p.cargo("-Zbuild-dir-new-layout -Zfine-grain-locking doc")
-        .masquerade_as_nightly_cargo(&["new build-dir layout"])
+    p.cargo("-Zfine-grain-locking doc")
+        .masquerade_as_nightly_cargo(&["fine grain locking"])
         .enable_mac_dsym()
         .run();
 
@@ -518,8 +518,8 @@ fn cargo_package_should_build_in_build_dir_and_output_to_target_dir() {
         )
         .build();
 
-    p.cargo("-Zbuild-dir-new-layout -Zfine-grain-locking package")
-        .masquerade_as_nightly_cargo(&["new build-dir layout"])
+    p.cargo("-Zfine-grain-locking package")
+        .masquerade_as_nightly_cargo(&["fine grain locking"])
         .enable_mac_dsym()
         .run();
 
@@ -575,8 +575,8 @@ fn cargo_publish_should_only_touch_build_dir() {
         )
         .build();
 
-    p.cargo("-Zbuild-dir-new-layout -Zfine-grain-locking publish")
-        .masquerade_as_nightly_cargo(&["new build-dir layout"])
+    p.cargo("-Zfine-grain-locking publish")
+        .masquerade_as_nightly_cargo(&["fine grain locking"])
         .replace_crates_io(registry.index_url())
         .enable_mac_dsym()
         .run();
@@ -604,8 +604,8 @@ fn cargo_clean_should_clean_the_target_dir_and_build_dir() {
         )
         .build();
 
-    p.cargo("-Zbuild-dir-new-layout -Zfine-grain-locking build")
-        .masquerade_as_nightly_cargo(&["new build-dir layout"])
+    p.cargo("-Zfine-grain-locking build")
+        .masquerade_as_nightly_cargo(&["fine grain locking"])
         .enable_mac_dsym()
         .run();
 
@@ -633,8 +633,8 @@ fn cargo_clean_should_clean_the_target_dir_and_build_dir() {
 
 "#]]);
 
-    p.cargo("-Zbuild-dir-new-layout -Zfine-grain-locking clean")
-        .masquerade_as_nightly_cargo(&["new build-dir layout"])
+    p.cargo("-Zfine-grain-locking clean")
+        .masquerade_as_nightly_cargo(&["fine grain locking"])
         .enable_mac_dsym()
         .run();
 
@@ -674,8 +674,8 @@ fn cargo_clean_should_remove_correct_files() {
         )
         .build();
 
-    p.cargo("-Zbuild-dir-new-layout -Zfine-grain-locking build")
-        .masquerade_as_nightly_cargo(&["new build-dir layout"])
+    p.cargo("-Zfine-grain-locking build")
+        .masquerade_as_nightly_cargo(&["fine grain locking"])
         .enable_mac_dsym()
         .run();
 
@@ -701,8 +701,8 @@ fn cargo_clean_should_remove_correct_files() {
 
 "#]]);
 
-    p.cargo("-Zbuild-dir-new-layout -Zfine-grain-locking clean -p bar")
-        .masquerade_as_nightly_cargo(&["new build-dir layout"])
+    p.cargo("-Zfine-grain-locking clean -p bar")
+        .masquerade_as_nightly_cargo(&["fine grain locking"])
         .enable_mac_dsym()
         .run();
 
@@ -735,8 +735,8 @@ fn timings_report_should_output_to_target_dir() {
         )
         .build();
 
-    p.cargo("-Zbuild-dir-new-layout -Zfine-grain-locking build --timings")
-        .masquerade_as_nightly_cargo(&["new build-dir layout"])
+    p.cargo("-Zfine-grain-locking build --timings")
+        .masquerade_as_nightly_cargo(&["fine grain locking"])
         .enable_mac_dsym()
         .run();
 
@@ -760,8 +760,8 @@ fn future_incompat_should_output_to_build_dir() {
         )
         .build();
 
-    p.cargo("-Zbuild-dir-new-layout -Zfine-grain-locking build")
-        .masquerade_as_nightly_cargo(&["new build-dir layout"])
+    p.cargo("-Zfine-grain-locking build")
+        .masquerade_as_nightly_cargo(&["fine grain locking"])
         .arg("--future-incompat-report")
         .env("RUSTFLAGS", "-Zfuture-incompat-test")
         .run();
@@ -783,8 +783,8 @@ fn template_should_error_for_invalid_variables() {
         )
         .build();
 
-    p.cargo("-Zbuild-dir-new-layout -Zfine-grain-locking build")
-        .masquerade_as_nightly_cargo(&["new build-dir layout"])
+    p.cargo("-Zfine-grain-locking build")
+        .masquerade_as_nightly_cargo(&["fine grain locking"])
         .enable_mac_dsym()
         .with_status(101)
         .with_stderr_data(str![[r#"
@@ -809,8 +809,8 @@ fn template_should_suggest_nearest_variable() {
         )
         .build();
 
-    p.cargo("-Zbuild-dir-new-layout -Zfine-grain-locking build")
-        .masquerade_as_nightly_cargo(&["new build-dir layout"])
+    p.cargo("-Zfine-grain-locking build")
+        .masquerade_as_nightly_cargo(&["fine grain locking"])
         .with_status(101)
         .with_stderr_data(str![[r#"
 [ERROR] unexpected variable `workspace-ro` in build.build-dir path `{workspace-ro}/build-dir`
@@ -835,8 +835,8 @@ fn template_workspace_root() {
         )
         .build();
 
-    p.cargo("-Zbuild-dir-new-layout -Zfine-grain-locking build")
-        .masquerade_as_nightly_cargo(&["new build-dir layout"])
+    p.cargo("-Zfine-grain-locking build")
+        .masquerade_as_nightly_cargo(&["fine grain locking"])
         .enable_mac_dsym()
         .run();
 
@@ -881,8 +881,8 @@ fn template_cargo_cache_home() {
         )
         .build();
 
-    p.cargo("-Zbuild-dir-new-layout -Zfine-grain-locking build")
-        .masquerade_as_nightly_cargo(&["new build-dir layout"])
+    p.cargo("-Zfine-grain-locking build")
+        .masquerade_as_nightly_cargo(&["fine grain locking"])
         .enable_mac_dsym()
         .run();
 
@@ -939,8 +939,8 @@ fn template_workspace_path_hash() {
         )
         .build();
 
-    p.cargo("-Zbuild-dir-new-layout -Zfine-grain-locking build")
-        .masquerade_as_nightly_cargo(&["new build-dir layout"])
+    p.cargo("-Zfine-grain-locking build")
+        .masquerade_as_nightly_cargo(&["fine grain locking"])
         .enable_mac_dsym()
         .run();
 
@@ -1010,8 +1010,8 @@ fn template_workspace_path_hash_should_handle_symlink() {
         .build();
 
     // Build from the non-symlinked directory
-    p.cargo("-Zbuild-dir-new-layout -Zfine-grain-locking check")
-        .masquerade_as_nightly_cargo(&["new build-dir layout"])
+    p.cargo("-Zfine-grain-locking check")
+        .masquerade_as_nightly_cargo(&["fine grain locking"])
         .enable_mac_dsym()
         .run();
 
@@ -1049,8 +1049,8 @@ fn template_workspace_path_hash_should_handle_symlink() {
     foo_dir.rm_rf();
 
     // Run cargo from the symlinked dir
-    p.cargo("-Zbuild-dir-new-layout -Zfine-grain-locking check")
-        .masquerade_as_nightly_cargo(&["new build-dir layout"])
+    p.cargo("-Zfine-grain-locking check")
+        .masquerade_as_nightly_cargo(&["fine grain locking"])
         .enable_mac_dsym()
         .cwd(&symlinked_dir)
         .run();
@@ -1095,8 +1095,8 @@ fn template_should_handle_reject_unmatched_brackets() {
         )
         .build();
 
-    p.cargo("-Zbuild-dir-new-layout -Zfine-grain-locking build")
-        .masquerade_as_nightly_cargo(&["new build-dir layout"])
+    p.cargo("-Zfine-grain-locking build")
+        .masquerade_as_nightly_cargo(&["fine grain locking"])
         .with_status(101)
         .with_stderr_data(str![[r#"
 [ERROR] unexpected opening bracket `{` in build.build-dir path `foo/{bar`
@@ -1174,7 +1174,7 @@ fn artifact_deps() {
         .file("bar/src/main.rs", "fn main() {}")
         .build();
 
-    p.cargo("run -Zbuild-dir-new-layout -Z bindeps")
+    p.cargo("run -Z bindeps")
         .masquerade_as_nightly_cargo(&["bindeps", "build-dir-new-layout"])
         .enable_mac_dsym()
         .with_stderr_data(str![[r#"
@@ -1236,9 +1236,9 @@ fn new_layout_opt_out() {
         )
         .build();
 
-    p.cargo("-Zbuild-dir-new-layout build")
+    p.cargo("build")
         .env("__CARGO_TEMPORARY_BUILD_DIR_NEW_LAYOUT_OPT_OUT", "1")
-        .masquerade_as_nightly_cargo(&["new build-dir layout"])
+        .masquerade_as_nightly_cargo(&["fine grain locking"])
         .enable_mac_dsym()
         .run();
 
@@ -1248,12 +1248,12 @@ fn new_layout_opt_out() {
 [ROOT]/foo/build-dir/.rustc_info.json
 [ROOT]/foo/build-dir/CACHEDIR.TAG
 [ROOT]/foo/build-dir/debug/.cargo-build-lock
-[ROOT]/foo/build-dir/debug/.fingerprint/foo-[HASH]/bin-foo
-[ROOT]/foo/build-dir/debug/.fingerprint/foo-[HASH]/bin-foo.json
-[ROOT]/foo/build-dir/debug/.fingerprint/foo-[HASH]/dep-bin-foo
-[ROOT]/foo/build-dir/debug/.fingerprint/foo-[HASH]/invoked.timestamp
-[ROOT]/foo/build-dir/debug/deps/foo[..][EXE]
-[ROOT]/foo/build-dir/debug/deps/foo[..].d
+[ROOT]/foo/build-dir/debug/build/foo/[HASH]/fingerprint/bin-foo
+[ROOT]/foo/build-dir/debug/build/foo/[HASH]/fingerprint/bin-foo.json
+[ROOT]/foo/build-dir/debug/build/foo/[HASH]/fingerprint/dep-bin-foo
+[ROOT]/foo/build-dir/debug/build/foo/[HASH]/fingerprint/invoked.timestamp
+[ROOT]/foo/build-dir/debug/build/foo/[HASH]/out/foo[..][EXE]
+[ROOT]/foo/build-dir/debug/build/foo/[HASH]/out/foo[..].d
 
 "#]]);
 

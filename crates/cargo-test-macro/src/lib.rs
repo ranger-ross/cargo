@@ -277,13 +277,42 @@ fn to_token_stream(code: &str) -> TokenStream {
 static VERSION: std::sync::LazyLock<(u32, bool)> = LazyLock::new(|| {
     let output = Command::new("rustc")
         .arg("-V")
+        .env("RUSTC_LOG", "info")
+        .env("RUSTC_BACKTRACE", "1")
+        .env("RUST_BACKTRACE", "1")
         .output()
         .expect("rustc should run");
+
+    if output.status.code() != Some(0) {
+        println!(
+            "'rustc -V' exited with non-zero exit code: {:?}",
+            output.status
+        );
+
+        println!(
+            "stdout: {:?}\nstderr: {:?}",
+            std::str::from_utf8(&output.stdout),
+            std::str::from_utf8(&output.stderr),
+        );
+    }
+
     let stdout = std::str::from_utf8(&output.stdout).expect("utf8");
-    let vers = stdout.split_whitespace().skip(1).next().unwrap();
+    println!("raw output: '{stdout}'");
+    let vers = stdout
+        .split_whitespace()
+        .skip(1)
+        .next()
+        .expect("version should have contain at least one space");
     let is_nightly = option_env!("CARGO_TEST_DISABLE_NIGHTLY").is_none()
         && (vers.contains("-nightly") || vers.contains("-dev"));
-    let minor = vers.split('.').skip(1).next().unwrap().parse().unwrap();
+    println!("raw vers: '{vers}'");
+    let minor = vers
+        .split('.')
+        .skip(1)
+        .next()
+        .expect("malformed rustc version (not semver)")
+        .parse()
+        .expect("malformed rustc version (minor version was not u32)");
     (minor, is_nightly)
 });
 

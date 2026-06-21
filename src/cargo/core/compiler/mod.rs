@@ -29,6 +29,7 @@
 //! [`ops::cargo_compile::compile`]: crate::ops::compile
 
 pub mod artifact;
+pub mod build_cache;
 mod build_config;
 pub(crate) mod build_context;
 pub(crate) mod build_runner;
@@ -67,6 +68,7 @@ use std::sync::{Arc, LazyLock};
 
 use anyhow::{Context as _, Error};
 use cargo_platform::{Cfg, Platform};
+use cargo_util::paths::{create_dir_all, move_directory};
 use cargo_util_terminal::report::{AnnotationKind, Group, Level, Renderer, Snippet};
 use itertools::Itertools;
 use regex::Regex;
@@ -234,6 +236,21 @@ fn compile<'gctx>(
                 work.then(link_targets(build_runner, unit, true)?)
             });
 
+            // FIXME: This does not work as it creates a race condition for the .rmeta location in
+            //        pipelined builds.
+            if unit.is_cacheable() {
+                let build_dir_location = build_runner.files().build_unit(unit);
+                let build_cache_location = build_runner.files().cached_build_unit(unit);
+                if !build_cache_location.exists() {
+                    job.after(Work::new(move |_state| {
+                        create_dir_all(build_cache_location.parent().unwrap())?;
+                        move_directory(&build_dir_location, &build_cache_location)?;
+
+                        Ok(())
+                    }));
+                }
+            }
+
             // If -Zfine-grain-locking is enabled, we wrap the job with an upgrade to exclusive
             // lock before starting, then downgrade to a shared lock after the job is finished.
             if build_runner.bcx.gctx.cli_unstable().fine_grain_locking && job.freshness().is_dirty()
@@ -316,7 +333,7 @@ fn rustc(
             format!("{}.d", unit.target.crate_name())
         };
     let rustc_dep_info_loc = root.join(dep_info_name);
-    let dep_info_loc = fingerprint::dep_info_loc(build_runner, unit);
+    let dep_info_loc = fingerprint::dep_info_loc(build_runner, unit, false);
 
     let mut output_options = OutputOptions::for_dirty(build_runner, unit);
     let package_id = unit.pkg.package_id();
@@ -333,7 +350,8 @@ fn rustc(
         .get_cwd()
         .unwrap_or_else(|| build_runner.bcx.gctx.cwd())
         .to_path_buf();
-    let fingerprint_dir = build_runner.files().fingerprint_dir(unit);
+    let is_cacheable = unit.is_cacheable();
+    let fingerprint_dir = build_runner.files().fingerprint_dir(unit, false);
     let script_metadatas = build_runner.find_build_script_metadatas(unit);
     let is_local = unit.is_local();
     let artifact = unit.artifact;
@@ -421,7 +439,11 @@ fn rustc(
         }
 
         state.running(&rustc);
-        let timestamp = paths::set_invocation_time(&fingerprint_dir)?;
+        let timestamp = if !is_cacheable {
+            Some(paths::set_invocation_time(&fingerprint_dir)?)
+        } else {
+            None
+        };
         for file in sbom_files {
             tracing::debug!("writing sbom to {}", file.display());
             let outfile = BufWriter::new(paths::create(&file)?);
@@ -504,7 +526,9 @@ fn rustc(
             })?;
             // This mtime shift allows Cargo to detect if a source file was
             // modified in the middle of the build.
-            paths::set_file_time_no_err(dep_info_loc, timestamp);
+            if let Some(timestamp) = timestamp {
+                paths::set_file_time_no_err(dep_info_loc, timestamp);
+            }
         }
 
         // This mtime shift for .rmeta is a workaround as rustc incremental build
@@ -522,7 +546,9 @@ fn rustc(
         //    However the check is a no-op (input has no change), so stuck.
         if mode.is_check() {
             for output in outputs.iter() {
-                paths::set_file_time_no_err(&output.path, timestamp);
+                if let Some(timestamp) = timestamp {
+                    paths::set_file_time_no_err(&output.path, timestamp);
+                }
             }
         }
 
@@ -999,14 +1025,14 @@ fn rustdoc(build_runner: &mut BuildRunner<'_, '_>, unit: &Unit) -> CargoResult<W
     let manifest = ManifestErrorContext::new(build_runner, unit);
 
     let rustdoc_dep_info_loc = rustdoc_dep_info_loc(build_runner, unit);
-    let dep_info_loc = fingerprint::dep_info_loc(build_runner, unit);
+    let dep_info_loc = fingerprint::dep_info_loc(build_runner, unit, false);
     let build_dir = build_runner.bcx.ws.build_dir().into_path_unlocked();
     let pkg_root = unit.pkg.root().to_path_buf();
     let cwd = rustdoc
         .get_cwd()
         .unwrap_or_else(|| build_runner.bcx.gctx.cwd())
         .to_path_buf();
-    let fingerprint_dir = build_runner.files().fingerprint_dir(unit);
+    let fingerprint_dir = build_runner.files().fingerprint_dir(unit, false);
     let is_local = unit.is_local();
     let env_config = Arc::clone(build_runner.bcx.gctx.env_config()?);
     let rustdoc_depinfo_enabled = build_runner.bcx.gctx.cli_unstable().rustdoc_depinfo;
@@ -1823,7 +1849,14 @@ fn add_dep_arg<'a, 'b: 'a>(
     if map.contains_key(&unit) {
         return;
     }
-    map.insert(&unit, build_runner.files().deps_dir(&unit));
+
+    let path = if unit.is_cacheable() {
+        build_runner.files().cached_out_dir(&unit)
+    } else {
+        build_runner.files().deps_dir(&unit)
+    };
+
+    map.insert(&unit, path);
 
     for dep in build_runner.unit_deps(unit) {
         add_dep_arg(map, build_runner, &dep.unit);
@@ -2684,7 +2717,7 @@ fn scrape_output_path(build_runner: &BuildRunner<'_, '_>, unit: &Unit) -> CargoR
 
 /// Gets the dep-info file emitted by rustdoc.
 fn rustdoc_dep_info_loc(build_runner: &BuildRunner<'_, '_>, unit: &Unit) -> PathBuf {
-    let mut loc = build_runner.files().fingerprint_file_path(unit, "");
+    let mut loc = build_runner.files().fingerprint_file_path(unit, "", false);
     loc.set_extension("d");
     loc
 }

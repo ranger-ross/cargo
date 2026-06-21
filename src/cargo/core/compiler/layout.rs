@@ -220,6 +220,7 @@ use std::path::{Path, PathBuf};
 pub struct Layout {
     artifact_dir: Option<ArtifactDirLayout>,
     build_dir: BuildDirLayout,
+    build_cache: BuildCacheLayout,
     _lock: Option<FileLock>,
 }
 
@@ -330,6 +331,9 @@ impl Layout {
                 _lock: build_dir_lock,
                 is_new_layout,
             },
+            build_cache: BuildCacheLayout {
+                root: ws.gctx().home().join("build-cache").into_path_unlocked(),
+            },
             _lock: lock,
         })
     }
@@ -340,6 +344,7 @@ impl Layout {
             artifact_dir.prepare()?;
         }
         self.build_dir.prepare()?;
+        self.build_cache.prepare()?;
 
         Ok(())
     }
@@ -350,6 +355,10 @@ impl Layout {
 
     pub fn build_dir(&self) -> &BuildDirLayout {
         &self.build_dir
+    }
+
+    pub fn build_cache(&self) -> &BuildCacheLayout {
+        &self.build_cache
     }
 }
 
@@ -509,5 +518,29 @@ impl BuildDirLayout {
     pub fn prepare_tmp(&self) -> CargoResult<&Path> {
         paths::create_dir_all(&self.tmp)?;
         Ok(&self.tmp)
+    }
+}
+
+pub struct BuildCacheLayout {
+    root: PathBuf,
+}
+
+impl BuildCacheLayout {
+    pub fn prepare(&mut self) -> CargoResult<()> {
+        paths::create_dir_all(&self.root)?;
+
+        Ok(())
+    }
+    /// Fetch the fingerprint path.
+    pub fn fingerprint(&self, pkg_dir: &str) -> PathBuf {
+        self.build_unit(pkg_dir).join("fingerprint")
+    }
+    /// Fetch the output path for build units.
+    pub fn out(&self, pkg_dir: &str) -> PathBuf {
+        self.build_unit(pkg_dir).join("out")
+    }
+    /// Fetch the build unit path
+    pub fn build_unit(&self, pkg_dir: &str) -> PathBuf {
+        self.root.join(pkg_dir)
     }
 }

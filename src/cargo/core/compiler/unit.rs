@@ -165,6 +165,11 @@ impl UnitInner {
         self.pkg.package_id().source_id().is_path() && !self.is_std
     }
 
+    pub fn is_cacheable(&self) -> bool {
+        // TODO: Properly review the units that can be cached
+        !self.is_local() && !self.target.is_custom_build() && !self.target.is_bin()
+    }
+
     /// Returns whether or not warnings should be displayed for this unit.
     pub fn show_warnings(&self, gctx: &GlobalContext) -> bool {
         self.is_local() || gctx.extra_verbose()

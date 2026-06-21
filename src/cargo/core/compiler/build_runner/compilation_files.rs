@@ -296,10 +296,19 @@ impl<'a, 'gctx: 'a> CompilationFiles<'a, 'gctx> {
             .out_force_new_layout(&dir)
     }
 
-    /// Directory where the fingerprint for the given unit should go.
-    pub fn fingerprint_dir(&self, unit: &Unit) -> PathBuf {
+    pub fn cached_out_dir(&self, unit: &Unit) -> PathBuf {
         let dir = self.pkg_dir(unit);
-        self.layout(unit.kind).build_dir().fingerprint(&dir)
+        self.layout(unit.kind).build_cache().out(&dir)
+    }
+
+    /// Directory where the fingerprint for the given unit should go.
+    pub fn fingerprint_dir(&self, unit: &Unit, cache: bool) -> PathBuf {
+        let dir = self.pkg_dir(unit);
+        if cache {
+            self.layout(unit.kind).build_cache().fingerprint(&dir)
+        } else {
+            self.layout(unit.kind).build_dir().fingerprint(&dir)
+        }
     }
 
     /// The lock location for a given build unit.
@@ -309,6 +318,16 @@ impl<'a, 'gctx: 'a> CompilationFiles<'a, 'gctx> {
             .build_dir()
             .build_unit(&dir)
             .join(".lock")
+    }
+
+    pub fn build_unit(&self, unit: &Unit) -> PathBuf {
+        let dir = self.pkg_dir(unit);
+        self.layout(unit.kind).build_dir().build_unit(&dir)
+    }
+
+    pub fn cached_build_unit(&self, unit: &Unit) -> PathBuf {
+        let dir = self.pkg_dir(unit);
+        self.layout(unit.kind).build_cache().build_unit(&dir)
     }
 
     /// Directory where incremental output for the given unit should go.
@@ -325,7 +344,7 @@ impl<'a, 'gctx: 'a> CompilationFiles<'a, 'gctx> {
     ///
     /// The "prefix" should be something to distinguish the file from other
     /// files in the fingerprint directory.
-    pub fn fingerprint_file_path(&self, unit: &Unit, prefix: &str) -> PathBuf {
+    pub fn fingerprint_file_path(&self, unit: &Unit, prefix: &str, cache: bool) -> PathBuf {
         // Different targets need to be distinguished in the
         let kind = unit.target.kind().description();
         let flavor = if unit.mode.is_any_test() {
@@ -338,12 +357,12 @@ impl<'a, 'gctx: 'a> CompilationFiles<'a, 'gctx> {
             ""
         };
         let name = format!("{}{}{}-{}", prefix, flavor, kind, unit.target.name());
-        self.fingerprint_dir(unit).join(name)
+        self.fingerprint_dir(unit, cache).join(name)
     }
 
     /// Path where compiler output is cached.
     pub fn message_cache_path(&self, unit: &Unit) -> PathBuf {
-        self.fingerprint_file_path(unit, "output-")
+        self.fingerprint_file_path(unit, "output-", false)
     }
 
     /// Returns the directory where a compiled build script is stored.
@@ -667,7 +686,13 @@ impl<'a, 'gctx: 'a> CompilationFiles<'a, 'gctx> {
         for file_type in file_types {
             let meta = self.metas[unit];
             let meta_opt = meta.c_extra_filename().map(|h| h.to_string());
-            let path = out_dir.join(file_type.output_filename(&unit.target, meta_opt.as_deref()));
+            let file = file_type.output_filename(&unit.target, meta_opt.as_deref());
+            let path = if unit.is_cacheable() {
+                let cache = self.cached_out_dir(unit);
+                cache.join(file)
+            } else {
+                out_dir.join(file)
+            };
 
             // If, the `different_binary_name` feature is enabled, the name of the hardlink will
             // be the name of the binary provided by the user in `Cargo.toml`.

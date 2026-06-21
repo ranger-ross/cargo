@@ -881,6 +881,130 @@ fn exclude_from_time_machine_and_cloud_sync(path: &Path) {
     // doesn't prevent Cargo from working
 }
 
+/// Moves a directory from `src` to `dst`.
+///
+/// Attempts a rename first (cheap, atomic on the same filesystem). If that
+/// fails because `src` and `dst` are on different filesystems
+/// (`EXDEV` / `ERROR_NOT_SAME_DEVICE`), it falls back to a recursive
+/// copy-then-delete.
+///
+/// `dst` must not already exist. Parent directories of `dst` are not
+/// created automatically, call [`create_dir_all`] on `dst`'s parent
+/// beforehand if needed.
+pub fn move_directory(src: &Path, dst: &Path) -> Result<()> {
+    // Fast path: rename works when src and dst are on the same filesystem.
+    match fs::rename(src, dst) {
+        Ok(()) => return Ok(()),
+        Err(e) if is_cross_device(&e) => {} // fall through to copy+delete
+        Err(e) => {
+            return Err(e).with_context(|| {
+                format!(
+                    "failed to move directory `{}` to `{}`",
+                    src.display(),
+                    dst.display()
+                )
+            });
+        }
+    }
+
+    // Slow path: different filesystems, copy then remove.
+    copy_directory(src, dst).with_context(|| {
+        format!(
+            "failed to copy directory `{}` to `{}` during move",
+            src.display(),
+            dst.display()
+        )
+    })?;
+    remove_dir_all(src).with_context(|| {
+        format!(
+            "failed to remove source directory `{}` after copy during move",
+            src.display()
+        )
+    })
+}
+
+/// Recursively copies a directory tree from `src` to `dst`.
+///
+/// `dst` is created by this function. Symlinks are copied as symlinks.
+fn copy_directory(src: &Path, dst: &Path) -> Result<()> {
+    fs::create_dir(dst)
+        .with_context(|| format!("failed to create directory `{}`", dst.display()))?;
+
+    for entry in fs::read_dir(src)
+        .with_context(|| format!("failed to read directory `{}`", src.display()))?
+    {
+        let entry =
+            entry.with_context(|| format!("failed to read entry in `{}`", src.display()))?;
+        let src_path = entry.path();
+        let dst_path = dst.join(entry.file_name());
+        let file_type = entry
+            .file_type()
+            .with_context(|| format!("failed to read file type of `{}`", src_path.display()))?;
+
+        if file_type.is_dir() {
+            copy_directory(&src_path, &dst_path)?;
+        } else if file_type.is_symlink() {
+            let target = fs::read_link(&src_path)
+                .with_context(|| format!("failed to read symlink `{}`", src_path.display()))?;
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(&target, &dst_path).with_context(|| {
+                format!(
+                    "failed to create symlink `{}` -> `{}`",
+                    dst_path.display(),
+                    target.display()
+                )
+            })?;
+            #[cfg(windows)]
+            {
+                // On Windows, symlink creation requires knowing whether the
+                // target is a file or a directory.
+                if target.is_dir() {
+                    std::os::windows::fs::symlink_dir(&target, &dst_path)
+                } else {
+                    std::os::windows::fs::symlink_file(&target, &dst_path)
+                }
+                .with_context(|| {
+                    format!(
+                        "failed to create symlink `{}` -> `{}`",
+                        dst_path.display(),
+                        target.display()
+                    )
+                })?;
+            }
+        } else {
+            fs::copy(&src_path, &dst_path).with_context(|| {
+                format!(
+                    "failed to copy `{}` to `{}`",
+                    src_path.display(),
+                    dst_path.display()
+                )
+            })?;
+        }
+    }
+    Ok(())
+}
+
+/// Returns `true` if the I/O error indicates a cross-device move was attempted.
+fn is_cross_device(err: &io::Error) -> bool {
+    #[cfg(unix)]
+    {
+        err.raw_os_error() == Some(libc::EXDEV)
+    }
+    #[cfg(windows)]
+    {
+        // ERROR_NOT_SAME_DEVICE = 17
+        err.raw_os_error() == Some(17)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        // Conservative fallback: always attempt copy+delete.
+        matches!(
+            err.kind(),
+            io::ErrorKind::CrossesDevices | io::ErrorKind::Other
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::join_paths;

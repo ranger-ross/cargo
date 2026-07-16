@@ -391,7 +391,6 @@ use anyhow::Context as _;
 use anyhow::format_err;
 use cargo_util::paths;
 use filetime::FileTime;
-use itertools::Itertools;
 use serde::de;
 use serde::ser;
 use serde::{Deserialize, Serialize};
@@ -457,14 +456,14 @@ pub fn prepare_target(
     force: bool,
 ) -> CargoResult<Job> {
     let bcx = build_runner.bcx;
+    let loc = build_runner.files().fingerprint_file_path(unit, "");
+
     if unit.is_cacheable() {
-        let loc = build_runner.files().fingerprint_file_path(unit, "", true);
         if loc.exists() {
             // Build cache units are immutable so if it exists, its fresh.
             return Ok(Job::new_fresh());
         }
     }
-    let loc = build_runner.files().fingerprint_file_path(unit, "", false);
 
     debug!("fingerprint at: {}", loc.display());
 
@@ -1610,7 +1609,7 @@ fn calculate_normal(
         })?;
         vec![LocalFingerprint::Precalculated(fingerprint)]
     } else {
-        let dep_info = dep_info_loc(build_runner, unit, false);
+        let dep_info = dep_info_loc(build_runner, unit);
         let dep_info = dep_info.strip_prefix(&build_root).unwrap().to_path_buf();
         vec![LocalFingerprint::CheckDepInfo {
             dep_info,
@@ -1971,10 +1970,10 @@ fn write_fingerprint(loc: &Path, fingerprint: &Fingerprint) -> CargoResult<()> {
 
 /// Prepare for work when a package starts to build
 pub fn prepare_init(build_runner: &mut BuildRunner<'_, '_>, unit: &Unit) -> CargoResult<()> {
-    let new1 = build_runner.files().fingerprint_dir(unit, false);
+    let new1 = build_runner.files().fingerprint_dir(unit);
 
     // Doc tests have no output, thus no fingerprint.
-    if !new1.exists() && !unit.mode.is_doc_test() {
+    if !new1.exists() && !unit.mode.is_doc_test() && !unit.is_cacheable() {
         paths::create_dir_all(&new1)?;
     }
 
@@ -1983,10 +1982,8 @@ pub fn prepare_init(build_runner: &mut BuildRunner<'_, '_>, unit: &Unit) -> Carg
 
 /// Returns the location that the dep-info file will show up at
 /// for the [`Unit`] specified.
-pub fn dep_info_loc(build_runner: &mut BuildRunner<'_, '_>, unit: &Unit, cache: bool) -> PathBuf {
-    build_runner
-        .files()
-        .fingerprint_file_path(unit, "dep-", cache)
+pub fn dep_info_loc(build_runner: &mut BuildRunner<'_, '_>, unit: &Unit) -> PathBuf {
+    build_runner.files().fingerprint_file_path(unit, "dep-")
 }
 
 /// Returns an absolute path that build directory.

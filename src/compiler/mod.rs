@@ -236,6 +236,21 @@ fn compile<'gctx>(
                 work.then(link_targets(build_runner, unit, true)?)
             });
 
+            // FIXME: This does not work as it creates a race condition for the .rmeta location in
+            //        pipelined builds.
+            // if unit.is_cacheable() {
+            //     let build_dir_location = build_runner.files().build_unit(unit);
+            //     let build_cache_location = build_runner.files().cached_build_unit(unit);
+            //     if !build_cache_location.exists() {
+            //         job.after(Work::new(move |_state| {
+            //             create_dir_all(build_cache_location.parent().unwrap())?;
+            //             move_directory(&build_dir_location, &build_cache_location)?;
+            //
+            //             Ok(())
+            //         }));
+            //     }
+            // }
+
             // If -Zfine-grain-locking is enabled, we wrap the job with an upgrade to exclusive
             // lock before starting, then downgrade to a shared lock after the job is finished.
             if build_runner.bcx.gctx.cli_unstable().fine_grain_locking && job.freshness().is_dirty()
@@ -319,6 +334,9 @@ fn rustc(
         };
     let rustc_dep_info_loc = root.join(dep_info_name);
     let dep_info_loc = fingerprint::dep_info_loc(build_runner, unit);
+    // if !dep_info_loc.exists() {
+    //     paths::create_dir_all(&dep_info_loc.parent().unwrap()).unwrap();
+    // }
 
     let mut output_options = OutputOptions::for_dirty(build_runner, unit);
     let package_id = unit.pkg.package_id();
@@ -335,6 +353,7 @@ fn rustc(
         .get_cwd()
         .unwrap_or_else(|| build_runner.bcx.gctx.cwd())
         .to_path_buf();
+    let is_cacheable = unit.is_cacheable();
     let fingerprint_dir = build_runner.files().fingerprint_dir(unit);
     let script_metadatas = build_runner.find_build_script_metadatas(unit);
     let is_local = unit.is_local();
@@ -432,7 +451,11 @@ fn rustc(
         }
 
         state.running(&rustc);
-        let timestamp = paths::set_invocation_time(&fingerprint_dir)?;
+        let timestamp = if !is_cacheable {
+            Some(paths::set_invocation_time(&fingerprint_dir)?)
+        } else {
+            None
+        };
         for file in sbom_files {
             tracing::debug!("writing sbom to {}", file.display());
             let outfile = BufWriter::new(paths::create(&file)?);
@@ -503,6 +526,9 @@ fn rustc(
         debug_assert_eq!(output_options.errors_seen, 0);
 
         if rustc_dep_info_loc.exists() {
+            if !dep_info_loc.parent().unwrap().exists() {
+                paths::create_dir_all(&dep_info_loc.parent().unwrap()).unwrap();
+            }
             fingerprint::translate_dep_info(
                 &rustc_dep_info_loc,
                 &dep_info_loc,
@@ -522,7 +548,9 @@ fn rustc(
             })?;
             // This mtime shift allows Cargo to detect if a source file was
             // modified in the middle of the build.
-            paths::set_file_time_no_err(dep_info_loc, timestamp);
+            if let Some(timestamp) = timestamp {
+                paths::set_file_time_no_err(dep_info_loc, timestamp);
+            }
         }
 
         // This mtime shift for .rmeta is a workaround as rustc incremental build
@@ -540,7 +568,9 @@ fn rustc(
         //    However the check is a no-op (input has no change), so stuck.
         if mode.is_check() {
             for output in outputs.iter() {
-                paths::set_file_time_no_err(&output.path, timestamp);
+                if let Some(timestamp) = timestamp {
+                    paths::set_file_time_no_err(&output.path, timestamp);
+                }
             }
         }
 

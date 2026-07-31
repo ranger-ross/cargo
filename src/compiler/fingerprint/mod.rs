@@ -466,6 +466,13 @@ pub fn prepare_target(
 
     debug!("fingerprint at: {}", loc.display());
 
+    if unit.is_cacheable() {
+        if loc.exists() {
+            // Build cache units are immutable so if it exists, its fresh.
+            return Ok(Job::new_fresh());
+        }
+    }
+
     // Figure out if this unit is up to date. After calculating the fingerprint
     // compare it to an old version, if any, and attempt to print diagnostic
     // information about failed comparisons to aid in debugging.
@@ -1581,7 +1588,13 @@ fn calculate_normal(
         let deps = Vec::from(build_runner.unit_deps(unit));
         let mut deps = deps
             .into_iter()
-            .filter(|dep| !dep.unit.target.is_bin() || dep.unit.artifact.is_true())
+            .filter(|dep| {
+                if dep.unit.is_cacheable() {
+                    return false;
+                }
+
+                !dep.unit.target.is_bin() || dep.unit.artifact.is_true()
+            })
             .map(|dep| DepFingerprint::new(build_runner, unit, &dep))
             .collect::<CargoResult<Vec<_>>>()?;
         deps.sort_by(|a, b| a.pkg_id.cmp(&b.pkg_id));
@@ -1953,6 +1966,13 @@ fn local_fingerprints_deps(
 /// and logs detailed JSON information to `<loc>.json`.
 fn write_fingerprint(loc: &Path, fingerprint: &Fingerprint) -> CargoResult<()> {
     debug_assert_ne!(fingerprint.rustc, 0);
+
+    // FIXME: There is probably a smart (and faster) way to do this.
+    //        This is quick and dirty for a prototype
+    if !loc.exists() {
+        paths::create_dir_all(&loc.parent().unwrap())?;
+    }
+
     // fingerprint::new().rustc == 0, make sure it doesn't make it to the file system.
     // This is mostly so outside tools can reliably find out what rust version this file is for,
     // as we can use the full hash.
@@ -1974,7 +1994,7 @@ pub fn prepare_init(build_runner: &mut BuildRunner<'_, '_>, unit: &Unit) -> Carg
     let new1 = build_runner.files().fingerprint_dir(unit);
 
     // Doc tests have no output, thus no fingerprint.
-    if !new1.exists() && !unit.mode.is_doc_test() {
+    if !new1.exists() && !unit.mode.is_doc_test() && !unit.is_cacheable() {
         paths::create_dir_all(&new1)?;
     }
 

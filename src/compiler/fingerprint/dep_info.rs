@@ -378,6 +378,7 @@ pub fn translate_dep_info(
             checksum_info.map(|(len, checksum)| (len, checksum.to_string())),
         ));
     }
+    println!("DI2={cargo_dep_info:?}");
     paths::write(cargo_dep_info, on_disk_info.serialize()?)?;
     Ok(())
 }
@@ -476,6 +477,7 @@ pub fn parse_dep_info(
     build_root: &Path,
     dep_info: &Path,
 ) -> CargoResult<Option<RustcDepInfo>> {
+    println!("DI={dep_info:?}");
     let Ok(data) = paths::read_bytes(dep_info) else {
         return Ok(None);
     };

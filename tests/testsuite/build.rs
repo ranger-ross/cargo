@@ -4662,8 +4662,8 @@ WRAPPER CALLED: rustc --crate-name foo [..]
     p.cargo("build -v")
         .env("RUSTC_WORKSPACE_WRAPPER", &relative_path)
         .with_stderr_data(str![[r#"
-[COMPILING] bar v1.0.0
-[RUNNING] `rustc --crate-name bar [..]`
+[FRESH] bar v1.0.0
+WRAPPER CALLED: rustc --crate-name bar --edition=2015 [ROOT]/home/.cargo/registry/src/-[HASH]/bar-1.0.0/src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --diagnostic-width=400 --crate-type lib --emit=dep-info,metadata,link -C embed-bitcode=no -C debuginfo=2 --check-cfg cfg(docsrs,test) --check-cfg cfg(feature, values()) -C metadata=a3cce8cf56b93fe3 -C extra-filename=-f4a8fd561c29b4bd --out-dir [ROOT]/home/.cargo/build-cache/bar/[HASH]/out --cap-lints allow
 [COMPILING] foo v0.1.0 ([ROOT]/foo)
 [RUNNING] `[ROOT]/foo/./rustc-echo-wrapper[EXE] rustc --crate-name foo [..]`
 WRAPPER CALLED: rustc --crate-name foo [..]
@@ -4683,12 +4683,11 @@ WRAPPER CALLED: rustc --crate-name foo [..]
     );
     p.cargo("build -v")
         .with_stderr_data(str![[r#"
-[COMPILING] bar v1.0.0
-[RUNNING] `[ROOT]/foo/./rustc-echo-wrapper[EXE] rustc --crate-name bar [..]`
-WRAPPER CALLED: rustc --crate-name bar [..]
+[FRESH] bar v1.0.0
+WRAPPER CALLED: rustc --crate-name bar --edition=2015 [ROOT]/home/.cargo/registry/src/-[HASH]/bar-1.0.0/src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --diagnostic-width=400 --crate-type lib --emit=dep-info,metadata,link -C embed-bitcode=no -C debuginfo=2 --check-cfg cfg(docsrs,test) --check-cfg cfg(feature, values()) -C metadata=a3cce8cf56b93fe3 -C extra-filename=-f4a8fd561c29b4bd --out-dir [ROOT]/home/.cargo/build-cache/bar/[HASH]/out --cap-lints allow
 [COMPILING] foo v0.1.0 ([ROOT]/foo)
-[RUNNING] `[ROOT]/foo/./rustc-echo-wrapper[EXE] rustc --crate-name foo [..]`
-WRAPPER CALLED: rustc --crate-name foo [..]
+[RUNNING] `[ROOT]/foo/./rustc-echo-wrapper[EXE] rustc --crate-name foo --edition=2015 src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --diagnostic-width=400 --crate-type lib --emit=dep-info,metadata,link -C embed-bitcode=no -C debuginfo=2 --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values())' -C metadata=f8c0fd84a48822e1 -C extra-filename=-14c4318ac56c4d62 --out-dir [ROOT]/foo/target/debug/build/foo/[HASH]/out -L dependency=[ROOT]/home/.cargo/build-cache/bar/[HASH]/out --extern bar=[ROOT]/home/.cargo/build-cache/bar/[HASH]/out/libbar-[HASH].rmeta`
+WRAPPER CALLED: rustc --crate-name foo --edition=2015 src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --diagnostic-width=400 --crate-type lib --emit=dep-info,metadata,link -C embed-bitcode=no -C debuginfo=2 --check-cfg cfg(docsrs,test) --check-cfg cfg(feature, values()) -C metadata=f8c0fd84a48822e1 -C extra-filename=-14c4318ac56c4d62 --out-dir [ROOT]/foo/target/debug/build/foo/[HASH]/out -L dependency=[ROOT]/home/.cargo/build-cache/bar/[HASH]/out --extern bar=[ROOT]/home/.cargo/build-cache/bar/[HASH]/out/libbar-[HASH].rmeta
 [FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
 
 "#]])

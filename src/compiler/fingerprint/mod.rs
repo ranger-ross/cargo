@@ -466,12 +466,20 @@ pub fn prepare_target(
 
     debug!("fingerprint at: {}", loc.display());
 
-    if unit.is_cacheable() {
-        if loc.exists() {
-            // Build cache units are immutable so if it exists, its fresh.
-            return Ok(Job::new_fresh());
-        }
-    }
+    // Cacheable units use the normal fingerprint comparison (hash match plus
+    // filesystem status). The hash match catches identity changes that are not
+    // part of the unit hash (e.g. a git revision, which appears in the
+    // checkout directory path and surfaces as `PathToSourceChanged`); the
+    // filesystem-status check catches changes to *non-cacheable*
+    // dependencies, most notably path patches of registry crates, whose
+    // mtimes are not reflected in any hash. The artifacts stay effectively
+    // immutable: nothing rebuilds them unless one of these conditions fires.
+    //
+    // Note that the fingerprint *content* (and thus a fresh cache hit) is
+    // stable across byte-identical rebuilds of the same unit by another
+    // workspace, but such a rebuild updates the artifact mtimes, which the
+    // filesystem-status check propagates as a (correct, conservative)
+    // relink/rebuild of dependents.
 
     // Figure out if this unit is up to date. After calculating the fingerprint
     // compare it to an old version, if any, and attempt to print diagnostic
@@ -1584,15 +1592,19 @@ fn calculate_normal(
         // built. The only exception here are artifact dependencies,
         // which is an actual dependency that needs a recompile.
         //
+        // Note: cacheable dependencies ARE included here. Even though their own
+        // freshness is determined by fingerprint-file existence in the build
+        // cache (they are immutable), their dependents still need to know when
+        // the dependency *identity* changes (e.g. a git dependency moving to a
+        // new revision, which produces a new build unit). That change must
+        // propagate as dirtiness to non-cacheable dependents such as binaries
+        // and build scripts.
+        //
         // Create Vec since mutable build_runner is needed in closure.
         let deps = Vec::from(build_runner.unit_deps(unit));
         let mut deps = deps
             .into_iter()
             .filter(|dep| {
-                if dep.unit.is_cacheable() {
-                    return false;
-                }
-
                 !dep.unit.target.is_bin() || dep.unit.artifact.is_true()
             })
             .map(|dep| DepFingerprint::new(build_runner, unit, &dep))
@@ -1616,7 +1628,21 @@ fn calculate_normal(
         vec![LocalFingerprint::Precalculated(fingerprint)]
     } else {
         let dep_info = dep_info_loc(build_runner, unit);
-        let dep_info = dep_info.strip_prefix(&build_root).unwrap().to_path_buf();
+        let dep_info = if build_runner.files().is_cacheable(unit) {
+            // The dep-info for a cacheable unit lives in the build cache, not
+            // under the workspace build root, so it cannot be encoded relative
+            // to it. Store the absolute path: `find_stale_item` joins it with
+            // the build root, which is a no-op for absolute paths. This is
+            // acceptable because the fingerprint itself lives in the build
+            // cache and is therefore not portable between machines anyway.
+            // Keeping `CheckDepInfo` (rather than a precalculated value)
+            // preserves the dep-info's environment-variable tracking (used by
+            // `-Zrustdoc-depinfo` and `-Zbinary-dep-depinfo`) and any source
+            // mtime checking.
+            dep_info
+        } else {
+            dep_info.strip_prefix(&build_root).unwrap().to_path_buf()
+        };
         vec![LocalFingerprint::CheckDepInfo {
             dep_info,
             checksum: build_runner.bcx.gctx.cli_unstable().checksum_freshness,
@@ -1767,6 +1793,8 @@ See https://doc.rust-lang.org/cargo/reference/build-scripts.html#rerun-if-change
         // Create Vec since mutable build_runner is needed in closure.
         let deps = Vec::from(build_runner.unit_deps(unit));
         deps.into_iter()
+            // Cacheable dependencies are included so that a dependency identity
+            // change (e.g. a new git revision) re-runs the build script.
             .map(|dep| DepFingerprint::new(build_runner, unit, &dep))
             .collect::<CargoResult<Vec<_>>>()?
     };
@@ -1994,11 +2022,39 @@ pub fn prepare_init(build_runner: &mut BuildRunner<'_, '_>, unit: &Unit) -> Carg
     let new1 = build_runner.files().fingerprint_dir(unit);
 
     // Doc tests have no output, thus no fingerprint.
-    if !new1.exists() && !unit.mode.is_doc_test() && !unit.is_cacheable() {
+    if !new1.exists() && !unit.mode.is_doc_test() {
         paths::create_dir_all(&new1)?;
     }
 
     Ok(())
+}
+
+/// The state needed by the build cache's coordination protocol to decide
+/// whether a cached unit is complete *for this unit's identity and filesystem
+/// state*.
+pub(crate) struct CacheCompletionState {
+    /// Hex fingerprint hash this unit would persist. The stored fingerprint
+    /// file encodes identity information (e.g. the git revision) beyond what
+    /// the unit hash captures, so completion is checked by comparing file
+    /// content rather than mere existence.
+    pub(crate) hash: String,
+    /// Whether the fingerprint's filesystem-status was up-to-date when it was
+    /// computed. This catches changes to *non-cacheable* dependencies (such
+    /// as path patches of registry crates) whose mtimes are not reflected in
+    /// any hash.
+    pub(crate) fs_up_to_date: bool,
+}
+
+/// Returns the fingerprint state a cacheable `unit` would persist.
+pub(crate) fn cache_completion_state(
+    build_runner: &mut BuildRunner<'_, '_>,
+    unit: &Unit,
+) -> CargoResult<CacheCompletionState> {
+    let fingerprint = calculate(build_runner, unit)?;
+    Ok(CacheCompletionState {
+        hash: util::to_hex(fingerprint.hash_u64()),
+        fs_up_to_date: fingerprint.fs_status.up_to_date(),
+    })
 }
 
 /// Returns the location that the dep-info file will show up at

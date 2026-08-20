@@ -418,7 +418,7 @@ fn clean_git() {
     p.cargo("build").run();
     p.cargo("clean -p dep")
         .with_stderr_data(str![[r#"
-[REMOVED] [FILE_NUM] files, [FILE_SIZE]B total
+[REMOVED] 0 files
 
 "#]])
         .run();
@@ -449,7 +449,7 @@ fn registry() {
     p.cargo("build").run();
     p.cargo("clean -p bar")
         .with_stderr_data(str![[r#"
-[REMOVED] [FILE_NUM] files, [FILE_SIZE]B total
+[REMOVED] 0 files
 
 "#]])
         .run();
@@ -479,8 +479,7 @@ fn clean_verbose() {
     p.cargo("build").run();
     p.cargo("clean -p bar --verbose")
         .with_stderr_data(str![[r#"
-[REMOVING] [ROOT]/foo/target/debug/build/bar
-[REMOVED] [FILE_NUM] files, [FILE_SIZE]B total
+[REMOVED] 0 files
 
 "#]])
         .run();
@@ -680,7 +679,7 @@ fn clean_spec_version() {
     p.cargo("clean -p bar:0.1.0")
         .with_stderr_data(str![[r#"
 [WARNING] version qualifier in `-p bar:0.1.0` is ignored, cleaning all versions of `bar` found
-[REMOVED] [FILE_NUM] files, [FILE_SIZE]B total
+[REMOVED] 0 files
 
 "#]])
         .run();
@@ -735,7 +734,7 @@ fn clean_spec_partial_version() {
     p.cargo("clean -p bar:0.1")
         .with_stderr_data(str![[r#"
 [WARNING] version qualifier in `-p bar:0.1` is ignored, cleaning all versions of `bar` found
-[REMOVED] [FILE_NUM] files, [FILE_SIZE]B total
+[REMOVED] 0 files
 
 "#]])
         .run();
@@ -790,7 +789,7 @@ fn clean_spec_partial_version_ambiguous() {
     p.cargo("clean -p bar:0")
         .with_stderr_data(str![[r#"
 [WARNING] version qualifier in `-p bar:0` is ignored, cleaning all versions of `bar` found
-[REMOVED] [FILE_NUM] files, [FILE_SIZE]B total
+[REMOVED] 0 files
 
 "#]])
         .run();

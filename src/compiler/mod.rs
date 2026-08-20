@@ -32,6 +32,7 @@ pub mod artifact;
 mod build_config;
 pub(crate) mod build_context;
 pub(crate) mod build_runner;
+mod cache;
 mod compilation;
 mod compile_kind;
 mod crate_type;
@@ -215,11 +216,23 @@ fn compile<'gctx>(
         } else {
             let force = exec.force_rebuild(unit) || force_rebuild;
             let mut job = fingerprint::prepare_target(build_runner, unit, force)?;
+            // Cacheable units that are dirty (missing or stale in the build
+            // cache) are coordinated through the per-unit state locks: exactly
+            // one process compiles them, others observe the progress and reuse
+            // the result.
+            let cache = if build_runner.files().is_cacheable(unit)
+                && job.freshness().is_dirty()
+            {
+                let completion = fingerprint::cache_completion_state(build_runner, unit)?;
+                Some(cache::CacheCoordination::new(build_runner, unit, completion)?)
+            } else {
+                None
+            };
             job.before(if job.freshness().is_dirty() {
                 let work = if unit.mode.is_doc() || unit.mode.is_doc_scrape() {
                     rustdoc(build_runner, unit)?
                 } else {
-                    rustc(build_runner, unit, exec)?
+                    rustc(build_runner, unit, exec, cache.clone())?
                 };
                 work.then(link_targets(build_runner, unit, false)?)
             } else {
@@ -235,21 +248,12 @@ fn compile<'gctx>(
                 // Need to link targets on both the dirty and fresh.
                 work.then(link_targets(build_runner, unit, true)?)
             });
-
-            // FIXME: This does not work as it creates a race condition for the .rmeta location in
-            //        pipelined builds.
-            // if unit.is_cacheable() {
-            //     let build_dir_location = build_runner.files().build_unit(unit);
-            //     let build_cache_location = build_runner.files().cached_build_unit(unit);
-            //     if !build_cache_location.exists() {
-            //         job.after(Work::new(move |_state| {
-            //             create_dir_all(build_cache_location.parent().unwrap())?;
-            //             move_directory(&build_dir_location, &build_cache_location)?;
-            //
-            //             Ok(())
-            //         }));
-            //     }
-            // }
+            if let Some(cache) = &cache {
+                // Runs after the fingerprint is written, so that waiters
+                // acquiring the rlib lock shared always observe the completed
+                // fingerprint.
+                job.after(cache::CacheCoordination::after_work(cache));
+            }
 
             // If -Zfine-grain-locking is enabled, we wrap the job with an upgrade to exclusive
             // lock before starting, then downgrade to a shared lock after the job is finished.
@@ -304,10 +308,15 @@ fn make_failed_scrape_diagnostic(
 }
 
 /// Creates a unit of work invoking `rustc` for building the `unit`.
+///
+/// `cache` carries the build-cache coordination state for cacheable units; for
+/// such units the returned work first runs the coordination protocol (possibly
+/// waiting on or taking over from another Cargo process) before compiling.
 fn rustc(
     build_runner: &mut BuildRunner<'_, '_>,
     unit: &Unit,
     exec: &Arc<dyn Executor>,
+    cache: Option<Arc<cache::CacheCoordination>>,
 ) -> CargoResult<Work> {
     let mut rustc = prepare_rustc(build_runner, unit)?;
 
@@ -353,7 +362,7 @@ fn rustc(
         .get_cwd()
         .unwrap_or_else(|| build_runner.bcx.gctx.cwd())
         .to_path_buf();
-    let is_cacheable = unit.is_cacheable();
+    let is_cacheable = build_runner.files().is_cacheable(unit);
     let fingerprint_dir = build_runner.files().fingerprint_dir(unit);
     let script_metadatas = build_runner.find_build_script_metadatas(unit);
     let is_local = unit.is_local();
@@ -394,10 +403,19 @@ fn rustc(
     }
     let env_config = Arc::clone(build_runner.bcx.gctx.env_config()?);
     return Ok(Work::new(move |state| {
+        // Cacheable units are coordinated through the build cache's per-unit
+        // state locks: if another process is (or already did) build this unit,
+        // there is nothing for us to compile.
+        if let Some(cache) = &cache {
+            if !cache.coordinate(state)? {
+                return Ok(());
+            }
+        }
+
         // Artifacts are in a different location than typical units,
         // hence we must assure the crate- and target-dependent
         // directory is present.
-        if artifact.is_true() {
+        if artifact.is_true() || is_cacheable {
             paths::create_dir_all(&root)?;
         }
 
@@ -469,6 +487,14 @@ fn rustc(
             }
         }
 
+        // When rustc reports the `.rmeta` artifact, a cacheable unit's rmeta
+        // lock is downgraded to shared (before signaling `rmeta_produced`) so
+        // other Cargo processes can start pipelined compilation against the
+        // metadata while this process still codegens.
+        let on_rmeta: Option<&dyn Fn() -> CargoResult<()>> = match &cache {
+            Some(cache) => Some(&|| cache.downgrade_rmeta(state)),
+            None => None,
+        };
         let result = exec
             .exec(
                 &rustc,
@@ -484,6 +510,7 @@ fn rustc(
                         &manifest,
                         &target,
                         &mut output_options,
+                        on_rmeta,
                     )
                 },
             )
@@ -1138,6 +1165,7 @@ fn rustdoc(build_runner: &mut BuildRunner<'_, '_>, unit: &Unit) -> CargoResult<W
                         &manifest,
                         &target,
                         &mut output_options,
+                        None,
                     )
                 },
                 false,
@@ -2083,8 +2111,9 @@ fn on_stderr_line(
     manifest: &ManifestErrorContext,
     target: &Target,
     options: &mut OutputOptions,
+    on_rmeta: Option<&dyn Fn() -> CargoResult<()>>,
 ) -> CargoResult<()> {
-    if on_stderr_line_inner(state, line, package_id, manifest, target, options)? {
+    if on_stderr_line_inner(state, line, package_id, manifest, target, options, on_rmeta)? {
         // Check if caching is enabled.
         if let Some((path, cell)) = &mut options.cache_cell {
             // Cache the output, which will be replayed later when Fresh.
@@ -2105,6 +2134,7 @@ fn on_stderr_line_inner(
     manifest: &ManifestErrorContext,
     target: &Target,
     options: &mut OutputOptions,
+    on_rmeta: Option<&dyn Fn() -> CargoResult<()>>,
 ) -> CargoResult<bool> {
     // We primarily want to use this function to process JSON messages from
     // rustc. The compiler should always print one JSON message per line, and
@@ -2343,6 +2373,9 @@ fn on_stderr_line_inner(
         trace!("found directive from rustc: `{}`", artifact.artifact);
         if artifact.artifact.ends_with(".rmeta") {
             debug!("looks like metadata finished early!");
+            if let Some(on_rmeta) = on_rmeta {
+                on_rmeta()?;
+            }
             state.rmeta_produced();
         }
         return Ok(false);
@@ -2574,6 +2607,7 @@ fn replay_output_cache(
                 &manifest,
                 &target,
                 &mut output_options,
+                None,
             )?;
             line.clear();
         }

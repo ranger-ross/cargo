@@ -51,7 +51,6 @@ fn depend_on_alt_registry() {
     // Don't download a second time
     p.cargo("check")
         .with_stderr_data(str![[r#"
-[CHECKING] bar v0.0.1 (registry `alternative`)
 [CHECKING] foo v0.0.1 ([ROOT]/foo)
 [FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
 

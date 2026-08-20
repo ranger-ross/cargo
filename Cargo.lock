@@ -423,6 +423,7 @@ dependencies = [
  "openssl",
  "openssl-src",
  "os_info",
+ "parking_lot",
  "pasetors",
  "pathdiff",
  "portable-atomic",

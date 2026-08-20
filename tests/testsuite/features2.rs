@@ -2260,10 +2260,6 @@ fn minimal_download() {
 [DOWNLOADED] normal v1.0.0 (registry `dummy-registry`)
 [DOWNLOADED] build_dep_pm v1.0.0 (registry `dummy-registry`)
 [DOWNLOADED] build_dep v1.0.0 (registry `dummy-registry`)
-[COMPILING] build_dep_pm v1.0.0
-[COMPILING] build_dep v1.0.0
-[CHECKING] normal_pm v1.0.0
-[CHECKING] normal v1.0.0
 [COMPILING] foo v0.1.0 ([ROOT]/foo)
 [FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
 
@@ -2284,8 +2280,6 @@ fn minimal_download() {
 [DOWNLOADED] dev_dep v1.0.0 (registry `dummy-registry`)
 [DOWNLOADED] build_dep_pm v1.0.0 (registry `dummy-registry`)
 [DOWNLOADED] build_dep v1.0.0 (registry `dummy-registry`)
-[COMPILING] build_dep_pm v1.0.0
-[COMPILING] build_dep v1.0.0
 [COMPILING] normal_pm v1.0.0
 [COMPILING] normal v1.0.0
 [COMPILING] dev_dep v1.0.0

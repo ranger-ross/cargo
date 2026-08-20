@@ -10,7 +10,7 @@ use crate::prelude::*;
 use cargo_test_support::assert_deps_contains;
 use cargo_test_support::registry::Package;
 use cargo_test_support::{
-    basic_lib_manifest, basic_manifest, project, rustc_host, rustc_host_env, str,
+    basic_lib_manifest, basic_manifest, paths, project, rustc_host, rustc_host_env, str,
 };
 
 use super::death;
@@ -187,7 +187,10 @@ fn binary_depinfo_correctly_encoded() {
             (1, &format!("{}/debug/build/bar/*/out/libbar-*.rlib", host)),
             (
                 1,
-                &format!("{}/debug/build/regdep/*/out/libregdep-*.rlib", host),
+                &paths::cargo_home()
+                    .join("build-cache/regdep/*/out/libregdep-*.rlib")
+                    .to_str()
+                    .unwrap(),
             ),
         ],
     );

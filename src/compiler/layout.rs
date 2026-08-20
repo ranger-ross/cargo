@@ -221,6 +221,11 @@ pub struct Layout {
     artifact_dir: Option<ArtifactDirLayout>,
     build_dir: BuildDirLayout,
     build_cache: BuildCacheLayout,
+    /// Whether the build cache is usable for this build. This is `false` when
+    /// `$CARGO_HOME/build-cache` cannot be written (e.g. a read-only
+    /// `CARGO_HOME`), in which case cacheable units fall back to the workspace
+    /// build directory.
+    cache_enabled: bool,
     _lock: Option<FileLock>,
 }
 
@@ -317,6 +322,24 @@ impl Layout {
         } else {
             None
         };
+        let build_cache_root = ws.gctx().home().join("build-cache").into_path_unlocked();
+        let cache_enabled = match paths::create_dir_all(&build_cache_root) {
+            Ok(()) => true,
+            Err(e)
+                if e.downcast_ref::<std::io::Error>()
+                    .is_some_and(|e| e.kind() == std::io::ErrorKind::PermissionDenied) =>
+            {
+                // A read-only `$CARGO_HOME` (e.g. a read-only registry cache
+                // setup) must not break the build; just disable the cache.
+                tracing::debug!(
+                    "build cache disabled: cannot create {:?}: {e:?}",
+                    build_cache_root
+                );
+                false
+            }
+            Err(e) => return Err(e.into()),
+        };
+
         Ok(Layout {
             artifact_dir,
             build_dir: BuildDirLayout {
@@ -332,8 +355,9 @@ impl Layout {
                 is_new_layout,
             },
             build_cache: BuildCacheLayout {
-                root: ws.gctx().home().join("build-cache").into_path_unlocked(),
+                root: build_cache_root,
             },
+            cache_enabled,
             _lock: lock,
         })
     }
@@ -358,6 +382,12 @@ impl Layout {
 
     pub fn build_cache(&self) -> &BuildCacheLayout {
         &self.build_cache
+    }
+
+    /// Returns whether the cross-workspace build cache is usable for this
+    /// build (i.e. `$CARGO_HOME/build-cache` is writable).
+    pub fn cache_enabled(&self) -> bool {
+        self.cache_enabled
     }
 }
 
@@ -537,6 +567,14 @@ impl BuildCacheLayout {
     /// Fetch the output path for build units.
     pub fn out(&self, pkg_dir: &str) -> PathBuf {
         self.build_unit(pkg_dir).join("out")
+    }
+    /// Fetch the incremental path for a build unit.
+    ///
+    /// Incremental data is stored per build unit (rather than per profile as
+    /// in the workspace build dir) so that concurrent Cargo processes never
+    /// share incremental state; the per-unit locks cover this directory.
+    pub fn incremental(&self, pkg_dir: &str) -> PathBuf {
+        self.build_unit(pkg_dir).join("incremental")
     }
     /// Fetch the build unit path
     pub fn build_unit(&self, pkg_dir: &str) -> PathBuf {

@@ -225,7 +225,6 @@ fn optional_cli_syntax() {
     // Builds bar.
     p.cargo("check --features bar?/feat,bar")
         .with_stderr_data(str![[r#"
-[CHECKING] bar v1.0.0
 [CHECKING] foo v0.1.0 ([ROOT]/foo)
 [FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
 

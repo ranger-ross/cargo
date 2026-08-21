@@ -27,6 +27,58 @@ pub(crate) use self::imp::try_lock_exclusive;
 pub(crate) use self::imp::try_lock_shared;
 pub(crate) use self::imp::unlock;
 
+/// Attempts to take a shared lock on an already-open file, without printing
+/// any "Blocking" message.
+///
+/// Returns `Ok(true)` if the lock was acquired, `Ok(false)` if the lock is
+/// currently held exclusively by another process, and `Err` for real I/O
+/// failures. Like [`try_acquire`], NFS mounts and filesystems that do not
+/// support file locking are treated as always-acquirable.
+pub(crate) fn try_lock_shared_simple(path: &Path, f: &File) -> CargoResult<bool> {
+    try_acquire(path, &|| imp::try_lock_shared(f))
+}
+
+/// Non-blocking exclusive lock attempt on an already-open file.
+///
+/// Returns `Ok(true)` if the lock was acquired, `Ok(false)` if it is currently
+/// held by another process, and `Err` for real I/O failures. NFS mounts and
+/// filesystems without locking support are treated as always-acquirable.
+pub(crate) fn try_lock_exclusive_simple(path: &Path, f: &File) -> CargoResult<bool> {
+    try_acquire(path, &|| imp::try_lock_exclusive(f))
+}
+
+/// Opens (creating the file and parent directories as needed) and takes a
+/// shared lock on `path`, without printing a "Blocking" message.
+///
+/// Used for the build cache's per-unit state locks, which are acquired from
+/// worker threads that have no shell access. A blocking shared lock is only
+/// attempted after a non-blocking attempt failed with real contention.
+pub(crate) fn open_ro_shared_no_msg(path: &Path) -> CargoResult<FileLock> {
+    let mut opts = OpenOptions::new();
+    opts.read(true).write(true).create(true);
+    let f = opts
+        .open(path)
+        .or_else(|e| {
+            // A NotFound error is likely due to missing intermediate
+            // directories. Try creating them and try again.
+            if e.kind() == io::ErrorKind::NotFound {
+                paths::create_dir_all(path.parent().unwrap())?;
+                Ok(opts.open(path)?)
+            } else {
+                Err(anyhow::Error::from(e))
+            }
+        })
+        .with_context(|| format!("failed to open: {}", path.display()))?;
+    if !try_acquire(path, &|| imp::try_lock_shared(&f))? {
+        imp::lock_shared(&f)
+            .with_context(|| format!("failed to lock file: {}", path.display()))?;
+    }
+    Ok(FileLock {
+        f: Some(f),
+        path: path.to_path_buf(),
+    })
+}
+
 /// A locked file.
 ///
 /// This provides access to file while holding a lock on the file. This type

@@ -731,20 +731,12 @@ fn cargo_clean_should_remove_correct_files() {
 [ROOT]/foo/build-dir/.rustc_info.json
 [ROOT]/foo/build-dir/CACHEDIR.TAG
 [ROOT]/foo/build-dir/debug/.cargo-build-lock
-[ROOT]/foo/build-dir/debug/build/bar/[HASH]/out/bar-[HASH].d
-[ROOT]/foo/build-dir/debug/build/bar/[HASH]/out/libbar-[HASH].rlib
-[ROOT]/foo/build-dir/debug/build/bar/[HASH]/out/libbar-[HASH].rmeta
-[ROOT]/foo/build-dir/debug/build/bar/[HASH]/fingerprint/dep-lib-bar
-[ROOT]/foo/build-dir/debug/build/bar/[HASH]/fingerprint/invoked.timestamp
-[ROOT]/foo/build-dir/debug/build/bar/[HASH]/fingerprint/lib-bar
-[ROOT]/foo/build-dir/debug/build/bar/[HASH]/fingerprint/lib-bar.json
 [ROOT]/foo/build-dir/debug/build/foo/[HASH]/out/foo[..][EXE]
 [ROOT]/foo/build-dir/debug/build/foo/[HASH]/out/foo[..].d
 [ROOT]/foo/build-dir/debug/build/foo/[HASH]/fingerprint/bin-foo
 [ROOT]/foo/build-dir/debug/build/foo/[HASH]/fingerprint/bin-foo.json
 [ROOT]/foo/build-dir/debug/build/foo/[HASH]/fingerprint/dep-bin-foo
 [ROOT]/foo/build-dir/debug/build/foo/[HASH]/fingerprint/invoked.timestamp
-[ROOT]/foo/build-dir/debug/build/bar/[HASH]/.lock
 [ROOT]/foo/build-dir/debug/build/foo/[HASH]/.lock
 
 "#]]);

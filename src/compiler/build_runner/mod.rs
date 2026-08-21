@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::compiler::compilation::{self, UnitOutput};
 use crate::compiler::locking::LockManager;
-use crate::compiler::{self, Unit, UserIntent, artifact};
+use crate::compiler::{self, Unit, UnitIndex, UserIntent, artifact};
 use crate::util::cache_lock::CacheLockMode;
 use crate::util::errors::CargoResult;
 use crate::workspace::PackageId;
@@ -94,6 +94,11 @@ pub struct BuildRunner<'a, 'gctx> {
 
     /// Manages locks for build units when fine grain locking is enabled.
     pub lock_manager: Arc<LockManager>,
+
+    /// Indices of units built into the cross-workspace build cache; the
+    /// freshness mtime chain must ignore these dependencies (see
+    /// `Fingerprint::check_filesystem`).
+    pub cacheable_unit_indices: HashSet<UnitIndex>,
 }
 
 impl<'a, 'gctx> BuildRunner<'a, 'gctx> {
@@ -135,6 +140,7 @@ impl<'a, 'gctx> BuildRunner<'a, 'gctx> {
             failed_scrape_units: Arc::new(Mutex::new(HashSet::default())),
             unused_dep_state: UnusedDepState::new(bcx),
             lock_manager: Arc::new(LockManager::new()),
+            cacheable_unit_indices: HashSet::default(),
         })
     }
 
@@ -456,6 +462,19 @@ impl<'a, 'gctx> BuildRunner<'a, 'gctx> {
         self.record_units_requiring_metadata();
 
         let files = CompilationFiles::new(self, host_layout, targets);
+        // Indices of units built into the cross-workspace build cache. The
+        // freshness mtime chain must ignore these dependencies: their cache
+        // artifacts are immutable, and their (normalized) fingerprint content
+        // is authoritative, so a newer mtime only means the shared cache entry
+        // was written after this unit last built — not that the dependency
+        // changed (see `Fingerprint::check_filesystem`).
+        self.cacheable_unit_indices = self
+            .bcx
+            .unit_to_index
+            .iter()
+            .filter(|(unit, _)| files.is_cacheable(unit))
+            .map(|(_, &index)| index)
+            .collect();
         self.files = Some(files);
         Ok(())
     }

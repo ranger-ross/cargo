@@ -254,6 +254,9 @@ fn relative_depinfo_paths_ws() {
         .build();
 
     let host = rustc_host();
+    // Cacheable registry dependencies are built into the build cache, so
+    // their paths in dep-info files are absolute cache paths.
+    let cache = paths::cargo_home().join("build-cache");
     p.cargo("build -Z binary-dep-depinfo --target")
         .arg(&host)
         .masquerade_as_nightly_cargo(&["binary-dep-depinfo"])
@@ -269,7 +272,10 @@ fn relative_depinfo_paths_ws() {
         "target/debug/build/pm/*/fingerprint/dep-lib-pm",
         &[
             (0, "src/lib.rs"),
-            (1, "debug/build/pmdep/*/out/libpmdep-*.rlib"),
+            (
+                1,
+                &cache.join("pmdep/*/out/libpmdep-*.rlib").to_str().unwrap(),
+            ),
         ],
     );
 
@@ -289,7 +295,7 @@ fn relative_depinfo_paths_ws() {
             (1, &format!("{}/debug/build/bar/*/out/libbar-*.rlib", host)),
             (
                 1,
-                &format!("{}/debug/build/regdep/*/out/libregdep-*.rlib", host),
+                &cache.join("regdep/*/out/libregdep-*.rlib").to_str().unwrap(),
             ),
         ],
     );
@@ -299,7 +305,7 @@ fn relative_depinfo_paths_ws() {
         "target/debug/build/foo/*/fingerprint/dep-build-script-build-script-build",
         &[
             (0, "build.rs"),
-            (1, "debug/build/bdep/*/out/libbdep-*.rlib"),
+            (1, &cache.join("bdep/*/out/libbdep-*.rlib").to_str().unwrap()),
         ],
     );
 
@@ -403,12 +409,19 @@ fn relative_depinfo_paths_no_ws() {
 "#]])
         .run();
 
+    // Cacheable registry dependencies are built into the build cache, so
+    // their paths in dep-info files are absolute cache paths.
+    let cache = paths::cargo_home().join("build-cache");
+
     assert_deps_contains(
         &p,
         "target/debug/build/pm/*/fingerprint/dep-lib-pm",
         &[
             (0, "src/lib.rs"),
-            (1, "debug/build/pmdep/*/out/libpmdep-*.rlib"),
+            (
+                1,
+                &cache.join("pmdep/*/out/libpmdep-*.rlib").to_str().unwrap(),
+            ),
         ],
     );
 
@@ -426,7 +439,7 @@ fn relative_depinfo_paths_no_ws() {
                 ),
             ),
             (1, "debug/build/bar/*/out/libbar-*.rlib"),
-            (1, "debug/build/regdep/*/out/libregdep-*.rlib"),
+            (1, &cache.join("regdep/*/out/libregdep-*.rlib").to_str().unwrap()),
         ],
     );
 
@@ -435,7 +448,7 @@ fn relative_depinfo_paths_no_ws() {
         "target/debug/build/foo/*/fingerprint/dep-build-script-build-script-build",
         &[
             (0, "build.rs"),
-            (1, "debug/build/bdep/*/out/libbdep-*.rlib"),
+            (1, &cache.join("bdep/*/out/libbdep-*.rlib").to_str().unwrap()),
         ],
     );
 
@@ -473,9 +486,12 @@ fn reg_dep_source_not_tracked() {
 
     p.cargo("check").run();
 
+    // The registry dependency is cacheable, so its dep-info lives in the
+    // build cache rather than the workspace target directory.
+    let dep_info = paths::cargo_home().join("build-cache/regdep/*/fingerprint/dep-lib-regdep");
     assert_deps(
         &p,
-        "target/debug/build/regdep/*/fingerprint/dep-lib-regdep",
+        dep_info.to_str().unwrap(),
         |info_path, entries| {
             for (kind, path) in entries {
                 if *kind == 1 {
@@ -526,7 +542,13 @@ fn canonical_path() {
         "target/debug/build/foo/*/fingerprint/dep-lib-foo",
         &[
             (0, "src/lib.rs"),
-            (1, "debug/build/regdep/*/out/libregdep-*.rmeta"),
+            (
+                1,
+                &paths::cargo_home()
+                    .join("build-cache/regdep/*/out/libregdep-*.rmeta")
+                    .to_str()
+                    .unwrap(),
+            ),
         ],
     );
 }

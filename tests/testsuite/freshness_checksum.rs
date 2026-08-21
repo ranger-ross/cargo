@@ -10,7 +10,7 @@ use crate::prelude::*;
 use cargo_test_support::assert_deps_contains;
 use cargo_test_support::registry::Package;
 use cargo_test_support::{
-    basic_lib_manifest, basic_manifest, project, rustc_host, rustc_host_env, str,
+    basic_lib_manifest, basic_manifest, paths, project, rustc_host, rustc_host_env, str,
 };
 
 use super::death;
@@ -187,7 +187,10 @@ fn binary_depinfo_correctly_encoded() {
             (1, &format!("{}/debug/build/bar/*/out/libbar-*.rlib", host)),
             (
                 1,
-                &format!("{}/debug/build/regdep/*/out/libregdep-*.rlib", host),
+                &paths::cargo_home()
+                    .join("build-cache/regdep/*/out/libregdep-*.rlib")
+                    .to_str()
+                    .unwrap(),
             ),
         ],
     );
@@ -1705,10 +1708,10 @@ fn bust_patched_dep() {
 [DIRTY] registry1 v0.1.0 ([ROOT]/foo/reg1new): file size changed (0 != 11) for `reg1new/src/lib.rs`
 [COMPILING] registry1 v0.1.0 ([ROOT]/foo/reg1new)
 [RUNNING] `rustc --crate-name registry1 [..]
-[DIRTY] registry2 v0.1.0: the dependency `registry1` was rebuilt
+[DIRTY] registry2 v0.1.0: info of dependency `registry1` changed
 [COMPILING] registry2 v0.1.0
 [RUNNING] `rustc --crate-name registry2 [..]
-[DIRTY] foo v0.0.1 ([ROOT]/foo): the dependency `registry2` was rebuilt
+[DIRTY] foo v0.0.1 ([ROOT]/foo): info of dependency `registry2` changed
 [COMPILING] foo v0.0.1 ([ROOT]/foo)
 [RUNNING] `rustc --crate-name foo [..]
 [FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s

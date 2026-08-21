@@ -5807,7 +5807,9 @@ fn workspace_with_local_deps() {
 
     p.cargo("package")
         .replace_crates_io(crates_io.index_url())
-        .with_stdout_data("")
+        .with_stdout_data(str![[r#"
+build cache: `level3` level3 is fresh (hit [ROOT]/home/.cargo/build-cache/level3/[..]
+"#]])
         .with_stderr_data(str![[r#"
 [PACKAGING] level3 v0.0.1 ([ROOT]/foo/level3)
 [PACKAGED] 4 files, [FILE_SIZE]B ([FILE_SIZE]B compressed)

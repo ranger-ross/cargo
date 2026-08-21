@@ -165,6 +165,38 @@ impl UnitInner {
         self.pkg.package_id().source_id().is_path() && !self.is_std
     }
 
+    /// Returns whether this unit is eligible for the cross-workspace build
+    /// cache (`$CARGO_HOME/build-cache`).
+    ///
+    /// Only build units whose inputs and outputs are immutable and shared
+    /// across workspaces can be cached:
+    ///
+    /// - Local (path) packages can change between builds, so their units are
+    ///   never cached.
+    /// - Packages with build scripts are excluded: their library unit is
+    ///   compiled with workspace-local `$OUT_DIR` content and environment
+    ///   variables baked in, so a cached artifact would not be usable from
+    ///   another workspace.
+    /// - Build script units themselves are excluded (they execute in the
+    ///   workspace).
+    /// - Bins, tests, benches, and examples are excluded: bins are linked
+    ///   against workspace-local state, and test/bench units only exist for
+    ///   local packages anyway.
+    /// - Doc units are excluded because rustdoc output goes into the
+    ///   workspace `doc/` directory.
+    /// - Artifact dependency units are excluded because their outputs are
+    ///   routed through a separate `artifact/<kind>` directory.
+    pub fn is_cacheable(&self) -> bool {
+        !self.is_local()
+            && !self.pkg.has_custom_build()
+            && !self.target.is_custom_build()
+            && !self.target.is_bin()
+            && !self.mode.is_doc()
+            && !self.mode.is_doc_scrape()
+            && !self.mode.is_any_test()
+            && !self.artifact.is_true()
+    }
+
     /// Returns whether or not warnings should be displayed for this unit.
     pub fn show_warnings(&self, gctx: &GlobalContext) -> bool {
         self.is_local() || gctx.extra_verbose()

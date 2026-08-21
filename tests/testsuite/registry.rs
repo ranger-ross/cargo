@@ -43,7 +43,6 @@ fn simple_http() {
 
 "#]],
         str![[r#"
-[CHECKING] bar v0.0.1
 [CHECKING] foo v0.0.1 ([ROOT]/foo)
 [FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
 
@@ -65,7 +64,6 @@ fn simple_git() {
 
 "#]],
         str![[r#"
-[CHECKING] bar v0.0.1
 [CHECKING] foo v0.0.1 ([ROOT]/foo)
 [FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
 
@@ -1698,7 +1696,6 @@ fn update_publish_then_update_http() {
 [UPDATING] `dummy-registry` index
 [DOWNLOADING] crates ...
 [DOWNLOADED] a v0.1.1 (registry `dummy-registry`)
-[COMPILING] a v0.1.1
 [COMPILING] foo v0.5.0 ([ROOT]/foo)
 [FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
 
@@ -1711,7 +1708,6 @@ fn update_publish_then_update_git() {
 [UPDATING] `dummy-registry` index
 [DOWNLOADING] crates ...
 [DOWNLOADED] a v0.1.1 (registry `dummy-registry`)
-[COMPILING] a v0.1.1
 [COMPILING] foo v0.5.0 ([ROOT]/foo)
 [FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
 
@@ -4545,7 +4541,6 @@ fn differ_only_by_metadata() {
     p.cargo("clean").run();
     p.cargo("check")
         .with_stderr_data(str![[r#"
-[CHECKING] baz v0.0.1+b
 [CHECKING] foo v0.0.1 ([ROOT]/foo)
 [FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
 

@@ -380,7 +380,7 @@ mod dep_info;
 mod dirty_reason;
 mod rustdoc;
 
-use crate::util::data_structures::HashMap;
+use crate::util::data_structures::{HashMap, HashSet};
 use std::collections::hash_map::Entry;
 use std::env;
 use std::ffi::OsString;
@@ -466,13 +466,34 @@ pub fn prepare_target(
 
     debug!("fingerprint at: {}", loc.display());
 
+    // Cacheable units use the normal fingerprint comparison (hash match plus
+    // filesystem status). The hash match catches identity changes that are not
+    // part of the unit hash (e.g. a git revision, which appears in the
+    // checkout directory path and surfaces as `PathToSourceChanged`); the
+    // filesystem-status check catches changes to *non-cacheable*
+    // dependencies, most notably path patches of registry crates, whose
+    // mtimes are not reflected in any hash. The artifacts stay effectively
+    // immutable: nothing rebuilds them unless one of these conditions fires.
+    //
+    // Note that the fingerprint *content* (and thus a fresh cache hit) is
+    // stable across byte-identical rebuilds of the same unit by another
+    // workspace, but such a rebuild updates the artifact mtimes, which the
+    // filesystem-status check propagates as a (correct, conservative)
+    // relink/rebuild of dependents.
+
     // Figure out if this unit is up to date. After calculating the fingerprint
     // compare it to an old version, if any, and attempt to print diagnostic
     // information about failed comparisons to aid in debugging.
     let fingerprint = calculate(build_runner, unit)?;
     let mtime_on_use = build_runner.bcx.gctx.cli_unstable().mtime_on_use;
-    let dirty_reason = match compare_old_fingerprint(unit, &loc, &*fingerprint, mtime_on_use, force)
-    {
+    let dirty_reason = match compare_old_fingerprint(
+        unit,
+        &loc,
+        &*fingerprint,
+        mtime_on_use,
+        force,
+        build_runner.files().is_cacheable(unit),
+    ) {
         FingerprintComparison::Fresh => None,
         FingerprintComparison::Dirty { reason } => Some(reason),
     };
@@ -728,6 +749,25 @@ impl FsStatus {
             | FsStatus::StaleDepFingerprint { .. } => false,
         }
     }
+
+    /// Whether the filesystem state is compatible with a build-cache hit.
+    ///
+    /// For cacheable units the fingerprint *content* is the authoritative
+    /// signal: the normalized dependency hashes change exactly when a
+    /// dependency's identity or (for path dependencies) its source content
+    /// changes. Dependency staleness (`StaleDependency`/`StaleDepFingerprint`)
+    /// merely means a dependency was rebuilt, which a byte-identical rebuild
+    /// (e.g. after `cargo clean` of the workspace target dir) does not
+    /// invalidate. `Stale` and `StaleItem` still require a rebuild: they mean
+    /// the unit's own outputs are missing or its own inputs changed.
+    fn cache_compatible(&self) -> bool {
+        matches!(
+            self,
+            FsStatus::UpToDate { .. }
+                | FsStatus::StaleDependency { .. }
+                | FsStatus::StaleDepFingerprint { .. }
+        )
+    }
 }
 
 mod serde_file_time {
@@ -811,7 +851,7 @@ impl<'de> Deserialize<'de> for DepFingerprint {
 /// when the filesystem contains stale information (based on mtime currently).
 /// The paths here don't change much between compilations but they're used as
 /// inputs when we probe the filesystem looking at information.
-#[derive(Debug, Serialize, Deserialize, Hash)]
+#[derive(Clone, Debug, Serialize, Deserialize, Hash)]
 enum LocalFingerprint {
     /// This is a precalculated fingerprint which has an opaque string we just
     /// hash as usual. This variant is primarily used for rustdoc where we
@@ -1061,6 +1101,43 @@ impl Fingerprint {
         *self.memoized_hash.lock().unwrap() = None;
     }
 
+    /// Deep-clones this fingerprint (dependencies included).
+    ///
+    /// Unlike a `serde` round-trip this preserves the `index` field, which is
+    /// needed to map dependency fingerprints back to their [`Unit`]s when
+    /// normalizing them for the build cache. The memoized hash is cleared so
+    /// the clone's hash recomputes from its (possibly modified) content; the
+    /// filesystem status is copied as-is.
+    fn deep_clone(&self) -> Fingerprint {
+        Fingerprint {
+            rustc: self.rustc,
+            features: self.features.clone(),
+            declared_features: self.declared_features.clone(),
+            target: self.target,
+            path: self.path,
+            profile: self.profile,
+            deps: self
+                .deps
+                .iter()
+                .map(|dep| DepFingerprint {
+                    pkg_id: dep.pkg_id,
+                    name: dep.name,
+                    public: dep.public,
+                    only_requires_rmeta: dep.only_requires_rmeta,
+                    fingerprint: Arc::new(dep.fingerprint.deep_clone()),
+                })
+                .collect(),
+            local: Mutex::new(self.local.lock().unwrap().clone()),
+            memoized_hash: Mutex::new(None),
+            rustflags: self.rustflags.clone(),
+            config: self.config,
+            compile_kind: self.compile_kind,
+            index: self.index,
+            fs_status: self.fs_status.clone(),
+            outputs: self.outputs.clone(),
+        }
+    }
+
     fn hash_u64(&self) -> u64 {
         if let Some(s) = *self.memoized_hash.lock().unwrap() {
             return s;
@@ -1251,6 +1328,7 @@ impl Fingerprint {
         build_root: &Path,
         cargo_exe: &Path,
         gctx: &GlobalContext,
+        cacheable_indices: &HashSet<UnitIndex>,
     ) -> CargoResult<()> {
         assert!(!self.fs_status.up_to_date());
 
@@ -1287,64 +1365,86 @@ impl Fingerprint {
             pkg_root, max_path, max_mtime
         );
 
-        for dep in self.deps.iter() {
-            let dep_mtimes = match &dep.fingerprint.fs_status {
-                FsStatus::UpToDate { mtimes } => mtimes,
-                // If our dependency is stale, so are we, so bail out.
-                FsStatus::Stale
-                | FsStatus::StaleItem(_)
-                | FsStatus::StaleDependency { .. }
-                | FsStatus::StaleDepFingerprint { .. } => {
-                    self.fs_status = FsStatus::StaleDepFingerprint {
-                        unit: dep.fingerprint.index,
+        // Cacheable units live in the shared build cache, whose artifacts'
+        // mtimes only reflect when the cache entry was written — not when the
+        // unit's dependencies were last rebuilt in a workspace. A cache entry
+        // is almost always *older* than freshly-rebuilt non-cacheable
+        // dependencies, so the mtime chain against dependencies is meaningless
+        // for them; their (normalized) fingerprint content is the authoritative
+        // signal. Skipping the dependency loop also prevents a dependency's
+        // mtime-bumped stale fs-status from leaking into dependents, which
+        // would otherwise rebuild a cache hit forever (the cache artifacts'
+        // mtimes are never refreshed).
+        if !cacheable_indices.contains(&self.index) {
+            for dep in self.deps.iter() {
+                let dep_mtimes = match &dep.fingerprint.fs_status {
+                        FsStatus::UpToDate { mtimes } => mtimes,
+                        // If our dependency is stale, so are we, so bail out.
+                        FsStatus::Stale
+                        | FsStatus::StaleItem(_)
+                        | FsStatus::StaleDependency { .. }
+                        | FsStatus::StaleDepFingerprint { .. } => {
+                            self.fs_status = FsStatus::StaleDepFingerprint {
+                                unit: dep.fingerprint.index,
+                            };
+                            return Ok(());
+                        }
                     };
-                    return Ok(());
-                }
-            };
-
-            // If our dependency edge only requires the rmeta file to be present
-            // then we only need to look at that one output file, otherwise we
-            // need to consider all output files to see if we're out of date.
-            let (dep_path, dep_mtime) = if dep.only_requires_rmeta {
-                dep_mtimes
-                    .iter()
-                    .find(|(path, _mtime)| {
-                        path.extension().and_then(|s| s.to_str()) == Some("rmeta")
-                    })
-                    .expect("failed to find rmeta")
-            } else {
-                match dep_mtimes.iter().max_by_key(|kv| kv.1) {
-                    Some(dep_mtime) => dep_mtime,
-                    // If our dependencies is up to date and has no filesystem
-                    // interactions, then we can move on to the next dependency.
-                    None => continue,
-                }
-            };
-            debug!(
-                "max dep mtime for {:?} is {:?} {}",
-                pkg_root, dep_path, dep_mtime
-            );
-
-            // If the dependency is newer than our own output then it was
-            // recompiled previously. We transitively become stale ourselves in
-            // that case, so bail out.
-            //
-            // Note that this comparison should probably be `>=`, not `>`, but
-            // for a discussion of why it's `>` see the discussion about #5918
-            // below in `find_stale`.
-            if dep_mtime > max_mtime {
-                info!(
-                    "dependency on `{}` is newer than we are {} > {} {:?}",
-                    dep.name, dep_mtime, max_mtime, pkg_root
-                );
-
-                self.fs_status = FsStatus::StaleDependency {
-                    unit: dep.fingerprint.index,
-                    dep_mtime: *dep_mtime,
-                    max_mtime: *max_mtime,
+    
+                    // Dependencies built into the cross-workspace build cache are
+                    // immutable: their artifacts' mtimes only reflect when the
+                    // shared cache entry was written, not whether the dependency
+                    // changed. Their normalized fingerprint content (embedded in
+                    // this fingerprint) is the authoritative freshness signal, so
+                    // skip the mtime comparison for them.
+                    if cacheable_indices.contains(&dep.fingerprint.index) {
+                        continue;
+                    }
+    
+                // If our dependency edge only requires the rmeta file to be present
+                // then we only need to look at that one output file, otherwise we
+                // need to consider all output files to see if we're out of date.
+                let (dep_path, dep_mtime) = if dep.only_requires_rmeta {
+                    dep_mtimes
+                        .iter()
+                        .find(|(path, _mtime)| {
+                            path.extension().and_then(|s| s.to_str()) == Some("rmeta")
+                        })
+                        .expect("failed to find rmeta")
+                } else {
+                    match dep_mtimes.iter().max_by_key(|kv| kv.1) {
+                        Some(dep_mtime) => dep_mtime,
+                        // If our dependencies is up to date and has no filesystem
+                        // interactions, then we can move on to the next dependency.
+                        None => continue,
+                    }
                 };
-
-                return Ok(());
+                debug!(
+                    "max dep mtime for {:?} is {:?} {}",
+                    pkg_root, dep_path, dep_mtime
+                );
+    
+                // If the dependency is newer than our own output then it was
+                // recompiled previously. We transitively become stale ourselves in
+                // that case, so bail out.
+                //
+                // Note that this comparison should probably be `>=`, not `>`, but
+                // for a discussion of why it's `>` see the discussion about #5918
+                // below in `find_stale`.
+                if dep_mtime > max_mtime {
+                    info!(
+                        "dependency on `{}` is newer than we are {} > {} {:?}",
+                        dep.name, dep_mtime, max_mtime, pkg_root
+                    );
+    
+                    self.fs_status = FsStatus::StaleDependency {
+                        unit: dep.fingerprint.index,
+                        dep_mtime: *dep_mtime,
+                        max_mtime: *max_mtime,
+                    };
+    
+                    return Ok(());
+            }
             }
         }
 
@@ -1517,6 +1617,69 @@ impl StaleItem {
     }
 }
 
+/// Normalizes a cacheable unit's fingerprint tree for stable cache entries.
+///
+/// A `run-custom-build` unit's `local` fingerprint switches between the
+/// whole-crate `Precalculated` form (when the previous run's output is
+/// missing) and the `RerunIfChanged`/`RerunIfEnvChanged` form (when it is
+/// present). Which form applies depends on environmental state (was the
+/// workspace build dir cleaned since the build script last ran), so a
+/// fingerprint that embeds it differs between builds of identical inputs —
+/// invalidating otherwise-immutable cache entries after a `cargo clean`.
+///
+/// For cacheable units the dependency fingerprint is replaced by the
+/// deterministic, content-based `Precalculated(pkg_fingerprint)` form
+/// (recursively):
+///
+/// * For `run-custom-build` dependencies the build script's inputs are its
+///   package (captured by `pkg_fingerprint`) — the `rerun-if-*` bookkeeping
+///   adds no information for immutable registry/git sources.
+/// * For local (path) dependencies the package fingerprint is mtime-based, so
+///   source edits still invalidate the cache entry — this is what catches
+///   path patches of registry crates, which the normal dependency hash (a
+///   stable path) would miss.
+///
+/// The clone is private to the cacheable unit's fingerprint, so the shared
+/// fingerprints used for the dependencies' own freshness checks are
+/// untouched.
+fn normalize_cache_fingerprint(
+    build_runner: &BuildRunner<'_, '_>,
+    fingerprint: &Fingerprint,
+) -> CargoResult<Fingerprint> {
+    let clone = fingerprint.deep_clone();
+    let index_to_unit: HashMap<UnitIndex, Unit> = build_runner
+        .bcx
+        .unit_to_index
+        .iter()
+        .map(|(unit, &index)| (index, unit.clone()))
+        .collect();
+    normalize_cache_deps(build_runner, &clone, &index_to_unit)?;
+    Ok(clone)
+}
+
+/// Recursively replaces the `local` fingerprints of `run-custom-build` and
+/// local dependencies of `fp` with their content-based package fingerprint.
+fn normalize_cache_deps(
+    build_runner: &BuildRunner<'_, '_>,
+    fp: &Fingerprint,
+    index_to_unit: &HashMap<UnitIndex, Unit>,
+) -> CargoResult<()> {
+    for dep in &fp.deps {
+        let unit = index_to_unit
+            .get(&dep.fingerprint.index)
+            .ok_or_else(|| internal("missing unit for fingerprint index"))?;
+        if unit.mode.is_run_custom_build() || unit.is_local() {
+            let s = pkg_fingerprint(build_runner.bcx, &unit.pkg)?;
+            // `local` is interior-mutable; the fingerprint itself (and the
+            // shared dependency fingerprints) must not be mutated, since the
+            // dependencies' own freshness checks use them.
+            *dep.fingerprint.local.lock().unwrap() = vec![LocalFingerprint::Precalculated(s)];
+        }
+        normalize_cache_deps(build_runner, &dep.fingerprint, index_to_unit)?;
+    }
+    Ok(())
+}
+
 /// Calculates the fingerprint for a [`Unit`].
 ///
 /// This fingerprint is used by Cargo to learn about when information such as:
@@ -1554,9 +1717,19 @@ fn calculate(build_runner: &mut BuildRunner<'_, '_>, unit: &Unit) -> CargoResult
         &build_root,
         cargo_exe,
         build_runner.bcx.gctx,
+        &build_runner.cacheable_unit_indices,
     )?;
 
-    let fingerprint = Arc::new(fingerprint);
+    let fingerprint = if build_runner.files().is_cacheable(unit) {
+        // Cacheable units must have stable fingerprints across workspace
+        // cleans: see `normalize_cache_fingerprint`. The normalized clone is
+        // what gets persisted and what dependents embed, so a cache entry
+        // built once matches every later freshness check of identical inputs.
+        let normalized = normalize_cache_fingerprint(build_runner, &fingerprint)?;
+        Arc::new(normalized)
+    } else {
+        Arc::new(fingerprint)
+    };
     build_runner
         .fingerprints
         .insert(unit.clone(), Arc::clone(&fingerprint));
@@ -1577,11 +1750,21 @@ fn calculate_normal(
         // built. The only exception here are artifact dependencies,
         // which is an actual dependency that needs a recompile.
         //
+        // Note: cacheable dependencies ARE included here. Even though their own
+        // freshness is determined by fingerprint-file existence in the build
+        // cache (they are immutable), their dependents still need to know when
+        // the dependency *identity* changes (e.g. a git dependency moving to a
+        // new revision, which produces a new build unit). That change must
+        // propagate as dirtiness to non-cacheable dependents such as binaries
+        // and build scripts.
+        //
         // Create Vec since mutable build_runner is needed in closure.
         let deps = Vec::from(build_runner.unit_deps(unit));
         let mut deps = deps
             .into_iter()
-            .filter(|dep| !dep.unit.target.is_bin() || dep.unit.artifact.is_true())
+            .filter(|dep| {
+                !dep.unit.target.is_bin() || dep.unit.artifact.is_true()
+            })
             .map(|dep| DepFingerprint::new(build_runner, unit, &dep))
             .collect::<CargoResult<Vec<_>>>()?;
         deps.sort_by(|a, b| a.pkg_id.cmp(&b.pkg_id));
@@ -1603,7 +1786,21 @@ fn calculate_normal(
         vec![LocalFingerprint::Precalculated(fingerprint)]
     } else {
         let dep_info = dep_info_loc(build_runner, unit);
-        let dep_info = dep_info.strip_prefix(&build_root).unwrap().to_path_buf();
+        let dep_info = if build_runner.files().is_cacheable(unit) {
+            // The dep-info for a cacheable unit lives in the build cache, not
+            // under the workspace build root, so it cannot be encoded relative
+            // to it. Store the absolute path: `find_stale_item` joins it with
+            // the build root, which is a no-op for absolute paths. This is
+            // acceptable because the fingerprint itself lives in the build
+            // cache and is therefore not portable between machines anyway.
+            // Keeping `CheckDepInfo` (rather than a precalculated value)
+            // preserves the dep-info's environment-variable tracking (used by
+            // `-Zrustdoc-depinfo` and `-Zbinary-dep-depinfo`) and any source
+            // mtime checking.
+            dep_info
+        } else {
+            dep_info.strip_prefix(&build_root).unwrap().to_path_buf()
+        };
         vec![LocalFingerprint::CheckDepInfo {
             dep_info,
             checksum: build_runner.bcx.gctx.cli_unstable().checksum_freshness,
@@ -1754,6 +1951,8 @@ See https://doc.rust-lang.org/cargo/reference/build-scripts.html#rerun-if-change
         // Create Vec since mutable build_runner is needed in closure.
         let deps = Vec::from(build_runner.unit_deps(unit));
         deps.into_iter()
+            // Cacheable dependencies are included so that a dependency identity
+            // change (e.g. a new git revision) re-runs the build script.
             .map(|dep| DepFingerprint::new(build_runner, unit, &dep))
             .collect::<CargoResult<Vec<_>>>()?
     };
@@ -1953,6 +2152,13 @@ fn local_fingerprints_deps(
 /// and logs detailed JSON information to `<loc>.json`.
 fn write_fingerprint(loc: &Path, fingerprint: &Fingerprint) -> CargoResult<()> {
     debug_assert_ne!(fingerprint.rustc, 0);
+
+    // FIXME: There is probably a smart (and faster) way to do this.
+    //        This is quick and dirty for a prototype
+    if !loc.exists() {
+        paths::create_dir_all(&loc.parent().unwrap())?;
+    }
+
     // fingerprint::new().rustc == 0, make sure it doesn't make it to the file system.
     // This is mostly so outside tools can reliably find out what rust version this file is for,
     // as we can use the full hash.
@@ -1981,6 +2187,34 @@ pub fn prepare_init(build_runner: &mut BuildRunner<'_, '_>, unit: &Unit) -> Carg
     Ok(())
 }
 
+/// The state needed by the build cache's coordination protocol to decide
+/// whether a cached unit is complete *for this unit's identity and filesystem
+/// state*.
+pub(crate) struct CacheCompletionState {
+    /// Hex fingerprint hash this unit would persist. The stored fingerprint
+    /// file encodes identity information (e.g. the git revision) beyond what
+    /// the unit hash captures, so completion is checked by comparing file
+    /// content rather than mere existence.
+    pub(crate) hash: String,
+    /// Whether the fingerprint's filesystem-status was up-to-date when it was
+    /// computed. This catches changes to *non-cacheable* dependencies (such
+    /// as path patches of registry crates) whose mtimes are not reflected in
+    /// any hash.
+    pub(crate) fs_up_to_date: bool,
+}
+
+/// Returns the fingerprint state a cacheable `unit` would persist.
+pub(crate) fn cache_completion_state(
+    build_runner: &mut BuildRunner<'_, '_>,
+    unit: &Unit,
+) -> CargoResult<CacheCompletionState> {
+    let fingerprint = calculate(build_runner, unit)?;
+    Ok(CacheCompletionState {
+        hash: util::to_hex(fingerprint.hash_u64()),
+        fs_up_to_date: fingerprint.fs_status.cache_compatible(),
+    })
+}
+
 /// Returns the location that the dep-info file will show up at
 /// for the [`Unit`] specified.
 pub fn dep_info_loc(build_runner: &mut BuildRunner<'_, '_>, unit: &Unit) -> PathBuf {
@@ -2003,6 +2237,7 @@ fn compare_old_fingerprint(
     new_fingerprint: &Fingerprint,
     mtime_on_use: bool,
     forced: bool,
+    cache_compatible: bool,
 ) -> FingerprintComparison {
     if mtime_on_use {
         // update the mtime so other cleaners know we used it
@@ -2011,7 +2246,7 @@ fn compare_old_fingerprint(
         paths::set_file_time_no_err(old_hash_path, t);
     }
 
-    let compare = _compare_old_fingerprint(old_hash_path, new_fingerprint);
+    let compare = _compare_old_fingerprint(old_hash_path, new_fingerprint, cache_compatible);
 
     match compare.as_ref() {
         Ok(FingerprintComparison::Fresh) => {}
@@ -2045,12 +2280,18 @@ fn compare_old_fingerprint(
 fn _compare_old_fingerprint(
     old_hash_path: &Path,
     new_fingerprint: &Fingerprint,
+    cache_compatible: bool,
 ) -> CargoResult<FingerprintComparison> {
     let old_fingerprint_short = paths::read(old_hash_path)?;
 
     let new_hash = new_fingerprint.hash_u64();
 
-    if util::to_hex(new_hash) == old_fingerprint_short && new_fingerprint.fs_status.up_to_date() {
+    let fs_ok = if cache_compatible {
+        new_fingerprint.fs_status.cache_compatible()
+    } else {
+        new_fingerprint.fs_status.up_to_date()
+    };
+    if util::to_hex(new_hash) == old_fingerprint_short && fs_ok {
         return Ok(FingerprintComparison::Fresh);
     }
 

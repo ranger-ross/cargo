@@ -126,6 +126,10 @@ pub struct CompilationFiles<'a, 'gctx> {
     pub(super) host: Layout,
     /// The target directory layout for the target (if different from then host).
     pub(super) target: HashMap<CompileTarget, Layout>,
+    /// Whether the cross-workspace build cache is usable (writable) for this
+    /// build. When disabled, cacheable units are treated as ordinary units and
+    /// built in the workspace.
+    cache_enabled: bool,
     /// Additional directory to include a copy of the outputs.
     export_dir: Option<PathBuf>,
     /// The root targets requested by the user on the command line (does not
@@ -177,10 +181,12 @@ impl<'a, 'gctx: 'a> CompilationFiles<'a, 'gctx> {
             .cloned()
             .map(|unit| (unit, OnceCell::new()))
             .collect();
+        let cache_enabled = host.cache_enabled();
         CompilationFiles {
             ws: build_runner.bcx.ws,
             host,
             target,
+            cache_enabled,
             export_dir: build_runner.bcx.build_config.export_dir.clone(),
             roots: build_runner.bcx.roots.clone(),
             metas,
@@ -276,14 +282,33 @@ impl<'a, 'gctx: 'a> CompilationFiles<'a, 'gctx> {
     /// Returns the host `deps` directory path for a given build unit.
     pub fn host_deps(&self, unit: &Unit) -> PathBuf {
         let dir = self.pkg_dir(unit);
-        self.host.build_dir().deps(&dir)
+        if self.is_cacheable(unit) {
+            self.host.build_cache().out(&dir)
+        } else {
+            self.host.build_dir().deps(&dir)
+        }
+    }
+
+    /// Returns whether the given unit should be built into the cross-workspace
+    /// build cache, i.e. it is eligible, the cache is usable, and the new
+    /// build-dir layout is in effect (the cache design assumes
+    /// `-Zbuild-dir-new-layout`, which is always on except when opted out via
+    /// `__CARGO_TEMPORARY_BUILD_DIR_NEW_LAYOUT_OPT_OUT`).
+    pub fn is_cacheable(&self, unit: &Unit) -> bool {
+        self.ws.gctx().cli_unstable().build_dir_new_layout
+            && self.cache_enabled
+            && unit.is_cacheable()
     }
 
     /// Returns the directories where Rust crate dependencies are found for the
     /// specified unit.
     pub fn deps_dir(&self, unit: &Unit) -> PathBuf {
         let dir = self.pkg_dir(unit);
-        self.layout(unit.kind).build_dir().deps(&dir)
+        if self.is_cacheable(unit) {
+            self.layout(unit.kind).build_cache().out(&dir)
+        } else {
+            self.layout(unit.kind).build_dir().deps(&dir)
+        }
     }
 
     /// Returns the directories where Rust crate dependencies are found for the
@@ -300,21 +325,69 @@ impl<'a, 'gctx: 'a> CompilationFiles<'a, 'gctx> {
     /// Directory where the fingerprint for the given unit should go.
     pub fn fingerprint_dir(&self, unit: &Unit) -> PathBuf {
         let dir = self.pkg_dir(unit);
-        self.layout(unit.kind).build_dir().fingerprint(&dir)
+        if self.is_cacheable(unit) {
+            self.layout(unit.kind).build_cache().fingerprint(&dir)
+        } else {
+            self.layout(unit.kind).build_dir().fingerprint(&dir)
+        }
     }
 
     /// The lock location for a given build unit.
     pub fn build_unit_lock(&self, unit: &Unit) -> PathBuf {
         let dir = self.pkg_dir(unit);
+        let unit_dir = if self.is_cacheable(unit) {
+            self.layout(unit.kind).build_cache().build_unit(&dir)
+        } else {
+            self.layout(unit.kind).build_dir().build_unit(&dir)
+        };
+        unit_dir.join(".lock")
+    }
+
+    /// The lock file guarding rmeta availability for a cacheable build unit.
+    ///
+    /// This lock is held exclusively while the unit is being compiled and the
+    /// `.rmeta` has not been produced yet. Once rustc reports the `.rmeta`
+    /// artifact the compiling Cargo downgrades it to shared, allowing other
+    /// Cargo processes to start pipelined compilation against the metadata
+    /// before the `.rlib` (or other final artifact) has been produced.
+    ///
+    /// Only meaningful for cacheable units; see [`Unit::is_cacheable`].
+    pub fn cache_rmeta_lock(&self, unit: &Unit) -> PathBuf {
+        let dir = self.pkg_dir(unit);
         self.layout(unit.kind)
-            .build_dir()
+            .build_cache()
             .build_unit(&dir)
-            .join(".lock")
+            .join(".rmeta.lock")
+    }
+
+    /// The lock file guarding full completion of a cacheable build unit.
+    ///
+    /// This lock is held exclusively while the unit is being compiled and
+    /// released (downgraded to shared) only after all artifacts have been
+    /// written *and* the fingerprint file has been persisted. Acquiring this
+    /// lock in shared mode therefore guarantees that the fingerprint file
+    /// exists and the unit can be used without recompiling it.
+    ///
+    /// Only meaningful for cacheable units; see [`Unit::is_cacheable`].
+    pub fn cache_rlib_lock(&self, unit: &Unit) -> PathBuf {
+        let dir = self.pkg_dir(unit);
+        self.layout(unit.kind)
+            .build_cache()
+            .build_unit(&dir)
+            .join(".rlib.lock")
     }
 
     /// Directory where incremental output for the given unit should go.
-    pub fn incremental_dir(&self, unit: &Unit) -> &Path {
-        self.layout(unit.kind).build_dir().incremental()
+    pub fn incremental_dir(&self, unit: &Unit) -> PathBuf {
+        let dir = self.pkg_dir(unit);
+        if self.is_cacheable(unit) {
+            self.layout(unit.kind).build_cache().incremental(&dir)
+        } else {
+            self.layout(unit.kind)
+                .build_dir()
+                .incremental()
+                .to_path_buf()
+        }
     }
 
     /// Directory where timing output should go.
@@ -767,6 +840,17 @@ fn compute_metadata(
         .package_id()
         .stable_hash(ws_root)
         .hash(&mut shared_hasher);
+
+    // The git revision is deliberately excluded from `stable_hash` (keeping
+    // cache folder names stable across revisions), but for the build cache it
+    // is part of the unit's identity: different revisions of the same git
+    // dependency produce different artifacts and must map to different cache
+    // entries. Otherwise two Cargo processes building different revisions of
+    // the same git URL concurrently would race on a shared cache directory
+    // (see `concurrent::git_same_branch_different_revs`).
+    if let Some(precise) = unit.pkg.package_id().source_id().precise_git_fragment() {
+        precise.hash(&mut shared_hasher);
+    }
 
     // Also mix in enabled features to our metadata. This'll ensure that
     // when changing feature sets each lib is separately cached.

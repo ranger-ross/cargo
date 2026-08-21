@@ -1,6 +1,6 @@
 //! See [`JobState`].
 
-use std::{cell::Cell, marker, sync::Arc};
+use std::{cell::Cell, marker, path::PathBuf, sync::Arc};
 
 use cargo_util::ProcessBuilder;
 
@@ -50,6 +50,19 @@ pub struct JobState<'a, 'gctx> {
     /// sending a double message later on.
     rmeta_required: Cell<bool>,
 
+    /// Whether `rmeta_produced` has already sent its message.
+    ///
+    /// `rmeta_required` cannot serve this purpose: a job legitimately calls
+    /// `rmeta_produced` even when no dependency requires the metadata (the
+    /// `-Zbuild-analysis` timings record the rmeta finish regardless), but a
+    /// second call must not send a duplicate `Message::Finish`, which the
+    /// dependency queue would treat as a bug (its `finish` asserts that the
+    /// edge is still present). Double calls can happen legitimately with the
+    /// build cache: a job may first observe that a shared build unit became
+    /// rmeta-ready while another Cargo was compiling it, and then go on to
+    /// compile the unit itself.
+    rmeta_sent: Cell<bool>,
+
     /// Manages locks for build units when fine grain locking is enabled.
     lock_manager: Arc<LockManager>,
 
@@ -74,6 +87,7 @@ impl<'a, 'gctx> JobState<'a, 'gctx> {
             messages,
             output,
             rmeta_required: Cell::new(rmeta_required),
+            rmeta_sent: Cell::new(false),
             lock_manager,
             warning_handling,
             _marker: marker::PhantomData,
@@ -149,14 +163,35 @@ impl<'a, 'gctx> JobState<'a, 'gctx> {
     /// builds when required, and can be called at any time before a job ends.
     /// This should only be called once because a metadata file can only be
     /// produced once!
+    ///
+    /// The message is only sent the first time this is called for a job; see
+    /// [`JobState::rmeta_sent`] for why.
     pub fn rmeta_produced(&self) {
-        self.rmeta_required.set(false);
-        self.messages
-            .push(Message::Finish(self.id, Artifact::Metadata, Ok(())));
+        if !self.rmeta_sent.replace(true) {
+            self.rmeta_required.set(false);
+            self.messages
+                .push(Message::Finish(self.id, Artifact::Metadata, Ok(())));
+        }
+    }
+
+    pub fn lock_shared_path(&self, path: PathBuf) -> CargoResult<LockKey> {
+        self.lock_manager.lock_shared_path(path)
+    }
+
+    pub fn try_lock_shared_path(&self, path: PathBuf) -> CargoResult<Option<LockKey>> {
+        self.lock_manager.try_lock_shared_path(path)
+    }
+
+    pub fn unlock(&self, lock: &LockKey) -> CargoResult<()> {
+        self.lock_manager.unlock(lock)
     }
 
     pub fn lock_exclusive(&self, lock: &LockKey) -> CargoResult<()> {
         self.lock_manager.lock(lock)
+    }
+
+    pub fn try_lock_exclusive(&self, lock: &LockKey) -> CargoResult<bool> {
+        self.lock_manager.try_lock_exclusive(lock)
     }
 
     pub fn downgrade_to_shared(&self, lock: &LockKey) -> CargoResult<()> {

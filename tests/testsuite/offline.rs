@@ -148,7 +148,6 @@ fn cargo_compile_with_downloaded_dependency_with_offline() {
     p2.cargo("check --offline")
         .with_stderr_data(str![[r#"
 [LOCKING] 1 package to highest compatible version
-[CHECKING] present_dep v1.2.3
 [CHECKING] bar v0.1.0 ([ROOT]/bar)
 [FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
 
@@ -266,13 +265,13 @@ fn main(){
     p2.cargo("run --offline")
         .with_stderr_data(str![[r#"
 [LOCKING] 1 package to highest compatible version
-[COMPILING] present_dep v1.2.3
 [COMPILING] foo v0.1.0 ([ROOT]/foo)
 [FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
 [RUNNING] `target/debug/foo[EXE]`
 
 "#]])
         .with_stdout_data(str![[r#"
+build cache: `present_dep` present_dep is fresh (hit [ROOT]/home/.cargo/build-cache/present_dep/c6965f549ee33889)
 1.2.3
 
 "#]])
@@ -703,7 +702,6 @@ fn main(){
     p2.cargo("build --offline")
         .with_stderr_data(str![[r#"
 [LOCKING] 1 package to highest compatible version
-[COMPILING] present_dep v1.2.9
 [COMPILING] foo v0.1.0 ([ROOT]/foo)
 [FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
 
@@ -726,7 +724,6 @@ fn main(){
 
     p2.cargo("build --offline")
         .with_stderr_data(str![[r#"
-[COMPILING] present_dep v1.2.3
 [COMPILING] foo v0.1.0 ([ROOT]/foo)
 [FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
 

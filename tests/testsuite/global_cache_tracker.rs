@@ -1278,7 +1278,6 @@ fn package_cache_lock_during_build() {
 [UPDATING] `dummy-registry` index
 [LOCKING] 1 package to highest compatible version
    [..]s DEBUG gc: unable to acquire mutate lock, auto gc disabled
-[CHECKING] bar v1.0.0
 [CHECKING] foo2 v0.1.0 ([ROOT]/foo2)
 [FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
 

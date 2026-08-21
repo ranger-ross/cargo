@@ -236,6 +236,21 @@ fn compile<'gctx>(
                 };
                 work.then(link_targets(build_runner, unit, false)?)
             } else {
+                // A fresh cacheable unit is a hit in the cross-workspace build
+                // cache: its fingerprint matches and its filesystem state is
+                // up-to-date, so there is nothing for us to compile.
+                if build_runner.files().is_cacheable(unit) {
+                    let cache_entry = build_runner.files().cache_rmeta_lock(unit);
+                    let cache_entry = cache_entry
+                        .parent()
+                        .expect("cache lock path always has a parent");
+                    println!(
+                        "build cache: `{}` {} is fresh (hit {})",
+                        unit.pkg.name(),
+                        unit.target.name(),
+                        cache_entry.display()
+                    );
+                }
                 let output_options = OutputOptions::for_fresh(build_runner, unit);
                 let manifest = ManifestErrorContext::new(build_runner, unit);
                 let work = replay_output_cache(
@@ -363,6 +378,21 @@ fn rustc(
         .unwrap_or_else(|| build_runner.bcx.gctx.cwd())
         .to_path_buf();
     let is_cacheable = build_runner.files().is_cacheable(unit);
+    // Display identity for the cache-hit diagnostics in the work closure
+    // below (the closure cannot borrow the build runner).
+    let cache_identity = if is_cacheable {
+        let cache_entry = build_runner.files().cache_rmeta_lock(unit);
+        let cache_entry = cache_entry
+            .parent()
+            .expect("cache lock path always has a parent");
+        Some((
+            unit.pkg.name().to_string(),
+            unit.target.name().to_string(),
+            cache_entry.to_path_buf(),
+        ))
+    } else {
+        None
+    };
     let fingerprint_dir = build_runner.files().fingerprint_dir(unit);
     let script_metadatas = build_runner.find_build_script_metadatas(unit);
     let is_local = unit.is_local();
@@ -408,6 +438,16 @@ fn rustc(
         // there is nothing for us to compile.
         if let Some(cache) = &cache {
             if !cache.coordinate(state)? {
+                // Another process (or a previous run) already built this unit
+                // in the build cache while we waited, so we skip compiling.
+                if let Some((name, target, cache_entry)) = &cache_identity {
+                    println!(
+                        "build cache: `{}` {} is fresh (hit {})",
+                        name,
+                        target,
+                        cache_entry.display()
+                    );
+                }
                 return Ok(());
             }
         }

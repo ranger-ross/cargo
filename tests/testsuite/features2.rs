@@ -238,24 +238,28 @@ common
         .run();
     p.cargo("run --features dep1")
         .with_stdout_data(str![[r#"
+build cache: `common` common is fresh (hit [ROOT]/home/.cargo/build-cache/common/025e0bb88962c973)
 dep1
 
 "#]])
         .run();
     p.cargo("run --features foo1")
         .with_stdout_data(str![[r#"
+build cache: `common` common is fresh (hit [ROOT]/home/.cargo/build-cache/common/025e0bb88962c973)
 foo1
 
 "#]])
         .run();
     p.cargo("run --features dep2")
         .with_stdout_data(str![[r#"
+build cache: `common` common is fresh (hit [ROOT]/home/.cargo/build-cache/common/025e0bb88962c973)
 dep2
 
 "#]])
         .run();
     p.cargo("run --features common")
         .with_stdout_data(str![[r#"
+build cache: `common` common is fresh (hit [ROOT]/home/.cargo/build-cache/common/025e0bb88962c973)
 common
 
 "#]])
@@ -1139,6 +1143,8 @@ it is true
     switch_to_resolver_2(&p);
     p.cargo("run")
         .with_stdout_data(str![[r#"
+build cache: `pm` pm is fresh (hit [ROOT]/home/.cargo/build-cache/pm/e40974656c9effb0)
+build cache: `common` common is fresh (hit [ROOT]/home/.cargo/build-cache/common/42b63cb09c8fd064)
 it is false
 
 "#]])
@@ -2696,6 +2702,7 @@ it works
 
 "#]])
         .with_stdout_data(str![[r#"
+build cache: `dep` dep is fresh (hit [ROOT]/home/.cargo/build-cache/dep/ae78596e3cc69400)
 it works
 
 "#]])

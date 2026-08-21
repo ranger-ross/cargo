@@ -1136,7 +1136,10 @@ fn overriding_nonexistent_no_spurious() {
 [FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
 
 "#]])
-        .with_stdout_data("")
+        .with_stdout_data(str![[r#"
+build cache: `bar` bar is fresh (hit [ROOT]/home/.cargo/build-cache/bar/[..]
+build cache: `baz` baz is fresh (hit [ROOT]/home/.cargo/build-cache/baz/[..]
+"#]])
         .run();
 }
 

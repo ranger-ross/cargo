@@ -271,6 +271,7 @@ fn main(){
 
 "#]])
         .with_stdout_data(str![[r#"
+build cache: `present_dep` present_dep is fresh (hit [ROOT]/home/.cargo/build-cache/present_dep/c6965f549ee33889)
 1.2.3
 
 "#]])

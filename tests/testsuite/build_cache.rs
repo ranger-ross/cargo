@@ -407,8 +407,7 @@ fn check_units_shared_across_workspaces() {
 }
 
 #[cargo_test]
-fn clean_does_not_touch_cache() {
-    let git_project = git::new("dep1", |project| {
+fn clean_does_not_touch_cache() {    let git_project = git::new("dep1", |project| {
         project
             .file("Cargo.toml", &basic_lib_manifest("dep1"))
             .file(
@@ -444,4 +443,164 @@ fn clean_does_not_touch_cache() {
     // The cache is shared across workspaces and intentionally not part of a
     // single workspace's `cargo clean`.
     assert_eq!(cached_rlibs().len(), 1, "cargo clean must not touch the cache");
+}
+
+#[cargo_test]
+fn fresh_despite_cache_entry_rewrite() {
+    // A non-cacheable unit (here the workspace binary) whose dependency is a
+    // cache hit must stay fresh when the shared cache entry's artifacts are
+    // rewritten by another workspace (an mtime bump, not a content change):
+    // the freshness mtime chain is skipped for cacheable dependencies, whose
+    // normalized fingerprint content is the authoritative signal. Without
+    // that, `serde` rebuilt after every cache rewrite even though
+    // `serde_derive` was a fresh cache hit.
+    let git_project = git::new("dep1", |project| {
+        project
+            .file("Cargo.toml", &basic_lib_manifest("dep1"))
+            .file(
+                "src/lib.rs",
+                r#"pub fn hello() -> &'static str { "hello" }"#,
+            )
+    });
+
+    let ws = project()
+        .file(
+            "Cargo.toml",
+            &format!(
+                r#"
+                    [package]
+                    name = "foo"
+                    version = "0.5.0"
+                    edition = "2015"
+
+                    [dependencies.dep1]
+                    git = '{}'
+                "#,
+                git_project.url()
+            ),
+        )
+        .file("src/main.rs", &main_file(r#""{}", dep1::hello()"#, &["dep1"]))
+        .build();
+
+    ws.cargo("build").run();
+    assert_eq!(cached_rlibs().len(), 1);
+
+    // Simulate the shared cache entry being rewritten by another workspace:
+    // bump the mtimes of every cached artifact. The content is unchanged.
+    let now = std::time::SystemTime::now();
+    for file in collect_files(&build_cache_root()) {
+        std::fs::File::options()
+            .write(true)
+            .open(&file)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(now))
+            .unwrap();
+    }
+
+    // Both the cached dependency and the workspace binary stay fresh; the
+    // binary still runs.
+    ws.cargo("build -v")
+        .with_stderr_contains("[FRESH] dep1 v0.5.0 ([ROOTURL]/dep1#[..])")
+        .with_stderr_contains("[FRESH] foo v0.5.0 ([ROOT]/foo)")
+        .run();
+    ws.process(&ws.bin("foo"))
+        .with_stdout_data(str![[r#"
+hello
+
+"#]])
+        .run();
+}
+
+#[cargo_test]
+fn cacheable_unit_fresh_despite_newer_noncacheable_deps() {
+    // A cacheable unit (dep1, in the build cache) whose dependency (dep2, in
+    // the workspace, has a build script) has newer artifacts must stay fresh,
+    // and so must its dependents: a cacheable unit's fs-status must not adopt
+    // the mtime chain from workspace-local dependencies, whose outputs are
+    // routinely newer than the shared cache entry (the cache is written once
+    // and never refreshed). Otherwise every build dirties the whole chain —
+    // the `serde` case (cacheable `serde_derive` vs workspace `serde_core`).
+    let dep2 = git::new("dep2", |project| {
+        project
+            .file(
+                "Cargo.toml",
+                &format!("{}\nbuild = \"build.rs\"\n", basic_lib_manifest("dep2")),
+            )
+            .file(
+                "build.rs",
+                r#"fn main() { println!("cargo:rerun-if-changed=build.rs"); }"#,
+            )
+            .file(
+                "src/lib.rs",
+                r#"pub fn hello() -> &'static str { "hello" }"#,
+            )
+    });
+
+    let dep1 = git::new("dep1", |project| {
+        project
+            .file(
+                "Cargo.toml",
+                &format!(
+                    "{}\n[dependencies.dep2]\ngit = '{}'\n",
+                    basic_lib_manifest("dep1"),
+                    dep2.url()
+                ),
+            )
+            .file(
+                "src/lib.rs",
+                r#"pub fn hello() -> &'static str { dep2::hello() }"#,
+            )
+    });
+
+    let ws = project()
+        .file(
+            "Cargo.toml",
+            &format!(
+                r#"
+                    [package]
+                    name = "foo"
+                    version = "0.5.0"
+                    edition = "2015"
+
+                    [dependencies.dep1]
+                    git = '{}'
+                "#,
+                dep1.url()
+            ),
+        )
+        .file("src/main.rs", &main_file(r#""{}", dep1::hello()"#, &["dep1"]))
+        .build();
+
+    ws.cargo("build").run();
+    assert_eq!(cached_rlibs().len(), 1, "dep1 is cached, dep2 is not");
+
+    // Make dep2's workspace artifacts newer than dep1's cache entry (as
+    // happens whenever dep2 rebuilds in the workspace after the cache was
+    // written).
+    let now = std::time::SystemTime::now();
+    for file in collect_files(&paths::root().join("foo/target")) {
+        if file.extension().is_some_and(|e| {
+            matches!(e.to_str(), Some("rlib" | "rmeta" | "so" | "d"))
+        }) {
+            std::fs::File::options()
+                .write(true)
+                .open(&file)
+                .unwrap()
+                .set_times(std::fs::FileTimes::new().set_modified(now))
+                .unwrap();
+        }
+    }
+
+    // dep1 stays fresh (its fs-status ignores dep2's newer mtimes), and so
+    // does foo.
+    ws.cargo("build -v")
+        .with_stderr_contains("[FRESH] dep1 v0.5.0 ([ROOTURL]/dep1#[..])")
+        .with_stderr_contains("[FRESH] foo v0.5.0 ([ROOT]/foo)")
+        .run();
+    ws.process(&ws.bin("foo"))
+        .with_stdout_data(str![[r#"
+hello
+
+"#]])
+        .run();
 }

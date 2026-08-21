@@ -257,6 +257,77 @@ the waiter-then-builder crash path can reach `rmeta_produced` twice.
     dropping the table lock. The test now passes 8/8 consecutive runs (it
     previously hung at a measurable rate).
 
+13. **Cached units depending on build-script crates were invalidated by
+    `cargo clean`.** `foo` (serde/syn/serde_derive): after `cargo clean` of
+    the workspace target only, `unicode-ident` stayed fresh but `syn` and
+    `serde_derive` rebuilt with "info of dependency changed". Root cause: a
+    `run-custom-build` unit's `local` fingerprint switches between the
+    whole-crate `Precalculated` form (when the previous run's output is
+    missing) and the `RerunIfChanged`/`RerunIfEnvChanged` form (when it is
+    present). A cacheable unit's *stored* fingerprint (written after the
+    build, with the `RerunIf*` state) never matched the *plan-time* fingerprint
+    computed after a clean (which sees the `Precalculated` state) — a
+    byte-identical dependency rebuild invalidated the entry.
+    **Fixed**: `Fingerprint::deep_clone` + a normalization pass applied in
+    `calculate()` to cacheable units' fingerprints: dependency `local`
+    fingerprints of `run-custom-build` and local (path) units are replaced
+    (recursively) by the content-based `Precalculated(pkg_fingerprint)` form.
+    Registry/git build scripts are immutable, so the `rerun-if-*` bookkeeping
+    adds no information; local deps' package fingerprints are mtime-based, so
+    path patches still invalidate (verified by `freshness::bust_patched_dep`).
+    The clone is private to the cacheable fingerprint, so the shared
+    fingerprints used for the dependencies' own freshness are untouched. The
+    fs-status check for cacheable units is relaxed to ignore dependency
+    staleness (`StaleDependency`/`StaleDepFingerprint` — a dependency was
+    rebuilt, which content matching already accounts for) while still
+    requiring the unit's own outputs (`Stale`/`StaleItem` still rebuild).
+    Result: after `cargo clean`, `serde_derive`/`syn`/`unicode-ident` all stay
+    fresh and only the non-cacheable build-script crates rebuild (5.5s → 3s
+    in the repro). Known limitation (documented): a build script's
+    `rerun-if-env-changed` env vars are not part of the normalized content, so
+    an env change that alters a build-script crate's output does not
+    invalidate *cache hits* of units depending on it (the build-script crate
+    itself still rebuilds correctly; only the cached dependent's reuse
+    decision is affected).
+    Consequence for the testsuite: cacheable units that stay fresh now emit
+    the `build cache: \`pkg\` target is fresh (hit …)` diagnostic on stdout
+    (feature requested by the user), and dependency-content changes are
+    reported as "info of dependency `X` changed" instead of "the dependency
+    `X` was rebuilt" (content-based instead of mtime-based). Affected
+    snapshots updated: `freshness::bust_patched_dep`,
+    `freshness_checksum::bust_patched_dep_checksum`, and the
+    exact-stdout assertions in `features2` (3 tests), `offline`,
+    `package::workspace_with_local_deps`, `replace::
+    overriding_nonexistent_no_spurious`.
+
+14. **Cached units' fs-status mtime chain dirtied dependents forever.** Same
+    `foo` repro: two consecutive builds — `serde` (and `foo`) rebuilt every
+    time with "the dependency `serde_derive` was rebuilt"
+    (`StaleDependency`), even though `serde_derive` was a fresh cache hit.
+    Root cause, two layers:
+    (a) a cacheable unit's *own* fs-status still ran the mtime chain against
+    its dependencies. The shared cache is written once and never refreshed,
+    so a cacheable unit's artifacts are almost always *older* than its
+    freshly-rebuilt non-cacheable deps (e.g. `serde_derive`'s cache .so vs
+    workspace `quote`/`proc-macro2`) — its fs-status was permanently
+    `StaleDependency`, which every dependent then inherited as
+    `StaleDepFingerprint` and rebuilt against forever; and
+    (b) even with (a) fixed, a dependent's own mtime comparison against a
+    cacheable dep's artifacts fires whenever the shared cache entry was
+    rewritten after the dependent last built.
+    **Fixed** in `Fingerprint::check_filesystem`: cacheable units skip the
+    dependency loop entirely (their normalized fingerprint content is the
+    authoritative signal; `Stale`/`StaleItem` for their own outputs still
+    rebuild), and non-cacheable units skip the mtime comparison for cacheable
+    dependencies. Unit identity comes from `BuildRunner::
+    cacheable_unit_indices` (populated in `prepare_units`). Regression tests:
+    `build_cache::fresh_despite_cache_entry_rewrite` (cache artifacts bumped
+    newer than the workspace) and `build_cache::
+    cacheable_unit_fresh_despite_newer_noncacheable_deps` (cacheable unit's
+    workspace dep bumped newer than the cache — reproduces the `serde` case
+    exactly: fails with `Dirty foo: the dependency dep1 was rebuilt` without
+    the fix, passes with it).
+
 ## Full test-suite results
 
 Definitive run with the final binary: **4404 tests — 4375 passed, 1 failed,

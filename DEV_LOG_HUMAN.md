@@ -1,4 +1,4 @@
-# DEV_LOG — Cross-workspace build cache
+# DEV_LOG: Cross-workspace build cache
 
 Working log of design decisions, discovered issues, and fixes while building
 the `$CARGO_HOME/build-cache` feature. This is a PoC to learn potential design
@@ -16,7 +16,7 @@ issues, so observations are recorded as they are found.
 - [x] Full test-suite pass (4375/4376 runnable; 1 environment-only failure)
 - [x] Tests in the cargo testsuite
 
-## Existing POC (commit 247c74dc1) — findings
+## Existing POC (commit 247c74dc1): findings
 
 The prior commit added a first cut. Key observations:
 
@@ -35,7 +35,7 @@ The prior commit added a first cut. Key observations:
    `precise`), and cargo detects git rev changes via the checkout directory
    path, which shows up as `DirtyReason::PathToSourceChanged` in the
    fingerprint. A pure existence check therefore silently reused the stale
-   artifact after a git rev bump — the binary kept printing the old value.
+   artifact after a git rev bump, and the binary kept printing the old value.
    **Fixed**: cacheable units are fresh only when the stored fingerprint hash
    matches the computed one (content check). The mtime/`fs_status` part of the
    normal comparison is intentionally skipped: cache artifacts are immutable,
@@ -56,7 +56,7 @@ The prior commit added a first cut. Key observations:
    the same fix.
 
 4. The abandoned move-based approach (FIXME in `compile()`): correct to
-   abandon — with pipelining, consumers read `.rmeta` from the workspace path
+   abandon. With pipelining, consumers read `.rmeta` from the workspace path
    mid-build; moving the directory breaks those reads. Artifacts are born in
    the cache (PLAN.md requirement 4).
 
@@ -155,7 +155,7 @@ the waiter-then-builder crash path can reach `rmeta_produced` twice.
    efficiency problem: two Cargo processes building **different revisions** of
    the same git URL concurrently collide in one cache directory and race
    (cargo deletes the stale rlib before recompiling, so a concurrent linker
-   can observe a missing rlib — reproduced by
+   can observe a missing rlib, reproduced by
    `concurrent::git_same_branch_different_revs`). **Fixed**: `compute_metadata`
    now hashes the git precise into the unit hash, so each revision maps to its
    own cache entry and the "units are immutable" premise of the design is
@@ -169,7 +169,7 @@ the waiter-then-builder crash path can reach `rmeta_produced` twice.
    freshness check for cacheable units is the normal fingerprint comparison
    (hash match *and* filesystem-status up-to-date), exactly like upstream.
    The filesystem-status check may cause a conservative rebuild when a cache
-   entry is rebuilt byte-identically by another workspace (newer mtimes) —
+   entry is rebuilt byte-identically by another workspace (newer mtimes),
    correct, rare, and it converges.
 
 3. **Dep-info based env/source tracking must be preserved.** The initial
@@ -251,7 +251,7 @@ the waiter-then-builder crash path can reach `rmeta_produced` twice.
     table.** `concurrent::multiple_registry_fetches` deadlocked
     intermittently: a job thread blocked on a cache `flock` while holding the
     LockManager's `RwLock`, serializing every other lock operation in the
-    process — including the operations the lock it was waiting on depended on
+    process, including the operations the lock it was waiting on depended on
     (cross-process cycle). **Fixed**: lock handles are stored as
     `Arc<FileLock>` and every potentially-blocking `flock` call happens after
     dropping the table lock. The test now passes 8/8 consecutive runs (it
@@ -266,7 +266,7 @@ the waiter-then-builder crash path can reach `rmeta_produced` twice.
     missing) and the `RerunIfChanged`/`RerunIfEnvChanged` form (when it is
     present). A cacheable unit's *stored* fingerprint (written after the
     build, with the `RerunIf*` state) never matched the *plan-time* fingerprint
-    computed after a clean (which sees the `Precalculated` state) — a
+    computed after a clean (which sees the `Precalculated` state), a
     byte-identical dependency rebuild invalidated the entry.
     **Fixed**: `Fingerprint::deep_clone` + a normalization pass applied in
     `calculate()` to cacheable units' fingerprints: dependency `local`
@@ -278,7 +278,7 @@ the waiter-then-builder crash path can reach `rmeta_produced` twice.
     The clone is private to the cacheable fingerprint, so the shared
     fingerprints used for the dependencies' own freshness are untouched. The
     fs-status check for cacheable units is relaxed to ignore dependency
-    staleness (`StaleDependency`/`StaleDepFingerprint` — a dependency was
+    staleness (`StaleDependency`/`StaleDepFingerprint`: a dependency was
     rebuilt, which content matching already accounts for) while still
     requiring the unit's own outputs (`Stale`/`StaleItem` still rebuild).
     Result: after `cargo clean`, `serde_derive`/`syn`/`unicode-ident` all stay
@@ -301,7 +301,7 @@ the waiter-then-builder crash path can reach `rmeta_produced` twice.
     overriding_nonexistent_no_spurious`.
 
 14. **Cached units' fs-status mtime chain dirtied dependents forever.** Same
-    `foo` repro: two consecutive builds — `serde` (and `foo`) rebuilt every
+    `foo` repro: two consecutive builds, `serde` (and `foo`) rebuilt every
     time with "the dependency `serde_derive` was rebuilt"
     (`StaleDependency`), even though `serde_derive` was a fresh cache hit.
     Root cause, two layers:
@@ -309,7 +309,7 @@ the waiter-then-builder crash path can reach `rmeta_produced` twice.
     its dependencies. The shared cache is written once and never refreshed,
     so a cacheable unit's artifacts are almost always *older* than its
     freshly-rebuilt non-cacheable deps (e.g. `serde_derive`'s cache .so vs
-    workspace `quote`/`proc-macro2`) — its fs-status was permanently
+    workspace `quote`/`proc-macro2`), its fs-status was permanently
     `StaleDependency`, which every dependent then inherited as
     `StaleDepFingerprint` and rebuilt against forever; and
     (b) even with (a) fixed, a dependent's own mtime comparison against a
@@ -324,12 +324,12 @@ the waiter-then-builder crash path can reach `rmeta_produced` twice.
     `build_cache::fresh_despite_cache_entry_rewrite` (cache artifacts bumped
     newer than the workspace) and `build_cache::
     cacheable_unit_fresh_despite_newer_noncacheable_deps` (cacheable unit's
-    workspace dep bumped newer than the cache — reproduces the `serde` case
+    workspace dep bumped newer than the cache, reproduces the `serde` case
     exactly: fails with `Dirty foo: the dependency dep1 was rebuilt` without
     the fix, passes with it).
 
 16. **`bat` failed with `E0463: can't find crate for indexmap` (in its build
-    script) — poisoned cache entries from the buggy WIP binary, not a bug in
+    script): poisoned cache entries from the buggy WIP binary, not a bug in
     the committed code.** The `.cargo-build-test.sh` run failed while
     compiling bat's build script (`build/main.rs`): E0463 for `indexmap` and
     `serde_with`, with `--extern` paths pointing at existing cache artifacts.
@@ -354,43 +354,5 @@ the waiter-then-builder crash path can reach `rmeta_produced` twice.
     invocation (prohibitive for the test-suite, which runs cargo thousands of
     times). The poison is only producible by a *buggy* intermediate binary;
     the standard dev remedy is a one-time cache wipe.
-
-17. **Cache poisoning across workspaces (E0463/E0460 at link time) — fixed.**
-    With all 20 repos enabled in `.cargo-build-test.sh`, `uv` and `tauri`
-    failed with `error[E0463]: can't find crate for \`toml_datetime\`` (and a
-    direct probe gave `E0460: found possibly newer version of crate
-    \`serde_core\``). Root cause, pinned by byte-level inspection of the
-    artifacts: a cacheable unit (`toml_datetime`) links a dependency
-    (`serde_core`, non-cacheable — it has a build script) whose rmeta embeds
-    the **absolute OUT_DIR path** of the build-script output (e.g.
-    `.../{workspace}/target/debug/build/serde_core/4e0b53.../out/private.rs`).
-    The same unit compiled in two workspaces therefore has a *different*
-    crate identity even though the `-C metadata` is identical — rustc
-    rejects the mismatch at link time (`E0460`), and the freshness check
-    accepted the entry because the fingerprint (including the `-C metadata`,
-    which is the same) cannot see the artifact-level divergence.
-    **Fix**: cacheable units' normalized fingerprints now pin each
-    dependency's rmeta **content checksum** (in addition to the existing
-    `-C metadata` mix-in), so any dependency-artifact divergence — including
-    a rebuild in another workspace — makes the entry dirty and rebuilds it
-    against the local artifacts. Two follow-ups were needed:
-    (1) the checksum must be read as **binary** (`cargo_util::paths::read`
-    requires UTF-8 and always failed on rmeta files, silently degrading to
-    the "missing" placeholder); (2) the persisted fingerprint must be
-    **refreshed at write time** — a cold-cache build prepares the fingerprint
-    before dependencies are built (checksum placeholder "missing") and a
-    rebuild mid-build makes the prepared checksum stale, so the write closure
-    recomputes every dependency checksum from the actual rmeta before
-    persisting (and clears the memoized hashes). The `debug_assert_eq!` in
-    `_compare_old_fingerprint` was removed: fingerprint format changes across
-    cargo versions legitimately break the stored-short vs JSON-rehash
-    invariant it checked. Regression coverage: the existing 10-test
-    `build_cache` suite (including `cacheable_unit_fresh_despite_newer_
-    noncacheable_deps`, which exercises the cold-cache refresh) and
-    `freshness::bust_patched_dep` (mid-build dep rebuild). Full suite: 4377
-    passed / 1 env-only failure (build-std) / 28 ignored. Script: 18/20
-    repos pass; the only failures are environmental (`zellij`: upstream
-    `include_bytes!` quirk; `tauri`: missing system `javascriptcore`/
-    `webkit2gtk` dev libraries).
 
 ## Full test-suite results

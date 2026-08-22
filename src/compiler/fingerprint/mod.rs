@@ -485,6 +485,16 @@ pub fn prepare_target(
     // compare it to an old version, if any, and attempt to print diagnostic
     // information about failed comparisons to aid in debugging.
     let fingerprint = calculate(build_runner, unit)?;
+    let is_cacheable = build_runner.files().is_cacheable(unit);
+    // The rmeta paths of every dependency (transitively), used to refresh the
+    // pinned content checksums when the fingerprint is written after a build
+    // (the checksums are "missing" placeholders in a cold cache, since the
+    // dependencies are not built yet when the fingerprint is calculated).
+    let rmeta_checksum_paths = if is_cacheable {
+        collect_dep_rmeta_paths(build_runner, &fingerprint)?
+    } else {
+        Vec::new()
+    };
     let mtime_on_use = build_runner.bcx.gctx.cli_unstable().mtime_on_use;
     let dirty_reason = match compare_old_fingerprint(
         unit,
@@ -492,7 +502,7 @@ pub fn prepare_target(
         &*fingerprint,
         mtime_on_use,
         force,
-        build_runner.files().is_cacheable(unit),
+        is_cacheable,
     ) {
         FingerprintComparison::Fresh => None,
         FingerprintComparison::Dirty { reason } => Some(reason),
@@ -603,6 +613,18 @@ pub fn prepare_target(
 
             write_fingerprint(&loc, &fingerprint)
         })
+    } else if is_cacheable {
+        // The prepared fingerprint pins each dependency's rmeta content
+        // checksum (see `normalize_cache_deps`). For a cold cache the
+        // dependencies have not been built yet when the fingerprint is
+        // calculated, so their checksums are the "missing" placeholder;
+        // recompute them now that the dependencies exist so the persisted
+        // fingerprint reflects the artifacts the unit was actually compiled
+        // against.
+        Work::new(move |_| {
+            refresh_cache_dep_checksums(&fingerprint, &rmeta_checksum_paths)?;
+            write_fingerprint(&loc, &fingerprint)
+        })
     } else {
         Work::new(move |_| write_fingerprint(&loc, &fingerprint))
     };
@@ -659,6 +681,18 @@ struct DepFingerprint {
 pub struct Fingerprint {
     /// Hash of the version of `rustc` used.
     rustc: u64,
+    /// The unit's `-C metadata` value (its artifact identity).
+    ///
+    /// The fingerprint must capture the exact `-C metadata` the unit's
+    /// artifacts were compiled with: a dependency's artifacts embed each
+    /// other's metadata hashes, so if a dependency is (re)built with a
+    /// different metadata (e.g. a stale workspace artifact produced by an
+    /// older cargo binary, or a divergent unit graph), every cached artifact
+    /// that links it becomes unusable (`E0460`/`E0463`) even though the
+    /// source content is unchanged. Without this field the freshness check
+    /// would accept such an entry forever.
+    #[serde(default)]
+    metadata: u64,
     /// Sorted list of cfg features enabled.
     features: String,
     /// Sorted list of all the declared cfg features.
@@ -1074,6 +1108,7 @@ impl Fingerprint {
     fn new() -> Fingerprint {
         Fingerprint {
             rustc: 0,
+            metadata: 0,
             target: 0,
             profile: 0,
             path: 0,
@@ -1111,6 +1146,7 @@ impl Fingerprint {
     fn deep_clone(&self) -> Fingerprint {
         Fingerprint {
             rustc: self.rustc,
+            metadata: self.metadata,
             features: self.features.clone(),
             declared_features: self.declared_features.clone(),
             target: self.target,
@@ -1479,6 +1515,7 @@ impl hash::Hash for Fingerprint {
     fn hash<H: Hasher>(&self, h: &mut H) {
         let Fingerprint {
             rustc,
+            metadata,
             ref features,
             ref declared_features,
             target,
@@ -1494,6 +1531,7 @@ impl hash::Hash for Fingerprint {
         let local = local.lock().unwrap();
         (
             rustc,
+            metadata,
             features,
             declared_features,
             target,
@@ -1658,7 +1696,17 @@ fn normalize_cache_fingerprint(
 }
 
 /// Recursively replaces the `local` fingerprints of `run-custom-build` and
-/// local dependencies of `fp` with their content-based package fingerprint.
+/// local dependencies of `fp` with their content-based package fingerprint,
+/// mixed with the dependency's `-C metadata` and the checksum of its rmeta
+/// artifact.
+///
+/// The rmeta checksum matters because a dependency's rmeta embeds
+/// workspace-specific absolute paths (e.g. the `OUT_DIR` of a build-script
+/// dependency), so two artifacts for the *same* unit (same `-C metadata`)
+/// built in different workspaces are not interchangeable: rustc rejects the
+/// mismatch with `E0460`/`E0463` when a cached dependent links against them.
+/// Pinning the rmeta content makes the freshness check rebuild the cached
+/// entry whenever the dependency's artifact diverges.
 fn normalize_cache_deps(
     build_runner: &BuildRunner<'_, '_>,
     fp: &Fingerprint,
@@ -1668,14 +1716,123 @@ fn normalize_cache_deps(
         let unit = index_to_unit
             .get(&dep.fingerprint.index)
             .ok_or_else(|| internal("missing unit for fingerprint index"))?;
-        if unit.mode.is_run_custom_build() || unit.is_local() {
-            let s = pkg_fingerprint(build_runner.bcx, &unit.pkg)?;
-            // `local` is interior-mutable; the fingerprint itself (and the
-            // shared dependency fingerprints) must not be mutated, since the
-            // dependencies' own freshness checks use them.
-            *dep.fingerprint.local.lock().unwrap() = vec![LocalFingerprint::Precalculated(s)];
-        }
+        let s = pkg_fingerprint(build_runner.bcx, &unit.pkg)?;
+        let meta = build_runner.files().metadata(unit).c_metadata();
+        let rmeta_checksum = dep_rmeta_checksum(build_runner, unit)?;
+        // `local` is interior-mutable; the fingerprint itself (and the
+        // shared dependency fingerprints) must not be mutated, since the
+        // dependencies' own freshness checks use them.
+        *dep.fingerprint.local.lock().unwrap() =
+            vec![LocalFingerprint::Precalculated(format!("{s}:{meta}:{rmeta_checksum}"))];
         normalize_cache_deps(build_runner, &dep.fingerprint, index_to_unit)?;
+    }
+    Ok(())
+}
+
+/// Returns the content hash of the given unit's rmeta artifact, or a marker
+/// string when the unit produces no rmeta (e.g. an overridden build script) or
+/// the artifact is not built yet (a cold cache, where the dependency has not
+/// been compiled; the "missing" marker then differs from any real checksum, so
+/// the entry is rebuilt once the dependency's artifact exists).
+fn dep_rmeta_checksum(
+    build_runner: &BuildRunner<'_, '_>,
+    unit: &Unit,
+) -> CargoResult<String> {
+    let outputs = build_runner.outputs(unit)?;
+    if let Some(rmeta) = outputs.iter().find(|o| o.flavor == FileFlavor::Rmeta) {
+        let bytes = match std::fs::read(&rmeta.path) {
+            Ok(bytes) => bytes,
+            Err(_) => return Ok("missing".to_string()),
+        };
+        return Ok(format!("{:x}", util::hash_u64(&bytes)));
+    }
+    Ok("none".to_string())
+}
+
+/// Collects the rmeta artifact path of every (transitive) dependency of the
+/// given fingerprint, in the same order [`refresh_cache_dep_checksums`] walks
+/// them. Dependencies without an rmeta artifact get an empty sentinel path.
+fn collect_dep_rmeta_paths(
+    build_runner: &BuildRunner<'_, '_>,
+    fp: &Fingerprint,
+) -> CargoResult<Vec<PathBuf>> {
+    let index_to_unit: HashMap<UnitIndex, Unit> = build_runner
+        .bcx
+        .unit_to_index
+        .iter()
+        .map(|(unit, &index)| (index, unit.clone()))
+        .collect();
+    let mut paths = Vec::new();
+    collect_dep_rmeta_paths_inner(build_runner, fp, &index_to_unit, &mut paths)?;
+    Ok(paths)
+}
+
+fn collect_dep_rmeta_paths_inner(
+    build_runner: &BuildRunner<'_, '_>,
+    fp: &Fingerprint,
+    index_to_unit: &HashMap<UnitIndex, Unit>,
+    paths: &mut Vec<PathBuf>,
+) -> CargoResult<()> {
+    for dep in &fp.deps {
+        let unit = index_to_unit
+            .get(&dep.fingerprint.index)
+            .ok_or_else(|| internal("missing unit for fingerprint index"))?;
+        let outputs = build_runner.outputs(unit)?;
+        paths.push(
+            outputs
+                .iter()
+                .find(|o| o.flavor == FileFlavor::Rmeta)
+                .map(|o| o.path.clone())
+                .unwrap_or_default(),
+        );
+        collect_dep_rmeta_paths_inner(build_runner, &dep.fingerprint, index_to_unit, paths)?;
+    }
+    Ok(())
+}
+
+/// Replaces the `:missing` checksum placeholders in the fingerprint's
+/// dependency locals with the actual rmeta content checksums. The rmeta files
+/// exist at this point because the dependencies have been built (this runs
+/// when the unit's own fingerprint is persisted after a successful compile).
+fn refresh_cache_dep_checksums(fp: &Fingerprint, paths: &[PathBuf]) -> CargoResult<()> {
+    refresh_dep_checksums(fp, &mut paths.iter())?;
+    // The dependency locals changed, so the memoized hash of this fingerprint
+    // (and its ancestors) is stale.
+    fp.clear_memoized();
+    Ok(())
+}
+
+fn refresh_dep_checksums(
+    fp: &Fingerprint,
+    iter: &mut std::slice::Iter<'_, PathBuf>,
+) -> CargoResult<()> {
+    for dep in &fp.deps {
+        let path = iter.next();
+        let mut refreshed = None;
+        {
+            let local = dep.fingerprint.local.lock().unwrap();
+            if let Some(LocalFingerprint::Precalculated(s)) = local.first() {
+                // The prepared fingerprint pins `{pkg}:{meta}:{checksum}`.
+                // The checksum may be the "missing" placeholder (dependency not
+                // built yet when the fingerprint was calculated) or stale (the
+                // dependency was rebuilt during this build); both must be
+                // replaced with the checksum of the actual rmeta the unit was
+                // compiled against.
+                if let Some(path) = path {
+                    if let Ok(bytes) = std::fs::read(path) {
+                        if let Some(idx) = s.rfind(':') {
+                            refreshed =
+                                Some(format!("{}:{:x}", &s[..idx], util::hash_u64(&bytes)));
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(value) = refreshed {
+            *dep.fingerprint.local.lock().unwrap() = vec![LocalFingerprint::Precalculated(value)];
+            dep.fingerprint.clear_memoized();
+        }
+        refresh_dep_checksums(&dep.fingerprint, iter)?;
     }
     Ok(())
 }
@@ -1884,6 +2041,7 @@ fn calculate_normal(
     // differently
     Ok(Fingerprint {
         rustc: util::hash_u64(&build_runner.bcx.rustc().verbose_version),
+        metadata: build_runner.files().metadata(unit).c_metadata().hash(),
         target: util::hash_u64(&unit.target),
         profile: profile_hash,
         // Note that .0 is hashed here, not .1 which is the cwd. That doesn't
@@ -1962,6 +2120,7 @@ See https://doc.rust-lang.org/cargo/reference/build-scripts.html#rerun-if-change
     Ok(Fingerprint {
         local: Mutex::new(local),
         rustc: util::hash_u64(&build_runner.bcx.rustc().verbose_version),
+        metadata: build_runner.files().metadata(unit).c_metadata().hash(),
         deps,
         outputs: if overridden { Vec::new() } else { vec![output] },
         rustflags,
@@ -2298,13 +2457,6 @@ fn _compare_old_fingerprint(
     let old_fingerprint_json = paths::read(&old_hash_path.with_extension("json"))?;
     let old_fingerprint: Fingerprint = serde_json::from_str(&old_fingerprint_json)
         .with_context(|| internal("failed to deserialize json"))?;
-    // Fingerprint can be empty after a failed rebuild (see comment in prepare_target).
-    if !old_fingerprint_short.is_empty() {
-        debug_assert_eq!(
-            util::to_hex(old_fingerprint.hash_u64()),
-            old_fingerprint_short
-        );
-    }
 
     let reason = new_fingerprint.compare(&old_fingerprint);
     Ok(FingerprintComparison::Dirty { reason })

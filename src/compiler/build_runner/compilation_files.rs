@@ -42,6 +42,13 @@ impl fmt::Debug for UnitHash {
     }
 }
 
+impl UnitHash {
+    /// Returns the raw hash value.
+    pub fn hash(&self) -> u64 {
+        self.0
+    }
+}
+
 /// [`Metadata`] tracks several [`UnitHash`]s, including
 /// [`Metadata::unit_id`], [`Metadata::c_metadata`], and [`Metadata::c_extra_filename`].
 ///

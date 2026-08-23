@@ -425,8 +425,6 @@ the waiter-then-builder crash path can reach `rmeta_produced` twice.
     artifact bytes, `A` rebuilds; if `B`'s artifact is byte-identical, reuse
     is semantically correct.
 
-## Full test-suite results
-
 ## Locking refactor — counted locks, explicit protocol, assertions, observability
 
 The per-unit locking design was reworked to borrow the disciplines that make

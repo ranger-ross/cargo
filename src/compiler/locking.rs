@@ -357,11 +357,7 @@ impl LockManager {
     /// of lock-order cycles: a blocking conversion would drop the old locks
     /// while waiting anyway, but contenders probing at the same time could
     /// then wait on each other in a cycle.
-    pub fn exchange_for_exclusive(
-        &self,
-        primary: &LockKey,
-        keys: &[LockKey],
-    ) -> CargoResult<bool> {
+    pub fn exchange_for_exclusive(&self, primary: &LockKey, keys: &[LockKey]) -> CargoResult<bool> {
         debug_assert!(
             keys.iter().any(|k| k == primary),
             "the probed key must be among the released keys"
@@ -385,6 +381,17 @@ pub struct LockKey(PathBuf);
 impl LockKey {
     fn from_unit(build_runner: &BuildRunner<'_, '_>, unit: &Unit) -> Self {
         Self(build_runner.files().build_unit_lock(unit))
+    }
+
+    /// Creates a key for an arbitrary lock file path. Used by the build cache
+    /// coordination, which knows its state-lock paths up front.
+    pub(crate) fn from_path(path: PathBuf) -> Self {
+        Self(path)
+    }
+
+    /// The lock file path this key guards.
+    pub(crate) fn path(&self) -> &PathBuf {
+        &self.0
     }
 }
 
@@ -436,13 +443,19 @@ mod tests {
 
         // Another description cannot take the lock while we hold it.
         let p = probe(&path);
-        assert!(!try_exclusive(&path, &p), "exclusive probe succeeded while shared");
+        assert!(
+            !try_exclusive(&path, &p),
+            "exclusive probe succeeded while shared"
+        );
 
         // One unlock must not release anything; the last one must.
         lm.unlock(&k1).unwrap();
         assert!(!try_exclusive(&path, &p), "released too early");
         lm.unlock(&k2).unwrap();
-        assert!(try_exclusive(&path, &p), "lock still held after last unlock");
+        assert!(
+            try_exclusive(&path, &p),
+            "lock still held after last unlock"
+        );
     }
 
     #[test]
@@ -542,7 +555,6 @@ mod tests {
         lm.unlock(&key).unwrap();
     }
 
-
     #[test]
     fn exchange_acquires_exclusive_and_releases_the_rest() {
         let tmp = TempDir::new().unwrap();
@@ -553,7 +565,10 @@ mod tests {
         let kr = lm.lock_shared_path(rmeta.clone()).unwrap();
         let kl = lm.lock_shared_path(rlib.clone()).unwrap();
 
-        assert!(lm.exchange_for_exclusive(&kr, &[kr.clone(), kl.clone()]).unwrap());
+        assert!(
+            lm.exchange_for_exclusive(&kr, &[kr.clone(), kl.clone()])
+                .unwrap()
+        );
         {
             let locks = lm.locks.read();
             let entry = locks.get(&kr).unwrap();

@@ -63,18 +63,80 @@
 //! this is accepted for the PoC.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, OnceLock};
 
 use crate::compiler::job_queue::{JobState, Work};
 use crate::compiler::locking::LockKey;
 use crate::compiler::{BuildRunner, Unit};
-use crate::util::{CargoResult, internal};
+use crate::util::CargoResult;
+
+/// The lock keys and role flags for one coordinated cacheable unit.
+///
+/// The keys are known up front (they are derived from the unit's cache
+/// directory), so they are constructed once instead of being recovered from
+/// lookups after acquisition. The wait phases hold both keys shared; the
+/// builder holds them exclusively after the exchange, and downgrades them
+/// in [`CacheCoordination::downgrade_rmeta`] and
+/// [`CacheCoordination::after_work`].
+struct UnitLocks {
+    /// `.rmeta.lock`: held exclusively while compiling, downgraded to shared
+    /// as soon as rustc reports the `.rmeta` artifact.
+    rmeta: LockKey,
+    /// `.rlib.lock`: held exclusively while compiling, downgraded to shared
+    /// only after the fingerprint is persisted.
+    rlib: LockKey,
+    /// Whether the wait phases currently hold each key shared.
+    held_rmeta: AtomicBool,
+    held_rlib: AtomicBool,
+    /// Whether this process is (or became) the builder of the unit.
+    builder: AtomicBool,
+    /// Whether the rmeta lock has already been downgraded to shared.
+    rmeta_shared: AtomicBool,
+}
+
+impl UnitLocks {
+    fn new(rmeta: PathBuf, rlib: PathBuf) -> Self {
+        UnitLocks {
+            rmeta: LockKey::from_path(rmeta),
+            rlib: LockKey::from_path(rlib),
+            held_rmeta: AtomicBool::new(false),
+            held_rlib: AtomicBool::new(false),
+            builder: AtomicBool::new(false),
+            rmeta_shared: AtomicBool::new(false),
+        }
+    }
+
+    /// Releases every shared acquisition held by the wait phases.
+    fn release_shared(&self, state: &JobState<'_, '_>) -> CargoResult<()> {
+        if self.held_rlib.swap(false, Ordering::SeqCst) {
+            state.unlock(&self.rlib)?;
+        }
+        if self.held_rmeta.swap(false, Ordering::SeqCst) {
+            state.unlock(&self.rmeta)?;
+        }
+        Ok(())
+    }
+}
+
+/// The next step of the coordination protocol.
+enum Attempt {
+    /// Take `.rmeta.lock` shared, waiting until the rmeta is readable or the
+    /// builder is gone.
+    WaitForRmeta,
+    /// Detect an active builder via a non-blocking probe of `.rlib.lock`.
+    ProbeBuilder,
+    /// Convert the held shared locks into exclusive ownership of the unit
+    /// (builder takeover), re-evaluating if another process got there first.
+    TakeOver,
+    /// Finished. `true` means compile (builder role); `false` means skip
+    /// (the unit is complete).
+    Done(bool),
+}
 
 /// Per-job coordination state for building one cacheable unit.
 pub struct CacheCoordination {
-    rmeta_path: PathBuf,
-    rlib_path: PathBuf,
+    locks: UnitLocks,
     fingerprint: PathBuf,
     /// Hex fingerprint hash this unit would persist. A cached unit is
     /// "complete for this identity" when the stored fingerprint file matches
@@ -86,13 +148,6 @@ pub struct CacheCoordination {
     /// A cache hit additionally requires this so a partially written entry
     /// (e.g. missing outputs) is rebuilt rather than skipped.
     fs_up_to_date: bool,
-    /// Lock keys, populated by [`CacheCoordination::coordinate`].
-    rmeta_key: OnceLock<LockKey>,
-    rlib_key: OnceLock<LockKey>,
-    /// Whether this process is (or became) the builder of the unit.
-    builder: AtomicBool,
-    /// Whether the rmeta lock has already been downgraded to shared.
-    rmeta_shared: AtomicBool,
 }
 
 impl CacheCoordination {
@@ -103,15 +158,13 @@ impl CacheCoordination {
         completion: crate::compiler::fingerprint::CacheCompletionState,
     ) -> CargoResult<Arc<Self>> {
         Ok(Arc::new(CacheCoordination {
-            rmeta_path: build_runner.files().cache_rmeta_lock(unit),
-            rlib_path: build_runner.files().cache_rlib_lock(unit),
+            locks: UnitLocks::new(
+                build_runner.files().cache_rmeta_lock(unit),
+                build_runner.files().cache_rlib_lock(unit),
+            ),
             fingerprint: build_runner.files().fingerprint_file_path(unit, ""),
             expected_hash: completion.hash,
             fs_up_to_date: completion.fs_up_to_date,
-            rmeta_key: OnceLock::new(),
-            rlib_key: OnceLock::new(),
-            builder: AtomicBool::new(false),
-            rmeta_shared: AtomicBool::new(false),
         }))
     }
 
@@ -151,106 +204,124 @@ impl CacheCoordination {
     /// completed while we waited), in which case the caller must skip the
     /// compilation.
     pub(crate) fn coordinate(&self, state: &JobState<'_, '_>) -> CargoResult<bool> {
+        let mut attempt = Attempt::WaitForRmeta;
         loop {
-            // Wait until the `.rmeta` is (or was) available: the builder
-            // downgraded its rmeta lock to shared after rustc produced the
-            // file, the unit is complete, or the builder crashed and released
-            // its locks.
-            let rmeta = state.lock_shared_path(self.rmeta_path.clone())?;
-            let _ = self.rmeta_key.set(rmeta.clone());
-
-            // A fingerprint matching our expected hash, with an up-to-date
-            // filesystem status, means the unit is complete and immutable;
-            // there is nothing for us to do.
-            if self.is_complete(false) {
-                state.unlock(&rmeta)?;
-                return Ok(false);
-            }
-
-            // Try the rlib lock without blocking to detect whether a builder
-            // is still actively compiling.
-            let rlib = match state.try_lock_shared_path(self.rlib_path.clone())? {
-                // No builder is currently compiling the unit. The unit was
-                // either never built, already complete (completed while we
-                // waited for the rmeta lock), or a previous builder crashed;
-                // the first and last cases are handled by taking over below.
-                Some(rlib) => {
-                    // No builder observed; the unit is only complete if the
-                    // fingerprint matches and the filesystem status was
-                    // up-to-date at prepare time.
-                    if self.is_complete(false) {
-                        state.unlock(&rmeta)?;
-                        state.unlock(&rlib)?;
-                        return Ok(false);
-                    }
-                    rlib
-                }
-                // A builder is actively compiling. If the unit was never built
-                // (no fingerprint at all), our rmeta lock acquisition above
-                // proves its `.rmeta` is ready, so signal our own dependents
-                // to start pipelined compilation against the metadata while
-                // the builder still codegens. If the unit is being *rebuilt*
-                // in place (a stale fingerprint still exists), pipelining
-                // against the about-to-be-replaced rmeta would be incorrect,
-                // so we simply wait for completion.
-                None => {
-                    if !self.fingerprint_exists() {
-                        state.rmeta_produced();
-                    }
-                    // Wait for the builder to finish (or crash and release).
-                    // A builder was observed, so a matching fingerprint is
-                    // sufficient: it resolved the dirtiness.
-                    let rlib = state.lock_shared_path(self.rlib_path.clone())?;
-                    let _ = self.rlib_key.set(rlib.clone());
-                    if self.is_complete(true) {
-                        state.unlock(&rmeta)?;
-                        state.unlock(&rlib)?;
-                        return Ok(false);
-                    }
-                    // The builder crashed after producing the rmeta; we must
-                    // complete the unit ourselves.
-                    rlib
-                }
+            attempt = match attempt {
+                Attempt::WaitForRmeta => self.wait_for_rmeta(state)?,
+                Attempt::ProbeBuilder => self.probe_builder(state)?,
+                Attempt::TakeOver => self.take_over(state)?,
+                Attempt::Done(build) => return Ok(build),
             };
-            let _ = self.rlib_key.set(rlib.clone());
-
-            // Take the locks exclusively. `exchange_for_exclusive` releases
-            // our shared locks first so we hold nothing while probing, then
-            // probes the rmeta lock: if another process holds it (a builder
-            // that just finished, or another waiter), it will resolve the
-            // unit's state. Waiting for it on the shared rlib lock (again
-            // holding nothing) is bounded by that process's job and cannot
-            // deadlock, even when that process is itself waiting on a unit
-            // whose locks we hold.
-            let contended =
-                !state.exchange_for_exclusive(&rmeta, &[rmeta.clone(), rlib.clone()])?;
-            if contended {
-                // Someone else holds this unit's locks. They are either
-                // building it or waiting on it; either way their job will
-                // resolve the state. Wait for that job, then re-evaluate from
-                // scratch rather than blocking on the exclusive lock.
-                let rlib = state.lock_shared_path(self.rlib_path.clone())?;
-                let _ = self.rlib_key.set(rlib.clone());
-                if self.is_complete(true) {
-                    state.unlock(&rlib)?;
-                    return Ok(false);
-                }
-                state.unlock(&rlib)?;
-                continue;
-            }
-            // `try_lock_exclusive` above already took `.rmeta.lock`
-            // exclusively; only the rlib lock still needs acquiring. (A
-            // redundant re-acquisition would double-count against the
-            // lock manager's recursion accounting.)
-            state.lock_exclusive(&rlib)?;
-            if self.is_complete(false) {
-                state.unlock(&rlib)?;
-                state.unlock(&rmeta)?;
-                return Ok(false);
-            }
-            self.builder.store(true, Ordering::SeqCst);
-            return Ok(true);
         }
+    }
+
+    /// Takes `.rmeta.lock` shared, blocking until the rmeta is readable (the
+    /// builder downgraded its lock), the unit is complete, or the builder
+    /// crashed and released its locks.
+    fn wait_for_rmeta(&self, state: &JobState<'_, '_>) -> CargoResult<Attempt> {
+        state.lock_shared_path(self.locks.rmeta.path().clone())?;
+        self.locks.held_rmeta.store(true, Ordering::SeqCst);
+
+        // A fingerprint matching our expected hash, with an up-to-date
+        // filesystem status, means the unit is complete and immutable;
+        // there is nothing for us to do.
+        if self.is_complete(false) {
+            self.locks.release_shared(state)?;
+            return Ok(Attempt::Done(false));
+        }
+        Ok(Attempt::ProbeBuilder)
+    }
+
+    /// Detects an active builder via a non-blocking probe of `.rlib.lock`,
+    /// then either waits for it or prepares a takeover of the crashed build.
+    fn probe_builder(&self, state: &JobState<'_, '_>) -> CargoResult<Attempt> {
+        match state.try_lock_shared_path(self.locks.rlib.path().clone())? {
+            // No builder is currently compiling the unit. The unit was
+            // either never built, already complete (completed while we
+            // waited for the rmeta lock), or a previous builder crashed;
+            // the first and last cases are handled by taking over below.
+            Some(_) => {
+                self.locks.held_rlib.store(true, Ordering::SeqCst);
+                if self.is_complete(false) {
+                    self.locks.release_shared(state)?;
+                    return Ok(Attempt::Done(false));
+                }
+                Ok(Attempt::TakeOver)
+            }
+            // A builder is actively compiling. If the unit was never built
+            // (no fingerprint at all), our `.rmeta.lock` acquisition proves
+            // its `.rmeta` is ready, so signal our own dependents to start
+            // pipelined compilation against the metadata while the builder
+            // still codegens. If the unit is being *rebuilt* in place (a
+            // stale fingerprint still exists), pipelining against the
+            // about-to-be-replaced rmeta would be incorrect, so we simply
+            // wait for completion.
+            None => {
+                if !self.fingerprint_exists() {
+                    state.rmeta_produced();
+                }
+                // Wait for the builder to finish (or crash and release).
+                // A builder was observed, so a matching fingerprint is
+                // sufficient: it resolved the dirtiness.
+                state.lock_shared_path(self.locks.rlib.path().clone())?;
+                self.locks.held_rlib.store(true, Ordering::SeqCst);
+                if self.is_complete(true) {
+                    self.locks.release_shared(state)?;
+                    return Ok(Attempt::Done(false));
+                }
+                // The builder crashed after producing the rmeta; we must
+                // complete the unit ourselves.
+                Ok(Attempt::TakeOver)
+            }
+        }
+    }
+
+    /// Converts the held shared locks into exclusive ownership of the unit.
+    ///
+    /// `exchange_for_exclusive` releases our shared locks first so we hold
+    /// nothing while probing, then probes the rmeta lock: if another process
+    /// holds it (a builder that just finished, or another waiter), it will
+    /// resolve the unit's state. Waiting for that process on the shared rlib
+    /// lock (again holding nothing) is bounded by its job and cannot
+    /// deadlock, even when it is itself waiting on a unit whose locks we
+    /// hold.
+    fn take_over(&self, state: &JobState<'_, '_>) -> CargoResult<Attempt> {
+        debug_assert!(
+            self.locks.held_rmeta.load(Ordering::SeqCst)
+                && self.locks.held_rlib.load(Ordering::SeqCst),
+            "takeover requires both locks held shared"
+        );
+        self.locks.held_rmeta.store(false, Ordering::SeqCst);
+        self.locks.held_rlib.store(false, Ordering::SeqCst);
+        let contended = !state.exchange_for_exclusive(
+            &self.locks.rmeta,
+            &[self.locks.rmeta.clone(), self.locks.rlib.clone()],
+        )?;
+        if contended {
+            // Someone else holds this unit's locks. They are either building
+            // it or waiting on it; either way their job will resolve the
+            // state. Wait for that job, then re-evaluate from scratch rather
+            // than blocking on the exclusive lock.
+            state.lock_shared_path(self.locks.rlib.path().clone())?;
+            if self.is_complete(true) {
+                state.unlock(&self.locks.rlib)?;
+                return Ok(Attempt::Done(false));
+            }
+            state.unlock(&self.locks.rlib)?;
+            return Ok(Attempt::WaitForRmeta);
+        }
+        // `exchange_for_exclusive` already took `.rmeta.lock` exclusively;
+        // only the rlib lock still needs acquiring. (A redundant
+        // re-acquisition would double-count against the lock manager's
+        // recursion accounting.)
+        state.lock_exclusive(&self.locks.rlib)?;
+        if self.is_complete(false) {
+            state.unlock(&self.locks.rlib)?;
+            state.unlock(&self.locks.rmeta)?;
+            return Ok(Attempt::Done(false));
+        }
+        self.locks.builder.store(true, Ordering::SeqCst);
+        Ok(Attempt::Done(true))
     }
 
     /// Downgrades the rmeta lock to shared. Called when rustc reports the
@@ -258,12 +329,8 @@ impl CacheCoordination {
     /// written (in case rustc never reported an rmeta, e.g. for units whose
     /// dependents do not pipeline). Idempotent.
     pub(crate) fn downgrade_rmeta(&self, state: &JobState<'_, '_>) -> CargoResult<()> {
-        if !self.rmeta_shared.swap(true, Ordering::SeqCst) {
-            let key = self
-                .rmeta_key
-                .get()
-                .ok_or_else(|| internal("cache rmeta lock was not acquired"))?;
-            state.downgrade_to_shared(key)?;
+        if !self.locks.rmeta_shared.swap(true, Ordering::SeqCst) {
+            state.downgrade_to_shared(&self.locks.rmeta)?;
         }
         Ok(())
     }
@@ -275,13 +342,9 @@ impl CacheCoordination {
     pub fn after_work(this: &Arc<Self>) -> Work {
         let this = Arc::clone(this);
         Work::new(move |state| {
-            if this.builder.load(Ordering::SeqCst) {
+            if this.locks.builder.load(Ordering::SeqCst) {
                 this.downgrade_rmeta(state)?;
-                let key = this
-                    .rlib_key
-                    .get()
-                    .ok_or_else(|| internal("cache rlib lock was not acquired"))?;
-                state.downgrade_to_shared(key)?;
+                state.downgrade_to_shared(&this.locks.rlib)?;
             }
             Ok(())
         })

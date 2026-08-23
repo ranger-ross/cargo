@@ -334,6 +334,70 @@ shared
 }
 
 #[cargo_test]
+fn concurrent_builders_resolve_to_a_single_builder() {
+    let git_project = git::new("dep1", |project| {
+        project
+            .file("Cargo.toml", &basic_lib_manifest("dep1"))
+            .file(
+                "src/lib.rs",
+                r#"pub fn hello() -> &'static str { "racing" }"#,
+            )
+    });
+
+    let make_ws = |name: &str, pkg: &str| {
+        project_in(name)
+            .file(
+                "Cargo.toml",
+                &format!(
+                    r#"
+                        [package]
+                        name = "{pkg}"
+                        version = "0.5.0"
+                        edition = "2015"
+
+                        [dependencies.dep1]
+                        git = '{}'
+                    "#,
+                    git_project.url()
+                ),
+            )
+            .file(
+                "src/main.rs",
+                &main_file(r#""{}", dep1::hello()"#, &["dep1"]),
+            )
+            .build()
+    };
+
+    // Three processes race on the same cold unit. Whichever loses the
+    // exclusive probe must release everything, wait on the winner's job, and
+    // re-evaluate from scratch rather than blocking on the exclusive lock.
+    let ws_a = make_ws("ws-a", "foo-a");
+    let ws_b = make_ws("ws-b", "foo-b");
+    let ws_c = make_ws("ws-c", "foo-c");
+
+    let mut a = ws_a.cargo("build");
+    let mut b = ws_b.cargo("build");
+    let mut c = ws_c.cargo("build");
+    let ra = cargo_test_support::threaded_timeout(600, move || a.run());
+    let rb = cargo_test_support::threaded_timeout(600, move || b.run());
+    let rc = cargo_test_support::threaded_timeout(600, move || c.run());
+    drop(ra);
+    drop(rb);
+    drop(rc);
+
+    assert_eq!(cached_rlibs().len(), 1, "exactly one cached rlib expected");
+    for (ws, bin) in [(&ws_a, "foo-a"), (&ws_b, "foo-b"), (&ws_c, "foo-c")] {
+        assert!(ws.bin(bin).is_file());
+        ws.process(&ws.bin(bin))
+            .with_stdout_data(str![[r#"
+racing
+
+"#]])
+            .run();
+    }
+}
+
+#[cargo_test]
 fn check_units_shared_across_workspaces() {
     let git_project = git::new("dep1", |project| {
         project

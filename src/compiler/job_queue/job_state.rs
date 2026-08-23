@@ -190,17 +190,9 @@ impl<'a, 'gctx> JobState<'a, 'gctx> {
         self.lock_manager.lock(lock)
     }
 
-    pub fn try_lock_exclusive(&self, lock: &LockKey) -> CargoResult<bool> {
-        self.lock_manager.try_lock_exclusive(lock)
-    }
-
     /// Converts held shared locks into an exclusive lock on `primary`. See
     /// [`LockManager::exchange_for_exclusive`].
-    pub fn exchange_for_exclusive(
-        &self,
-        primary: &LockKey,
-        keys: &[LockKey],
-    ) -> CargoResult<bool> {
+    pub fn exchange_for_exclusive(&self, primary: &LockKey, keys: &[LockKey]) -> CargoResult<bool> {
         self.lock_manager.exchange_for_exclusive(primary, keys)
     }
 

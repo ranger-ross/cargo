@@ -597,6 +597,7 @@ impl<'gctx> DrainState<'gctx> {
                 build_runner.bcx.ws.root(),
                 &unit,
                 job.freshness(),
+                &job,
             )?;
             self.run(&unit, job, build_runner, scope);
         }
@@ -1222,6 +1223,7 @@ impl<'gctx> DrainState<'gctx> {
         ws_root: &Path,
         unit: &Unit,
         fresh: &Freshness,
+        job: &Job,
     ) -> CargoResult<()> {
         if (self.compiled.contains(&unit.pkg.package_id())
             && !unit.mode.is_doc()
@@ -1250,6 +1252,13 @@ impl<'gctx> DrainState<'gctx> {
                 } else if unit.mode.is_doc_scrape() {
                     self.scraped.insert(unit.pkg.package_id());
                     gctx.shell().status("Scraping", &unit.pkg)?;
+                } else if job
+                    .cache_hit_probe()
+                    .is_some_and(|probe| probe().unwrap_or(false))
+                {
+                    // A complete build-cache entry will be reused instead of
+                    // compiled; the job reports the hit itself.
+                    self.compiled.insert(unit.pkg.package_id());
                 } else {
                     self.compiled.insert(unit.pkg.package_id());
                     if unit.mode.is_check() {

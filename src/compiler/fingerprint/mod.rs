@@ -562,7 +562,14 @@ pub fn prepare_target(
     // But the executable is corrupt and needs to be rebuilt. Clearing the
     // fingerprint at step 3 ensures that Cargo never mistakes a partially
     // written output as up-to-date.
-    if loc.exists() {
+    // Cacheable units must not truncate: their fingerprint file lives inside
+    // the immutable cache entry, and wiping it would destroy a still-valid
+    // entry whenever the unit is planned as dirty (e.g. a workspace clean
+    // made a non-cacheable dependency's fingerprint disappear). The
+    // coordination protocol re-checks completion under the unit's exclusive
+    // locks before skipping the compile, so a stale or partial entry is
+    // resolved there rather than by pre-wiping the fingerprint.
+    if loc.exists() && !is_cacheable {
         // Truncate instead of delete so that compare_old_fingerprint will
         // still log the reason for the fingerprint failure instead of just
         // reporting "failed to read fingerprint" during the next build if
@@ -2316,11 +2323,15 @@ pub fn prepare_init(build_runner: &mut BuildRunner<'_, '_>, unit: &Unit) -> Carg
 /// whether a cached unit is complete *for this unit's identity and filesystem
 /// state*.
 pub(crate) struct CacheCompletionState {
-    /// Hex fingerprint hash this unit would persist. The stored fingerprint
-    /// file encodes identity information (e.g. the git revision) beyond what
-    /// the unit hash captures, so completion is checked by comparing file
-    /// content rather than mere existence.
-    pub(crate) hash: String,
+    /// The unit's normalized fingerprint as a private clone. The pinned
+    /// dependency rmeta checksums start as "missing" placeholders when the
+    /// dependencies are not built yet (a cold workspace); call
+    /// [`CacheCompletionState::expected_hash`] to refresh them from the
+    /// artifacts that exist at check time.
+    pub(crate) fingerprint: parking_lot::Mutex<Fingerprint>,
+    /// The rmeta artifact paths of every transitive dependency, in the order
+    /// [`refresh_cache_dep_checksums`] walks them.
+    pub(crate) rmeta_paths: Vec<PathBuf>,
     /// Whether the fingerprint's filesystem-status was up-to-date when it was
     /// computed, i.e. the unit's own outputs exist and its own local inputs
     /// (dep-info tracked) are unchanged. Dependency staleness is not part of
@@ -2330,15 +2341,37 @@ pub(crate) struct CacheCompletionState {
     pub(crate) fs_up_to_date: bool,
 }
 
+impl CacheCompletionState {
+    /// Returns the hex hash a complete cache entry must match.
+    ///
+    /// The stored fingerprint was written after this unit compiled against
+    /// its dependencies' actual rmeta bytes (`refresh_cache_dep_checksums`
+    /// runs before `write_fingerprint`). Comparing against it therefore
+    /// requires the same refresh here: on a cold workspace the plan-time
+    /// checksums were placeholders because the dependencies had not been
+    /// built yet, but by the time a dirty unit's job executes they have
+    /// been (the job queue compiles dependencies first), so refreshing
+    /// yields the values the entry was persisted with and an intact entry
+    /// is recognized instead of rebuilt.
+    pub(crate) fn expected_hash(&self) -> CargoResult<String> {
+        let fp = self.fingerprint.lock();
+        refresh_cache_dep_checksums(&fp, &self.rmeta_paths)?;
+        Ok(util::to_hex(fp.hash_u64()))
+    }
+}
+
 /// Returns the fingerprint state a cacheable `unit` would persist.
 pub(crate) fn cache_completion_state(
     build_runner: &mut BuildRunner<'_, '_>,
     unit: &Unit,
 ) -> CargoResult<CacheCompletionState> {
     let fingerprint = calculate(build_runner, unit)?;
+    let fs_up_to_date = fingerprint.fs_status.up_to_date();
+    let rmeta_paths = collect_dep_rmeta_paths(build_runner, &fingerprint)?;
     Ok(CacheCompletionState {
-        hash: util::to_hex(fingerprint.hash_u64()),
-        fs_up_to_date: fingerprint.fs_status.up_to_date(),
+        fingerprint: parking_lot::Mutex::new(fingerprint.deep_clone()),
+        rmeta_paths,
+        fs_up_to_date,
     })
 }
 

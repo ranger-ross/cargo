@@ -138,16 +138,10 @@ enum Attempt {
 pub struct CacheCoordination {
     locks: UnitLocks,
     fingerprint: PathBuf,
-    /// Hex fingerprint hash this unit would persist. A cached unit is
-    /// "complete for this identity" when the stored fingerprint file matches
-    /// this value (the content encodes identity information such as the git
-    /// revision that the unit hash does not capture).
-    expected_hash: String,
-    /// Whether the fingerprint's filesystem-status was up-to-date when it was
-    /// computed (see [`crate::compiler::fingerprint::CacheCompletionState`]).
-    /// A cache hit additionally requires this so a partially written entry
-    /// (e.g. missing outputs) is rebuilt rather than skipped.
-    fs_up_to_date: bool,
+    /// The unit's normalized fingerprint and filesystem state used to decide
+    /// whether a cache entry is complete (see
+    /// [`crate::compiler::fingerprint::CacheCompletionState`]).
+    completion: crate::compiler::fingerprint::CacheCompletionState,
 }
 
 impl CacheCoordination {
@@ -163,8 +157,7 @@ impl CacheCoordination {
                 build_runner.files().cache_rlib_lock(unit),
             ),
             fingerprint: build_runner.files().fingerprint_file_path(unit, ""),
-            expected_hash: completion.hash,
-            fs_up_to_date: completion.fs_up_to_date,
+            completion,
         }))
     }
 
@@ -176,15 +169,15 @@ impl CacheCoordination {
     /// resolves the unit's dirtiness, so a content match alone is enough to
     /// skip when one was seen. Without an active builder, the unit is only
     /// complete when the fingerprint matches *and* the filesystem status was
-    /// up-to-date at prepare time — otherwise the staleness (our own outputs
+    /// up-to-date at prepare time, otherwise the staleness (our own outputs
     /// missing on a cold or partially-written cache) still needs to be
     /// resolved by building.
-    fn is_complete(&self, builder_active: bool) -> bool {
+    pub(crate) fn is_complete(&self, builder_active: bool) -> CargoResult<bool> {
         let content_matches = match cargo_util::paths::read(&self.fingerprint) {
-            Ok(stored) => stored == self.expected_hash,
+            Ok(stored) => stored == self.completion.expected_hash()?,
             Err(_) => false,
         };
-        content_matches && (self.fs_up_to_date || builder_active)
+        Ok(content_matches && (self.completion.fs_up_to_date || builder_active))
     }
 
     /// Returns whether any fingerprint file exists at all.
@@ -225,7 +218,7 @@ impl CacheCoordination {
         // A fingerprint matching our expected hash, with an up-to-date
         // filesystem status, means the unit is complete and immutable;
         // there is nothing for us to do.
-        if self.is_complete(false) {
+        if self.is_complete(false)? {
             self.locks.release_shared(state)?;
             return Ok(Attempt::Done(false));
         }
@@ -242,7 +235,7 @@ impl CacheCoordination {
             // the first and last cases are handled by taking over below.
             Some(_) => {
                 self.locks.held_rlib.store(true, Ordering::SeqCst);
-                if self.is_complete(false) {
+                if self.is_complete(false)? {
                     self.locks.release_shared(state)?;
                     return Ok(Attempt::Done(false));
                 }
@@ -269,7 +262,7 @@ impl CacheCoordination {
                 // sufficient: it resolved the dirtiness.
                 state.lock_shared_path(self.locks.rlib.path().clone())?;
                 self.locks.held_rlib.store(true, Ordering::SeqCst);
-                if self.is_complete(true) {
+                if self.is_complete(true)? {
                     self.locks.release_shared(state)?;
                     return Ok(Attempt::Done(false));
                 }
@@ -307,7 +300,7 @@ impl CacheCoordination {
             // state. Wait for that job, then re-evaluate from scratch rather
             // than blocking on the exclusive lock.
             state.lock_shared_path(self.locks.rlib.path().clone())?;
-            if self.is_complete(true) {
+            if self.is_complete(true)? {
                 state.unlock(&self.locks.rlib)?;
                 return Ok(Attempt::Done(false));
             }
@@ -319,7 +312,7 @@ impl CacheCoordination {
         // re-acquisition would double-count against the lock manager's
         // recursion accounting.)
         state.lock_exclusive(&self.locks.rlib)?;
-        if self.is_complete(false) {
+        if self.is_complete(false)? {
             state.unlock(&self.locks.rlib)?;
             state.unlock(&self.locks.rmeta)?;
             return Ok(Attempt::Done(false));

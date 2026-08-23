@@ -230,6 +230,10 @@ fn compile<'gctx>(
             } else {
                 None
             };
+            if let Some(cache) = &cache {
+                let cache = std::sync::Arc::clone(cache);
+                job.set_cache_hit_probe(std::sync::Arc::new(move || cache.is_complete(false)));
+            }
             job.before(if job.freshness().is_dirty() {
                 let work = if unit.mode.is_doc() || unit.mode.is_doc_scrape() {
                     rustdoc(build_runner, unit)?

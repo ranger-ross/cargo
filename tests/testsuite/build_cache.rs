@@ -45,6 +45,34 @@ fn cached_rlibs() -> Vec<PathBuf> {
         .collect()
 }
 
+/// Returns the sorted package names that have entries in the build cache.
+fn cached_pkgs() -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(build_cache_root())
+        .expect("cache root should exist")
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .collect();
+    names.sort();
+    names
+}
+
+/// Returns the modification time of every file under `root`, sorted by path.
+fn mtimes_under(root: &Path) -> Vec<(PathBuf, std::time::SystemTime)> {
+    let mut out = collect_files(root)
+        .into_iter()
+        .map(|p| {
+            let mtime = p
+                .metadata()
+                .expect("file exists")
+                .modified()
+                .expect("mtime supported");
+            (p, mtime)
+        })
+        .collect::<Vec<(PathBuf, std::time::SystemTime)>>();
+    out.sort();
+    out
+}
+
 #[cargo_test]
 fn git_dep_built_into_cache_and_reused() {
     let git_project = git::new("dep1", |project| {
@@ -185,6 +213,82 @@ fn held_locks_summarized_under_build_analysis() {
 [FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
         Held 1x shared [ROOT]/home/.cargo/build-cache/dep1/[HASH]/.rlib.lock
      1x shared [ROOT]/home/.cargo/build-cache/dep1/[HASH]/.rmeta.lock
+
+"#]])
+        .run();
+}
+
+#[cargo_test]
+fn cache_entry_reused_after_workspace_clean() {
+    // A dependency with a build script is not cacheable, but a cacheable
+    // unit that depends on it must still be recognized after the workspace
+    // build dir is deleted: rebuilding the non-cacheable dependency used to
+    // dirty dependents' cache entries (the plan-time fingerprint pins
+    // placeholder checksums for dependencies that are not built yet) and
+    // forced pointless recompiles of immutable entries.
+    Package::new("script_dep", "0.1.0")
+        .file("build.rs", "fn main() {}")
+        .file("src/lib.rs", r#"pub fn value() -> u32 { 1 }"#)
+        .publish();
+    Package::new("mid", "0.1.0")
+        .dep("script_dep", "0.1.0")
+        .file(
+            "src/lib.rs",
+            r#"pub fn value() -> u32 { script_dep::value() * 2 }"#,
+        )
+        .publish();
+
+    let ws = project()
+        .file(
+            "Cargo.toml",
+            r#"
+                [package]
+                name = "foo"
+                version = "0.5.0"
+                edition = "2015"
+
+                [dependencies]
+                mid = "0.1.0"
+            "#,
+        )
+        .file("src/main.rs", &main_file(r#""{}", mid::value()"#, &["mid"]))
+        .build();
+
+    ws.cargo("build").run();
+    ws.process(&ws.bin("foo"))
+        .with_stdout_data(str![[r#"
+2
+
+"#]])
+        .run();
+    assert_eq!(cached_pkgs(), vec!["mid"]);
+
+    let entry_before = mtimes_under(&build_cache_root());
+    // Clean the workspace and rebuild. `script_dep` recompiles (it was never
+    // cached), but `mid` is served from its intact cache entry without
+    // recompiling or rewriting it.
+    std::fs::remove_dir_all(paths::root().join("foo/target")).unwrap();
+    if is_coarse_mtime() {
+        sleep_ms(1000);
+    }
+    ws.cargo("build")
+        .with_stderr_does_not_contain("[COMPILING] mid v0.1.0")
+        .with_stdout_contains("build cache: `mid` mid is fresh [..]")
+        .run();
+    // The compiled artifacts and lock files must be untouched. (The stored
+    // fingerprint is rewritten with identical content by the job's
+    // bookkeeping, so its mtime is not compared.)
+    let artifacts_unchanged = mtimes_under(&build_cache_root())
+        .into_iter()
+        .filter(|(p, _)| !p.components().any(|c| c.as_os_str() == "fingerprint"))
+        .eq(entry_before
+            .into_iter()
+            .filter(|(p, _)| !p.components().any(|c| c.as_os_str() == "fingerprint")));
+    assert!(artifacts_unchanged);
+
+    ws.process(&ws.bin("foo"))
+        .with_stdout_data(str![[r#"
+2
 
 "#]])
         .run();

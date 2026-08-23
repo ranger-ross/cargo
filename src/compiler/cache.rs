@@ -238,7 +238,10 @@ impl CacheCoordination {
                 state.unlock(&rlib)?;
                 continue;
             }
-            state.lock_exclusive(&rmeta)?;
+            // `try_lock_exclusive` above already took `.rmeta.lock`
+            // exclusively; only the rlib lock still needs acquiring. (A
+            // redundant re-acquisition would double-count against the
+            // lock manager's recursion accounting.)
             state.lock_exclusive(&rlib)?;
             if self.is_complete(false) {
                 state.unlock(&rlib)?;

@@ -25,7 +25,41 @@ use tracing::instrument;
 /// this process (including operations that the lock we are waiting on may
 /// depend on), turning a cross-process wait into a deadlock.
 pub struct LockManager {
-    locks: RwLock<HashMap<LockKey, Arc<FileLock>>>,
+    locks: RwLock<HashMap<LockKey, ManagedLock>>,
+}
+
+/// The mode a [`LockManager`] entry was last acquired or transitioned to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LockMode {
+    Shared,
+    Exclusive,
+}
+
+/// A lock handle tracked by [`LockManager`], mirroring the counting
+/// discipline of the package cache locker (`util::cache_lock`).
+#[derive(Debug)]
+struct ManagedLock {
+    file: Arc<FileLock>,
+    /// Number of active acquisitions of this key within this process. The
+    /// underlying `flock` is taken on the 0-to-1 transition and released on
+    /// the 1-to-0 transition.
+    ///
+    /// Counts are per key, not per acquisition fd: one build unit maps to
+    /// exactly one job inside a process (the job queue dedupes units), so a
+    /// key has a single in-process owner. [`LockManager`] debug-asserts
+    /// acquisitions that would violate this.
+    count: u32,
+    mode: LockMode,
+}
+
+impl ManagedLock {
+    fn new(file: Arc<FileLock>) -> Self {
+        ManagedLock {
+            file,
+            count: 0,
+            mode: LockMode::Shared,
+        }
+    }
 }
 
 impl LockManager {
@@ -35,9 +69,39 @@ impl LockManager {
         }
     }
 
+    /// Bumps the recursion count when `key` is already locked shared in this
+    /// process, mirroring the recursive locking of the package cache locker
+    /// (`util::cache_lock`). Returns whether the bump happened.
+    ///
+    /// This only touches the lock table and never calls `flock`, so holding
+    /// the table lock while doing it cannot turn a cross-process wait into a
+    /// deadlock.
+    fn increment_shared(&self, key: &LockKey) -> bool {
+        let mut locks = self.locks.write();
+        match locks.get_mut(key) {
+            Some(entry) if entry.count > 0 && entry.mode == LockMode::Shared => {
+                entry.count += 1;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Returns the tracked handle for `key` without blocking.
+    fn handle(&self, key: &LockKey) -> CargoResult<Arc<FileLock>> {
+        let locks = self.locks.read();
+        match locks.get(key) {
+            Some(entry) => Ok(Arc::clone(&entry.file)),
+            None => bail!("lock was not found in lock manager: {key}"),
+        }
+    }
+
     /// Takes a shared lock on a given [`Unit`]
     /// This prevents other Cargo instances from compiling (writing) to
     /// this build unit.
+    ///
+    /// Recursive acquisitions are counted: the underlying `flock` is taken
+    /// once and released when the last acquisition is unlocked.
     ///
     /// This function returns a [`LockKey`] which can be used to
     /// upgrade/unlock the lock.
@@ -50,23 +114,33 @@ impl LockManager {
         let key = LockKey::from_unit(build_runner, unit);
         tracing::Span::current().record("key", key.0.to_str());
 
-        if let Some(lock) = self.locks.read().get(&key) {
-            let lock = Arc::clone(lock);
-            flock::lock_shared(lock.file())?;
+        // Fast path: already held shared by this process; recursion is a
+        // pure count bump.
+        if self.increment_shared(&key) {
             return Ok(key);
         }
 
-        // Open (and, if necessary, block for) the lock without holding the
-        // lock table.
-        let fs = Filesystem::new(key.0.clone());
-        let lock_msg = format!(
-            "{} ({})",
-            unit.pkg.name(),
-            build_runner.files().unit_hash(unit)
-        );
-        let lock = fs.open_ro_shared_create(&key.0, build_runner.bcx.gctx, &lock_msg)?;
-        self.locks.write().insert(key.clone(), Arc::new(lock));
-
+        // Slow path: ensure a handle exists, opening (and, if necessary,
+        // blocking for) the lock without holding the lock table.
+        if self.locks.read().get(&key).is_none() {
+            let fs = Filesystem::new(key.0.clone());
+            let lock_msg = format!(
+                "{} ({})",
+                unit.pkg.name(),
+                build_runner.files().unit_hash(unit)
+            );
+            let lock = fs.open_ro_shared_create(&key.0, build_runner.bcx.gctx, &lock_msg)?;
+            self.locks
+                .write()
+                .entry(key.clone())
+                .or_insert_with(|| ManagedLock::new(Arc::new(lock)));
+        }
+        let file = self.handle(&key)?;
+        flock::lock_shared(file.file())?;
+        let mut locks = self.locks.write();
+        let entry = locks.get_mut(&key).expect("handle lookup succeeded");
+        entry.count += 1;
+        entry.mode = LockMode::Shared;
         Ok(key)
     }
 
@@ -75,6 +149,9 @@ impl LockManager {
     /// cross-workspace build cache, which are acquired from worker threads
     /// that have no shell access, so no "Blocking" message is printed.
     ///
+    /// Recursive acquisitions are counted: the underlying `flock` is taken
+    /// once and released when the last acquisition is unlocked.
+    ///
     /// This function returns a [`LockKey`] which can be used to
     /// upgrade/unlock the lock.
     #[instrument(skip_all, fields(key))]
@@ -82,21 +159,29 @@ impl LockManager {
         let key = LockKey(path);
         tracing::Span::current().record("key", key.0.to_str());
 
-        // Fast path: a handle already exists and can be (re-)locked without
-        // blocking.
-        if let Some(lock) = self.locks.read().get(&key) {
-            let lock = Arc::clone(lock);
-            if try_acquire_shared(&key.0, lock.file())? {
-                return Ok(key);
-            }
+        // Fast path: already held shared by this process; recursion is a
+        // pure count bump.
+        if self.increment_shared(&key) {
+            return Ok(key);
         }
 
-        // Slow path: open (and, if necessary, block for) the lock without
-        // holding the lock table, so a blocking `flock` does not serialize
-        // every other lock operation in this process.
-        let lock = flock::open_ro_shared_no_msg(&key.0)?;
-        self.locks.write().insert(key.clone(), Arc::new(lock));
-
+        // Slow path: ensure a handle exists, opening (and, if necessary,
+        // blocking for) the lock without holding the lock table, so a
+        // blocking `flock` does not serialize every other lock operation in
+        // this process.
+        if self.locks.read().get(&key).is_none() {
+            let lock = flock::open_ro_shared_no_msg(&key.0)?;
+            self.locks
+                .write()
+                .entry(key.clone())
+                .or_insert_with(|| ManagedLock::new(Arc::new(lock)));
+        }
+        let file = self.handle(&key)?;
+        flock::lock_shared(file.file())?;
+        let mut locks = self.locks.write();
+        let entry = locks.get_mut(&key).expect("handle lookup succeeded");
+        entry.count += 1;
+        entry.mode = LockMode::Shared;
         Ok(key)
     }
 
@@ -109,60 +194,151 @@ impl LockManager {
         let key = LockKey(path);
         tracing::Span::current().record("key", key.0.to_str());
 
-        if let Some(lock) = self.locks.read().get(&key) {
-            let lock = Arc::clone(lock);
-            if try_acquire_shared(&key.0, lock.file())? {
-                return Ok(Some(key));
-            }
+        // Fast path: already held shared by this process; recursion is a
+        // pure count bump.
+        if self.increment_shared(&key) {
+            return Ok(Some(key));
+        }
+
+        // Slow path: ensure a handle exists. Creating the lock file and
+        // probing it are non-blocking.
+        if self.locks.read().get(&key).is_none() {
+            let fs = Filesystem::new(key.0.clone());
+            let Some(lock) = fs.try_open_ro_shared_create(&key.0)? else {
+                return Ok(None);
+            };
+            self.locks
+                .write()
+                .entry(key.clone())
+                .or_insert_with(|| ManagedLock::new(Arc::new(lock)));
+        }
+        {
+            let locks = self.locks.read();
+            let entry = locks.get(&key).expect("handle lookup succeeded");
+            debug_assert!(
+                !(entry.count > 0 && entry.mode == LockMode::Exclusive),
+                "taking shared while exclusively held within this process \
+                 would silently downgrade the exclusive lock"
+            );
+        }
+        let file = self.handle(&key)?;
+        if !try_acquire_shared(&key.0, file.file())? {
             return Ok(None);
         }
-        let fs = Filesystem::new(key.0.clone());
-        let Some(lock) = fs.try_open_ro_shared_create(&key.0)? else {
-            return Ok(None);
-        };
-        self.locks.write().insert(key.clone(), Arc::new(lock));
+        let mut locks = self.locks.write();
+        let entry = locks.get_mut(&key).expect("handle lookup succeeded");
+        entry.count += 1;
+        entry.mode = LockMode::Shared;
         Ok(Some(key))
     }
 
+    /// Takes an exclusive lock, blocking if another process holds it.
+    ///
+    /// Callers must not hold the same key shared: a blocking shared-to-
+    /// exclusive conversion on one descriptor drops the old lock while
+    /// waiting, which allows lock-order cycles between contenders. Release
+    /// shared acquisitions first, as the cache coordination protocol does.
     #[instrument(skip(self))]
     pub fn lock(&self, key: &LockKey) -> CargoResult<()> {
-        let Some(lock) = self.locks.read().get(key).cloned() else {
-            bail!("lock was not found in lock manager: {key}");
-        };
+        {
+            let locks = self.locks.read();
+            match locks.get(key) {
+                Some(entry) => {
+                    debug_assert!(
+                        entry.count == 0 || entry.mode == LockMode::Exclusive,
+                        "shared-to-exclusive conversion requires releasing the \
+                         shared lock first"
+                    );
+                }
+                None => bail!("lock was not found in lock manager: {key}"),
+            }
+        }
+        let file = self.handle(key)?;
         // Block outside the lock table (see struct docs).
-        flock::lock_exclusive(lock.file())?;
+        flock::lock_exclusive(file.file())?;
+        let mut locks = self.locks.write();
+        let entry = locks.get_mut(key).expect("handle lookup succeeded");
+        entry.count += 1;
+        entry.mode = LockMode::Exclusive;
         Ok(())
     }
 
     /// Non-blocking variant of [`LockManager::lock`].
     ///
-    /// Returns `Ok(true)` if the exclusive lock was acquired (converting the
-    /// process's existing shared lock on the same file), `Ok(false)` if the
-    /// file is currently locked by another process. A failed attempt leaves
-    /// the existing shared lock intact.
+    /// Returns `Ok(true)` if the exclusive lock was acquired, `Ok(false)` if
+    /// the file is currently locked by another process. A failed attempt
+    /// leaves any existing lock intact.
     #[instrument(skip(self))]
     pub fn try_lock_exclusive(&self, key: &LockKey) -> CargoResult<bool> {
-        let Some(lock) = self.locks.read().get(key).cloned() else {
-            bail!("lock was not found in lock manager: {key}");
-        };
-        crate::util::flock::try_lock_exclusive_simple(&key.0, lock.file())
+        {
+            let locks = self.locks.read();
+            match locks.get(key) {
+                Some(entry) => {
+                    debug_assert!(
+                        entry.count == 0 || entry.mode == LockMode::Exclusive,
+                        "shared-to-exclusive conversion requires releasing the \
+                         shared lock first"
+                    );
+                }
+                None => bail!("lock was not found in lock manager: {key}"),
+            }
+        }
+        let file = self.handle(key)?;
+        if !crate::util::flock::try_lock_exclusive_simple(&key.0, file.file())? {
+            return Ok(false);
+        }
+        let mut locks = self.locks.write();
+        let entry = locks.get_mut(key).expect("handle lookup succeeded");
+        entry.count += 1;
+        entry.mode = LockMode::Exclusive;
+        Ok(true)
     }
 
-    /// Upgrades an existing exclusive lock into a shared lock.
+    /// Downgrades an existing exclusive lock into a shared lock. The
+    /// acquisition count is unchanged; the lock stays held (now shared) until
+    /// it is unlocked as many times as it was acquired.
     #[instrument(skip(self))]
     pub fn downgrade_to_shared(&self, key: &LockKey) -> CargoResult<()> {
-        let Some(lock) = self.locks.read().get(key).cloned() else {
-            bail!("lock was not found in lock manager: {key}");
-        };
-        flock::lock_shared(lock.file())?;
+        {
+            let locks = self.locks.read();
+            match locks.get(key) {
+                Some(entry) => {
+                    debug_assert!(
+                        entry.count > 0 && entry.mode == LockMode::Exclusive,
+                        "downgrade requires an exclusively held lock"
+                    );
+                }
+                None => bail!("lock was not found in lock manager: {key}"),
+            }
+        }
+        let file = self.handle(key)?;
+        // An exclusive-to-shared conversion on the descriptor we hold cannot
+        // block.
+        flock::lock_shared(file.file())?;
+        let mut locks = self.locks.write();
+        let entry = locks.get_mut(key).expect("handle lookup succeeded");
+        entry.mode = LockMode::Shared;
         Ok(())
     }
 
+    /// Releases one acquisition of `key`. The underlying `flock` is released
+    /// when the last acquisition is unlocked.
     #[instrument(skip(self))]
     pub fn unlock(&self, key: &LockKey) -> CargoResult<()> {
-        if let Some(lock) = self.locks.read().get(key) {
-            flock::unlock(lock.file())?;
+        let mut locks = self.locks.write();
+        let Some(entry) = locks.get_mut(key) else {
+            debug_assert!(false, "unlock of unknown lock {key}");
+            return Ok(());
         };
+        debug_assert!(entry.count > 0, "unlock of unheld lock {key}");
+        if entry.count == 0 {
+            return Ok(());
+        }
+        entry.count -= 1;
+        if entry.count == 0 {
+            // `LOCK_UN` does not block.
+            flock::unlock(entry.file.file())?;
+        }
         Ok(())
     }
 }
@@ -185,5 +361,185 @@ impl LockKey {
 impl Display for LockKey {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.0.display())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs::File;
+    use tempfile::TempDir;
+
+    /// Opens an independent descriptor on `path` for probing the lock state
+    /// from the perspective of "another process". `flock` locks are per
+    /// open-file description, so a separate `File` sees exactly what another
+    /// process would see.
+    fn probe(path: &std::path::Path) -> File {
+        File::options()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path)
+            .unwrap()
+    }
+
+    fn try_exclusive(path: &std::path::Path, f: &File) -> bool {
+        crate::util::flock::try_lock_exclusive_simple(path, f).unwrap()
+    }
+
+    #[test]
+    fn shared_acquisitions_are_counted() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join(".rmeta.lock");
+        let lm = LockManager::new();
+
+        let k1 = lm.lock_shared_path(path.clone()).unwrap();
+        let k2 = lm.lock_shared_path(path.clone()).unwrap();
+        assert_eq!(k1, k2);
+        {
+            let locks = lm.locks.read();
+            let entry = locks.get(&k1).unwrap();
+            assert_eq!(entry.count, 2);
+            assert_eq!(entry.mode, LockMode::Shared);
+        }
+
+        // Another description cannot take the lock while we hold it.
+        let p = probe(&path);
+        assert!(!try_exclusive(&path, &p), "exclusive probe succeeded while shared");
+
+        // One unlock must not release anything; the last one must.
+        lm.unlock(&k1).unwrap();
+        assert!(!try_exclusive(&path, &p), "released too early");
+        lm.unlock(&k2).unwrap();
+        assert!(try_exclusive(&path, &p), "lock still held after last unlock");
+    }
+
+    #[test]
+    fn unlock_below_zero_is_a_bug() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join(".rlib.lock");
+        let lm = LockManager::new();
+        let key = lm.lock_shared_path(path).unwrap();
+        lm.unlock(&key).unwrap();
+        // The second unlock has no matching acquisition; this is a protocol
+        // violation that the debug assertions catch.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            lm.unlock(&key).unwrap();
+        }))
+        .unwrap_err();
+    }
+
+    #[test]
+    fn exclusive_downgrade_and_release_roundtrip() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join(".state.lock");
+        let lm = LockManager::new();
+
+        // Create the entry via a shared acquisition, release it, then take
+        // the lock exclusively (the sequence the cache protocol uses).
+        let key = lm.lock_shared_path(path.clone()).unwrap();
+        lm.unlock(&key).unwrap();
+
+        assert!(lm.try_lock_exclusive(&key).unwrap());
+        {
+            let locks = lm.locks.read();
+            let entry = locks.get(&key).unwrap();
+            assert_eq!(entry.count, 1);
+            assert_eq!(entry.mode, LockMode::Exclusive);
+        }
+        let p = probe(&path);
+        assert!(
+            !try_exclusive(&path, &p),
+            "exclusive probe succeeded while held exclusively"
+        );
+
+        // Downgrade keeps the acquisition; readers can now observe shared.
+        lm.downgrade_to_shared(&key).unwrap();
+        {
+            let locks = lm.locks.read();
+            let entry = locks.get(&key).unwrap();
+            assert_eq!(entry.count, 1);
+            assert_eq!(entry.mode, LockMode::Shared);
+        }
+        let reader = probe(&path);
+        assert!(
+            crate::util::flock::try_lock_shared_simple(&path, &reader).unwrap(),
+            "shared probe failed after downgrade"
+        );
+
+        // The single remaining acquisition releases for everyone. The probe
+        // descriptors must be gone first: the reader still holds shared.
+        drop(reader);
+        lm.unlock(&key).unwrap();
+        assert!(try_exclusive(&path, &p), "lock still held after unlock");
+    }
+
+    #[test]
+    fn failed_try_leaves_the_existing_lock_intact() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join(".contended.lock");
+        let lm = LockManager::new();
+
+        // Create the entry, then release it so the manager tracks a handle
+        // without holding the lock (the state `try_lock_exclusive` sees when
+        // the cache protocol probes after releasing its shared locks).
+        let key = lm.lock_shared_path(path.clone()).unwrap();
+        lm.unlock(&key).unwrap();
+
+        // Simulate another process holding the file exclusively. A separate
+        // open-file description conflicts with the manager's descriptor even
+        // within one process, and only non-blocking calls are used here: a
+        // blocking exclusive acquisition would deadlock against our own
+        // recorded handle.
+        let other = probe(&path);
+        assert!(
+            crate::util::flock::try_lock_exclusive_simple(&path, &other).unwrap(),
+            "contender could not take the released lock"
+        );
+
+        // The attempt fails and must not record an acquisition.
+        assert!(!lm.try_lock_exclusive(&key).unwrap());
+        {
+            let locks = lm.locks.read();
+            let entry = locks.get(&key).unwrap();
+            assert_eq!(entry.count, 0);
+        }
+
+        drop(other);
+        // Once the contender is gone the same key is acquirable.
+        assert!(lm.try_lock_exclusive(&key).unwrap());
+        lm.unlock(&key).unwrap();
+    }
+
+    #[test]
+    fn concurrent_acquisitions_balance_out() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join(".race.lock");
+        let lm = std::sync::Arc::new(LockManager::new());
+
+        let handles: Vec<_> = (0..4)
+            .map(|_| {
+                let lm = std::sync::Arc::clone(&lm);
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..50 {
+                        let key = lm.lock_shared_path(path.clone()).unwrap();
+                        lm.unlock(&key).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        {
+            let locks = lm.locks.read();
+            let entry = locks.values().next().expect("entry exists");
+            assert_eq!(entry.count, 0);
+        }
+        let p = probe(&path);
+        assert!(try_exclusive(&path, &p));
     }
 }

@@ -67,7 +67,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::compiler::job_queue::{JobState, Work};
-use crate::compiler::locking::LockKey;
+use crate::compiler::locking::{LockKey, LockMode};
 use crate::compiler::{BuildRunner, Unit};
 use crate::util::CargoResult;
 
@@ -257,6 +257,10 @@ impl CacheCoordination {
             // about-to-be-replaced rmeta would be incorrect, so we simply
             // wait for completion.
             None => {
+                // The early pipelining signal requires that we can prove the
+                // rmeta is readable, which rests on holding `.rmeta.lock`
+                // shared.
+                state.assert_locked(&self.locks.rmeta, LockMode::Shared);
                 if !self.fingerprint_exists() {
                     state.rmeta_produced();
                 }
@@ -324,12 +328,15 @@ impl CacheCoordination {
         Ok(Attempt::Done(true))
     }
 
-    /// Downgrades the rmeta lock to shared. Called when rustc reports the
-    /// `.rmeta` artifact (builder path) and again after the fingerprint is
-    /// written (in case rustc never reported an rmeta, e.g. for units whose
-    /// dependents do not pipeline). Idempotent.
     pub(crate) fn downgrade_rmeta(&self, state: &JobState<'_, '_>) -> CargoResult<()> {
         if !self.locks.rmeta_shared.swap(true, Ordering::SeqCst) {
+            // Only a builder in possession of the exclusive lock may
+            // downgrade it.
+            debug_assert!(
+                self.locks.builder.load(Ordering::SeqCst),
+                "rmeta downgrade outside the builder role"
+            );
+            state.assert_locked(&self.locks.rmeta, LockMode::Exclusive);
             state.downgrade_to_shared(&self.locks.rmeta)?;
         }
         Ok(())
@@ -343,7 +350,21 @@ impl CacheCoordination {
         let this = Arc::clone(this);
         Work::new(move |state| {
             if this.locks.builder.load(Ordering::SeqCst) {
+                // The fingerprint is what makes shared `.rlib.lock` holders
+                // consider the unit complete, so it must be on disk before
+                // the lock goes shared. The content is not compared here:
+                // dependency rmeta checksums are legitimately refreshed at
+                // write time, so the persisted hash may differ from the one
+                // prepared at plan time.
+                if cfg!(debug_assertions) {
+                    let stored = cargo_util::paths::read(&this.fingerprint).ok();
+                    assert!(
+                        stored.is_some_and(|s| !s.is_empty()),
+                        "fingerprint was not persisted before downgrading .rlib.lock"
+                    );
+                }
                 this.downgrade_rmeta(state)?;
+                state.assert_locked(&this.locks.rlib, LockMode::Exclusive);
                 state.downgrade_to_shared(&this.locks.rlib)?;
             }
             Ok(())

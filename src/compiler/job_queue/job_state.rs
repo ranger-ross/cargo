@@ -5,7 +5,7 @@ use std::{cell::Cell, marker, path::PathBuf, sync::Arc};
 use cargo_util::ProcessBuilder;
 
 use crate::compiler::future_incompat::FutureBreakageItem;
-use crate::compiler::locking::LockKey;
+use crate::compiler::locking::{LockKey, LockMode};
 use crate::compiler::timings::SectionTiming;
 use crate::context::WarningHandling;
 use crate::util::Queue;
@@ -194,6 +194,12 @@ impl<'a, 'gctx> JobState<'a, 'gctx> {
     /// [`LockManager::exchange_for_exclusive`].
     pub fn exchange_for_exclusive(&self, primary: &LockKey, keys: &[LockKey]) -> CargoResult<bool> {
         self.lock_manager.exchange_for_exclusive(primary, keys)
+    }
+
+    /// Asserts (in debug builds) that `key` is held in `mode`. See
+    /// [`LockManager::assert_locked`].
+    pub fn assert_locked(&self, key: &LockKey, mode: LockMode) {
+        self.lock_manager.assert_locked(key, mode);
     }
 
     pub fn downgrade_to_shared(&self, lock: &LockKey) -> CargoResult<()> {

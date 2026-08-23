@@ -30,7 +30,7 @@ pub struct LockManager {
 
 /// The mode a [`LockManager`] entry was last acquired or transitioned to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum LockMode {
+pub(crate) enum LockMode {
     Shared,
     Exclusive,
 }
@@ -367,6 +367,30 @@ impl LockManager {
         }
         self.try_lock_exclusive(primary)
     }
+
+    /// Asserts (in debug builds) that `key` is currently held in `mode` by
+    /// this process.
+    ///
+    /// Mirrors the package cache locker's `assert_package_cache_locked`:
+    /// low-level code verifies the lock state its correctness depends on
+    /// instead of trusting its callers. Compiled out of release builds.
+    #[track_caller]
+    pub(crate) fn assert_locked(&self, key: &LockKey, mode: LockMode) {
+        if !cfg!(debug_assertions) {
+            return;
+        }
+        let locks = self.locks.read();
+        let found = locks
+            .get(key)
+            .map(|e| (e.count, e.mode))
+            .unwrap_or((0, mode));
+        assert!(
+            found.0 > 0 && found.1 == mode,
+            "expected lock {key} held {mode:?}, found count {} mode {:?}",
+            found.0,
+            found.1
+        );
+    }
 }
 
 /// Attempts to take a shared lock on `f`, ignoring NFS mounts and filesystems
@@ -644,5 +668,35 @@ mod tests {
         }
         let p = probe(&path);
         assert!(try_exclusive(&path, &p));
+    }
+
+    #[test]
+    fn assert_locked_accepts_the_held_mode() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join(".assert.lock");
+        let lm = LockManager::new();
+        let key = lm.lock_shared_path(path).unwrap();
+
+        // No panic when the recorded state matches.
+        lm.assert_locked(&key, LockMode::Shared);
+        lm.unlock(&key).unwrap();
+    }
+
+    #[test]
+    #[should_panic(expected = "expected lock")]
+    fn assert_locked_rejects_a_wrong_mode() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join(".assert-wrong.lock");
+        let lm = LockManager::new();
+        let key = lm.lock_shared_path(path).unwrap();
+        lm.assert_locked(&key, LockMode::Exclusive);
+    }
+
+    #[test]
+    #[should_panic(expected = "expected lock")]
+    fn assert_locked_rejects_an_unknown_key() {
+        let tmp = TempDir::new().unwrap();
+        let key = LockKey::from_path(tmp.path().join(".never.lock"));
+        LockManager::new().assert_locked(&key, LockMode::Shared);
     }
 }

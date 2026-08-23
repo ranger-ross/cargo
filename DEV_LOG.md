@@ -426,3 +426,63 @@ the waiter-then-builder crash path can reach `rmeta_produced` twice.
     is semantically correct.
 
 ## Full test-suite results
+
+## Locking refactor — counted locks, explicit protocol, assertions, observability
+
+The per-unit locking design was reworked to borrow the disciplines that make
+the package cache locker (`src/util/cache_lock.rs`) easy to reason about,
+while keeping the two-state (rmeta/rlib) protocol intact. Landed as five
+commits:
+
+1. **Counted acquisitions (`LockManager`)**. Each entry now records a
+   recursion count plus the mode it was last acquired in, mirroring
+   `RecursiveLock`. A shared re-acquisition bumps the count without touching
+   the flock; the flock is taken on the first acquisition and released on the
+   last unlock. This makes violations explicit instead of silent:
+   - shared→exclusive conversion while shared is held trips a debug assertion
+     (a blocking conversion drops the old lock while waiting, which is what
+     finding #8 worked around by hand);
+   - unlocking an unheld lock asserts;
+   - downgrades keep the count, so a downgraded lock stays held until it has
+     been unlocked as many times as it was acquired.
+   Counts are per key, not per acquisition fd: one build unit maps to exactly
+   one job inside a process, so a key has a single in-process owner.
+
+2. **`exchange_for_exclusive`**. The release-then-probe dance that keeps the
+   multi-lock protocol free of lock-order cycles moved out of
+   `CacheCoordination::coordinate` into `LockManager`, giving the protocol
+   the same shape as the package cache locker: mode conversions happen in
+   exactly one reviewed place.
+
+3. **Explicit state machine**. `coordinate()` reads as four named steps now:
+   `WaitForRmeta` → `ProbeBuilder` → `TakeOver` → `Done`. Lock keys are
+   derived from the unit's cache paths up front (`UnitLocks`), replacing the
+   `OnceLock` lookups and their internal-error failure paths. The unused
+   `JobState::try_lock_exclusive` wrapper was removed.
+
+4. **Debug assertions on the protocol invariants**
+   (`assert_locked`, modeled on `assert_package_cache_locked`):
+   - the early pipelining signal fires while `.rmeta.lock` is held shared;
+   - downgrades happen only in builder role with the exclusive lock actually
+     possessed;
+   - the fingerprint file exists before `.rlib.lock` goes shared. Its
+     *content* is deliberately not compared there: dependency rmeta checksums
+     are refreshed at write time (finding #17), so the persisted hash may
+     legitimately differ from the one prepared at plan time.
+   These run on every debug test-suite invocation, so a future protocol break
+   fails tests instead of racing silently.
+
+5. **Observability**: `LockManager::active_locks()` plus a summary printed
+   after the job queue drains under `-Zbuild-analysis`. Worker threads take
+   locks silently (no shell access for "Blocking" messages), so this restores
+   outside visibility, e.g. a cold cached build ends with:
+   ```
+       Held 1x shared .../build-cache/dep1/<hash>/.rlib.lock
+            1x shared .../.rmeta.lock
+   ```
+
+Tests added: 11 unit tests on `LockManager` (counting, downgrade/upgrade
+rules, exchange semantics, assert helpers, active_locks),
+`build_cache::concurrent_builders_resolve_to_a_single_builder` (three
+processes race the same cold unit, exercising the contended-takeover branch)
+and `build_cache::held_locks_summarized_under_build_analysis`.

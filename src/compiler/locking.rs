@@ -236,8 +236,8 @@ impl LockManager {
     ///
     /// Callers must not hold the same key shared: a blocking shared-to-
     /// exclusive conversion on one descriptor drops the old lock while
-    /// waiting, which allows lock-order cycles between contenders. Release
-    /// shared acquisitions first, as the cache coordination protocol does.
+    /// waiting, which allows lock-order cycles between contenders. Use
+    /// [`LockManager::exchange_for_exclusive`] to convert held shared locks.
     #[instrument(skip(self))]
     pub fn lock(&self, key: &LockKey) -> CargoResult<()> {
         {
@@ -340,6 +340,36 @@ impl LockManager {
             flock::unlock(entry.file.file())?;
         }
         Ok(())
+    }
+
+    /// Converts held shared locks into an exclusive lock on `primary`,
+    /// following the package cache locker's rule that shared-to-exclusive
+    /// conversions never happen in place.
+    ///
+    /// Each key in `keys` (which must include `primary`) has one acquisition
+    /// unlocked, then `primary` is probed non-blockingly. Returns `Ok(true)`
+    /// when the exclusive lock on `primary` was acquired; the caller must
+    /// re-acquire any remaining keys it needs. Returns `Ok(false)` when
+    /// another process holds `primary`; nothing is held afterwards, and the
+    /// caller should re-evaluate from scratch.
+    ///
+    /// Releasing before probing is what keeps the multi-lock protocol free
+    /// of lock-order cycles: a blocking conversion would drop the old locks
+    /// while waiting anyway, but contenders probing at the same time could
+    /// then wait on each other in a cycle.
+    pub fn exchange_for_exclusive(
+        &self,
+        primary: &LockKey,
+        keys: &[LockKey],
+    ) -> CargoResult<bool> {
+        debug_assert!(
+            keys.iter().any(|k| k == primary),
+            "the probed key must be among the released keys"
+        );
+        for key in keys {
+            self.unlock(key)?;
+        }
+        self.try_lock_exclusive(primary)
     }
 }
 
@@ -512,6 +542,64 @@ mod tests {
         lm.unlock(&key).unwrap();
     }
 
+
+    #[test]
+    fn exchange_acquires_exclusive_and_releases_the_rest() {
+        let tmp = TempDir::new().unwrap();
+        let rmeta = tmp.path().join(".rmeta.lock");
+        let rlib = tmp.path().join(".rlib.lock");
+        let lm = LockManager::new();
+
+        let kr = lm.lock_shared_path(rmeta.clone()).unwrap();
+        let kl = lm.lock_shared_path(rlib.clone()).unwrap();
+
+        assert!(lm.exchange_for_exclusive(&kr, &[kr.clone(), kl.clone()]).unwrap());
+        {
+            let locks = lm.locks.read();
+            let entry = locks.get(&kr).unwrap();
+            assert_eq!(entry.count, 1);
+            assert_eq!(entry.mode, LockMode::Exclusive);
+            let entry = locks.get(&kl).unwrap();
+            assert_eq!(entry.count, 0, "the non-primary key must stay released");
+        }
+
+        // The released key is free for another description; the probed one is
+        // not.
+        let p_rlib = probe(&rlib);
+        assert!(try_exclusive(&rlib, &p_rlib));
+        let p_rmeta = probe(&rmeta);
+        assert!(!try_exclusive(&rmeta, &p_rmeta));
+    }
+
+    #[test]
+    fn exchange_releases_every_acquisition() {
+        let tmp = TempDir::new().unwrap();
+        let rmeta = tmp.path().join(".rmeta.lock");
+        let rlib = tmp.path().join(".rlib.lock");
+        let lm = LockManager::new();
+
+        // The wait loop holds each key exactly once when it reaches the
+        // exchange (re-acquisitions happen only after a full release).
+        let kr = lm.lock_shared_path(rmeta.clone()).unwrap();
+        let kl = lm.lock_shared_path(rlib.clone()).unwrap();
+        {
+            let locks = lm.locks.read();
+            assert_eq!(locks.get(&kr).unwrap().count, 1);
+            assert_eq!(locks.get(&kl).unwrap().count, 1);
+        }
+
+        assert!(lm.exchange_for_exclusive(&kr, &[kr.clone(), kl]).unwrap());
+        {
+            let locks = lm.locks.read();
+            let entry = locks.get(&kr).unwrap();
+            assert_eq!(entry.count, 1);
+            assert_eq!(entry.mode, LockMode::Exclusive);
+        }
+
+        // The fully released key is free for another description.
+        let p_rlib = probe(&rlib);
+        assert!(try_exclusive(&rlib, &p_rlib));
+    }
     #[test]
     fn concurrent_acquisitions_balance_out() {
         let tmp = TempDir::new().unwrap();

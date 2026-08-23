@@ -214,16 +214,16 @@ impl CacheCoordination {
             };
             let _ = self.rlib_key.set(rlib.clone());
 
-            // Take the locks exclusively. Release our shared locks first so we
-            // hold nothing while acquiring, then probe the rmeta lock: if
-            // another process holds it (a builder that just finished, or
-            // another waiter), it will resolve the unit's state — waiting for
-            // it on the shared rlib lock (again holding nothing) is bounded by
-            // that process's job and cannot deadlock, even when that process
-            // is itself waiting on a unit whose locks we hold.
-            state.unlock(&rlib)?;
-            state.unlock(&rmeta)?;
-            let contended = !state.try_lock_exclusive(&rmeta)?;
+            // Take the locks exclusively. `exchange_for_exclusive` releases
+            // our shared locks first so we hold nothing while probing, then
+            // probes the rmeta lock: if another process holds it (a builder
+            // that just finished, or another waiter), it will resolve the
+            // unit's state. Waiting for it on the shared rlib lock (again
+            // holding nothing) is bounded by that process's job and cannot
+            // deadlock, even when that process is itself waiting on a unit
+            // whose locks we hold.
+            let contended =
+                !state.exchange_for_exclusive(&rmeta, &[rmeta.clone(), rlib.clone()])?;
             if contended {
                 // Someone else holds this unit's locks. They are either
                 // building it or waiting on it; either way their job will

@@ -391,6 +391,29 @@ impl LockManager {
             found.1
         );
     }
+
+    /// Summarizes the locks currently held, for observability.
+    ///
+    /// Worker threads acquire locks silently (they have no shell access to
+    /// print "Blocking" messages), so this post-build summary restores
+    /// visibility into what the build ended up holding. Returns
+    /// `(path, mode, count)` sorted by path for stable output.
+    pub fn active_locks(&self) -> Vec<(String, &'static str, u32)> {
+        let locks = self.locks.read();
+        let mut summary: Vec<_> = locks
+            .iter()
+            .filter(|(_, entry)| entry.count > 0)
+            .map(|(key, entry)| {
+                let mode = match entry.mode {
+                    LockMode::Shared => "shared",
+                    LockMode::Exclusive => "exclusive",
+                };
+                (key.0.display().to_string(), mode, entry.count)
+            })
+            .collect();
+        summary.sort_by(|a, b| a.0.cmp(&b.0));
+        summary
+    }
 }
 
 /// Attempts to take a shared lock on `f`, ignoring NFS mounts and filesystems
@@ -676,7 +699,6 @@ mod tests {
         let path = tmp.path().join(".assert.lock");
         let lm = LockManager::new();
         let key = lm.lock_shared_path(path).unwrap();
-
         // No panic when the recorded state matches.
         lm.assert_locked(&key, LockMode::Shared);
         lm.unlock(&key).unwrap();
@@ -698,5 +720,29 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let key = LockKey::from_path(tmp.path().join(".never.lock"));
         LockManager::new().assert_locked(&key, LockMode::Shared);
+    }
+
+    #[test]
+    fn active_locks_summarizes_held_entries_only() {
+        let tmp = TempDir::new().unwrap();
+        let rmeta = tmp.path().join(".rmeta.lock");
+        let rlib = tmp.path().join(".rlib.lock");
+        let lm = LockManager::new();
+
+        let kr = lm.lock_shared_path(rmeta.clone()).unwrap();
+        lm.lock_shared_path(rmeta.clone()).unwrap();
+        // The rlib entry was created and released again; released entries do
+        // not appear in the summary.
+        let kl = lm.lock_shared_path(rlib.clone()).unwrap();
+        lm.unlock(&kl).unwrap();
+
+        // Only the held key appears, with its mode and acquisition count.
+        assert_eq!(
+            lm.active_locks(),
+            vec![(rmeta.display().to_string(), "shared", 2)]
+        );
+        lm.unlock(&kr).unwrap();
+        lm.unlock(&kr).unwrap();
+        assert!(lm.active_locks().is_empty());
     }
 }

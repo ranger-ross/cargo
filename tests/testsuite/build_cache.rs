@@ -141,6 +141,56 @@ hello world
 }
 
 #[cargo_test]
+fn held_locks_summarized_under_build_analysis() {
+    let git_project = git::new("dep1", |project| {
+        project
+            .file("Cargo.toml", &basic_lib_manifest("dep1"))
+            .file(
+                "src/lib.rs",
+                r#"pub fn hello() -> &'static str { "observed" }"#,
+            )
+    });
+
+    let ws = project()
+        .file(
+            "Cargo.toml",
+            &format!(
+                r#"
+                    [package]
+                    name = "foo"
+                    version = "0.5.0"
+                    edition = "2015"
+
+                    [dependencies.dep1]
+                    git = '{}'
+                "#,
+                git_project.url()
+            ),
+        )
+        .file(
+            "src/main.rs",
+            &main_file(r#""{}", dep1::hello()"#, &["dep1"]),
+        )
+        .build();
+
+    // Worker threads take the per-unit state locks silently, so the cold
+    // build summarizes them at the end under -Zbuild-analysis.
+    ws.cargo("build -Zbuild-analysis")
+        .masquerade_as_nightly_cargo(&["build_analysis"])
+        .with_stderr_data(str![[r#"
+[UPDATING] git repository `[ROOTURL]/dep1`
+[LOCKING] 1 package to highest compatible version
+[COMPILING] dep1 v0.5.0 ([ROOTURL]/dep1#[..])
+[COMPILING] foo v0.5.0 ([ROOT]/foo)
+[FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
+        Held 1x shared [ROOT]/home/.cargo/build-cache/dep1/[HASH]/.rlib.lock
+     1x shared [ROOT]/home/.cargo/build-cache/dep1/[HASH]/.rmeta.lock
+
+"#]])
+        .run();
+}
+
+#[cargo_test]
 fn git_dep_rev_bump_gets_new_cache_entry() {
     let (git_project, repo) = git::new_repo("dep1", |project| {
         project

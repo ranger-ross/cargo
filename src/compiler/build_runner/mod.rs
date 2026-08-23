@@ -213,6 +213,21 @@ impl<'a, 'gctx> BuildRunner<'a, 'gctx> {
         // Now that we've figured out everything that we're going to do, do it!
         queue.execute(&mut self)?;
 
+        // The build's locks were acquired silently on worker threads (they
+        // cannot print "Blocking" messages), so with -Zbuild-analysis,
+        // summarize what ended up held now that every job has finished.
+        if self.bcx.gctx.cli_unstable().build_analysis {
+            let held = self.lock_manager.active_locks();
+            if !held.is_empty() {
+                let summary = held
+                    .iter()
+                    .map(|(path, mode, count)| format!("{count}x {mode} {path}"))
+                    .collect::<Vec<_>>()
+                    .join("\n     ");
+                self.bcx.gctx.shell().status("Held", &summary)?;
+            }
+        }
+
         // Add `OUT_DIR` to env vars if unit has a build script.
         let units_with_build_script = &self
             .bcx

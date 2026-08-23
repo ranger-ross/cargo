@@ -7,8 +7,11 @@
 use std::path::{Path, PathBuf};
 
 use crate::prelude::*;
+use cargo_test_support::registry::Package;
 use cargo_test_support::str;
-use cargo_test_support::{basic_lib_manifest, git, main_file, paths, project, project_in};
+use cargo_test_support::{
+    basic_lib_manifest, git, is_coarse_mtime, main_file, paths, project, project_in, sleep_ms,
+};
 
 /// The build-cache root for the current test's `CARGO_HOME`.
 fn build_cache_root() -> PathBuf {
@@ -77,8 +80,7 @@ fn git_dep_built_into_cache_and_reused() {
 
     ws_a.cargo("build").run();
     assert!(ws_a.bin("foo").is_file());
-    ws_a
-        .process(&ws_a.bin("foo"))
+    ws_a.process(&ws_a.bin("foo"))
         .with_stdout_data(str![[r#"
 hello world
 
@@ -121,8 +123,7 @@ hello world
         )
         .build();
 
-    ws_b
-        .cargo("build")
+    ws_b.cargo("build")
         .with_stderr_data(str![[r#"
 [UPDATING] git repository `[ROOTURL]/dep1`
 [LOCKING] 1 package to highest compatible version
@@ -131,8 +132,7 @@ hello world
 
 "#]])
         .run();
-    ws_b
-        .process(&ws_b.bin("foo-b"))
+    ws_b.process(&ws_b.bin("foo-b"))
         .with_stdout_data(str![[r#"
 hello world
 
@@ -145,10 +145,7 @@ fn git_dep_rev_bump_gets_new_cache_entry() {
     let (git_project, repo) = git::new_repo("dep1", |project| {
         project
             .file("Cargo.toml", &basic_lib_manifest("dep1"))
-            .file(
-                "src/lib.rs",
-                r#"pub fn value() -> u32 { 1 }"#,
-            )
+            .file("src/lib.rs", r#"pub fn value() -> u32 { 1 }"#)
     });
 
     let ws_a = project()
@@ -167,12 +164,14 @@ fn git_dep_rev_bump_gets_new_cache_entry() {
                 git_project.url()
             ),
         )
-        .file("src/main.rs", &main_file(r#""{}", dep1::value()"#, &["dep1"]))
+        .file(
+            "src/main.rs",
+            &main_file(r#""{}", dep1::value()"#, &["dep1"]),
+        )
         .build();
 
     ws_a.cargo("build").run();
-    ws_a
-        .process(&ws_a.bin("foo"))
+    ws_a.process(&ws_a.bin("foo"))
         .with_stdout_data(str![[r#"
 1
 
@@ -183,18 +182,14 @@ fn git_dep_rev_bump_gets_new_cache_entry() {
     // unit hash (see `compute_metadata`), so the new revision gets its own
     // cache entry and is compiled from scratch; the dependent binary must be
     // relinked against the new content.
-    git_project.change_file(
-        "src/lib.rs",
-        r#"pub fn value() -> u32 { 2 }"#,
-    );
+    git_project.change_file("src/lib.rs", r#"pub fn value() -> u32 { 2 }"#);
     git::add(&repo);
     git::commit(&repo);
     ws_a.cargo("update -p dep1").run();
 
     // The new revision maps to a fresh cache entry; the dependent binary is
     // relinked against the new content.
-    ws_a
-        .cargo("build")
+    ws_a.cargo("build")
         .with_stderr_data(str![[r#"
 [COMPILING] dep1 v0.5.0 ([ROOTURL]/dep1#[..])
 [COMPILING] foo v0.5.0 ([ROOT]/foo)
@@ -202,8 +197,7 @@ fn git_dep_rev_bump_gets_new_cache_entry() {
 
 "#]])
         .run();
-    ws_a
-        .process(&ws_a.bin("foo"))
+    ws_a.process(&ws_a.bin("foo"))
         .with_stdout_data(str![[r#"
 2
 
@@ -217,10 +211,7 @@ fn build_script_dep_not_cached() {
         project
             .file(
                 "Cargo.toml",
-                &format!(
-                    "{}\nbuild = \"build.rs\"\n",
-                    basic_lib_manifest("dep1")
-                ),
+                &format!("{}\nbuild = \"build.rs\"\n", basic_lib_manifest("dep1")),
             )
             .file(
                 "build.rs",
@@ -248,7 +239,10 @@ fn build_script_dep_not_cached() {
                 git_project.url()
             ),
         )
-        .file("src/main.rs", &main_file(r#""{}", dep1::value()"#, &["dep1"]))
+        .file(
+            "src/main.rs",
+            &main_file(r#""{}", dep1::value()"#, &["dep1"]),
+        )
         .build();
 
     ws.cargo("build").run();
@@ -317,15 +311,13 @@ fn concurrent_cold_builds_share_the_unit() {
 
     assert!(ws_a.bin("foo-a").is_file());
     assert!(ws_b.bin("foo-b").is_file());
-    ws_a
-        .process(&ws_a.bin("foo-a"))
+    ws_a.process(&ws_a.bin("foo-a"))
         .with_stdout_data(str![[r#"
 shared
 
 "#]])
         .run();
-    ws_b
-        .process(&ws_b.bin("foo-b"))
+    ws_b.process(&ws_b.bin("foo-b"))
         .with_stdout_data(str![[r#"
 shared
 
@@ -336,8 +328,7 @@ shared
     assert_eq!(cached_rlibs().len(), 1, "exactly one cached rlib expected");
 
     // A subsequent build in either workspace is fully fresh.
-    ws_a
-        .cargo("build -v")
+    ws_a.cargo("build -v")
         .with_stderr_contains("[FRESH] dep1 v0.5.0 ([ROOTURL]/dep1#[..])")
         .run();
 }
@@ -380,8 +371,7 @@ fn check_units_shared_across_workspaces() {
     let ws_a = make_ws("ws-a", "foo-a");
     let ws_b = make_ws("ws-b", "foo-b");
 
-    ws_a
-        .cargo("check")
+    ws_a.cargo("check")
         .with_stderr_data(str![[r#"
 [UPDATING] git repository `[ROOTURL]/dep1`
 [LOCKING] 1 package to highest compatible version
@@ -394,8 +384,7 @@ fn check_units_shared_across_workspaces() {
 
     // The second workspace reuses the check unit from the cache: only its own
     // member is checked.
-    ws_b
-        .cargo("check")
+    ws_b.cargo("check")
         .with_stderr_data(str![[r#"
 [UPDATING] git repository `[ROOTURL]/dep1`
 [LOCKING] 1 package to highest compatible version
@@ -407,7 +396,8 @@ fn check_units_shared_across_workspaces() {
 }
 
 #[cargo_test]
-fn clean_does_not_touch_cache() {    let git_project = git::new("dep1", |project| {
+fn clean_does_not_touch_cache() {
+    let git_project = git::new("dep1", |project| {
         project
             .file("Cargo.toml", &basic_lib_manifest("dep1"))
             .file(
@@ -432,7 +422,10 @@ fn clean_does_not_touch_cache() {    let git_project = git::new("dep1", |project
                 git_project.url()
             ),
         )
-        .file("src/main.rs", &main_file(r#""{}", dep1::hello()"#, &["dep1"]))
+        .file(
+            "src/main.rs",
+            &main_file(r#""{}", dep1::hello()"#, &["dep1"]),
+        )
         .build();
 
     ws.cargo("build").run();
@@ -442,7 +435,11 @@ fn clean_does_not_touch_cache() {    let git_project = git::new("dep1", |project
 
     // The cache is shared across workspaces and intentionally not part of a
     // single workspace's `cargo clean`.
-    assert_eq!(cached_rlibs().len(), 1, "cargo clean must not touch the cache");
+    assert_eq!(
+        cached_rlibs().len(),
+        1,
+        "cargo clean must not touch the cache"
+    );
 }
 
 #[cargo_test]
@@ -479,7 +476,10 @@ fn fresh_despite_cache_entry_rewrite() {
                 git_project.url()
             ),
         )
-        .file("src/main.rs", &main_file(r#""{}", dep1::hello()"#, &["dep1"]))
+        .file(
+            "src/main.rs",
+            &main_file(r#""{}", dep1::hello()"#, &["dep1"]),
+        )
         .build();
 
     ws.cargo("build").run();
@@ -568,7 +568,10 @@ fn cacheable_unit_fresh_despite_newer_noncacheable_deps() {
                 dep1.url()
             ),
         )
-        .file("src/main.rs", &main_file(r#""{}", dep1::hello()"#, &["dep1"]))
+        .file(
+            "src/main.rs",
+            &main_file(r#""{}", dep1::hello()"#, &["dep1"]),
+        )
         .build();
 
     ws.cargo("build").run();
@@ -579,9 +582,10 @@ fn cacheable_unit_fresh_despite_newer_noncacheable_deps() {
     // written).
     let now = std::time::SystemTime::now();
     for file in collect_files(&paths::root().join("foo/target")) {
-        if file.extension().is_some_and(|e| {
-            matches!(e.to_str(), Some("rlib" | "rmeta" | "so" | "d"))
-        }) {
+        if file
+            .extension()
+            .is_some_and(|e| matches!(e.to_str(), Some("rlib" | "rmeta" | "so" | "d")))
+        {
             std::fs::File::options()
                 .write(true)
                 .open(&file)
@@ -603,4 +607,103 @@ hello
 
 "#]])
         .run();
+}
+
+#[cargo_test]
+fn path_patched_dependent_not_cached() {
+    // A registry crate whose dependency is replaced by a `[patch]` with a
+    // path is not eligible for the build cache: the patched dependency is
+    // mutable workspace state (mtime-tracked), so the dependent keeps
+    // upstream's normal mtime-based freshness logic instead of an immutable
+    // cache entry. An unrelated registry crate without patched dependencies
+    // is still cached, showing the exclusion targets only units with mutable
+    // inputs.
+    Package::new("base", "0.1.0")
+        .file("src/lib.rs", r#"pub fn value() -> u32 { 1 }"#)
+        .publish();
+    Package::new("wrapper", "0.1.0")
+        .dep("base", "0.1.0")
+        .file(
+            "src/lib.rs",
+            r#"pub fn value() -> u32 { base::value() * 2 }"#,
+        )
+        .publish();
+    Package::new("plain", "0.1.0")
+        .file(
+            "src/lib.rs",
+            r#"pub fn hello() -> &'static str { "hello" }"#,
+        )
+        .publish();
+
+    let ws = project()
+        .file(
+            "Cargo.toml",
+            r#"
+                [package]
+                name = "foo"
+                version = "0.5.0"
+                edition = "2015"
+
+                [dependencies]
+                wrapper = "0.1.0"
+                plain = "0.1.0"
+
+                [patch.crates-io]
+                base = { path = "base_local" }
+            "#,
+        )
+        .file(
+            "src/main.rs",
+            &main_file(r#""{}", wrapper::value()"#, &["wrapper"]),
+        )
+        .file(
+            "base_local/Cargo.toml",
+            r#"
+                [package]
+                name = "base"
+                version = "0.1.0"
+                edition = "2015"
+            "#,
+        )
+        .file("base_local/src/lib.rs", r#"pub fn value() -> u32 { 100 }"#)
+        .build();
+
+    ws.cargo("build").run();
+    ws.process(&ws.bin("foo"))
+        .with_stdout_data(str![[r#"
+200
+
+"#]])
+        .run();
+
+    // Only `plain` (no patched dependencies) may appear in the cache.
+    let cached_pkgs = || -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(build_cache_root())
+            .expect("cache root should exist")
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        names.sort();
+        names
+    };
+    assert_eq!(cached_pkgs(), vec!["plain"]);
+
+    // Editing the patch source rebuilds `wrapper` through upstream's normal
+    // mtime-based freshness logic, and still leaves no cache entry behind.
+    std::fs::write(
+        ws.root().join("base_local/src/lib.rs"),
+        "pub fn value() -> u32 { 200 }",
+    )
+    .unwrap();
+    if is_coarse_mtime() {
+        sleep_ms(1000);
+    }
+    ws.cargo("build").run();
+    ws.process(&ws.bin("foo"))
+        .with_stdout_data(str![[r#"
+400
+
+"#]])
+        .run();
+    assert_eq!(cached_pkgs(), vec!["plain"]);
 }

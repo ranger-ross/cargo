@@ -162,15 +162,24 @@ the waiter-then-builder crash path can reach `rmeta_produced` twice.
    actually true. Tradeoff: revision changes accumulate cache entries (old
    ones orphaned); there is no cache GC in the PoC.
 
-2. **Path patches of registry crates need mtime-based invalidation.** A
-   cacheable registry crate can depend on a *patched* (path) crate. Editing
+2. **Path patches of registry crates make the dependent ineligible for the
+   cache.** A registry crate can depend on a *patched* (path) crate. Editing
    the patch changes no hash (mtimes only), so a content-only freshness check
-   kept the dependent fresh (`freshness::bust_patched_dep`). **Fixed**: the
-   freshness check for cacheable units is the normal fingerprint comparison
-   (hash match *and* filesystem-status up-to-date), exactly like upstream.
-   The filesystem-status check may cause a conservative rebuild when a cache
-   entry is rebuilt byte-identically by another workspace (newer mtimes) —
-   correct, rare, and it converges.
+   kept the dependent fresh (`freshness::bust_patched_dep`). The first fix
+   routed mtime-based invalidation into cacheable units' freshness check —
+   that conflicted with the design premise that cache units are immutable
+   and keyed by content, and was **reverted in favor of an eligibility rule**:
+   a unit that depends on a path-sourced package is not eligible for the
+   build cache at all (`CompilationFiles::is_cacheable`, computed from the
+   unit graph since `Unit` itself carries no dependency edges). Patched
+   dependents therefore use upstream's normal mtime-based freshness logic,
+   and no mtime machinery exists inside the cache path. The rmeta content
+   checksums pinned by finding #17 remain as defense-in-depth for immutable-
+   source dependencies whose artifacts can still diverge across workspaces.
+   Regression test: `build_cache::path_patched_dependent_not_cached` (the
+   patched dependent and the patch target get no cache entry while an
+   unrelated registry crate does; editing the patch rebuilds through
+   upstream's logic).
 
 3. **Dep-info based env/source tracking must be preserved.** The initial
    `Precalculated` local fingerprint for cacheable units dropped the
@@ -392,5 +401,28 @@ the waiter-then-builder crash path can reach `rmeta_produced` twice.
     repos pass; the only failures are environmental (`zellij`: upstream
     `include_bytes!` quirk; `tauri`: missing system `javascriptcore`/
     `webkit2gtk` dev libraries).
+
+18. **Architecture correction: eligibility instead of mtime-based
+    invalidation (follow-up to finding #2).** The freshness path for cacheable
+    units no longer consults dependency mtimes in any form:
+    * `CompilationFiles::is_cacheable` now also excludes any unit with a
+      dependency on a path-sourced package (precomputed `path_dep_units` set
+      from the unit graph; `Unit` does not carry dependency edges). Registry
+      crates whose dependency is replaced by `[patch] ... { path = ... }`
+      (or `[replace]`, or directory sources) keep upstream's mtime-based
+      freshness and are never routed into `$CARGO_HOME/build-cache`.
+    * `FsStatus::cache_compatible()` was deleted; `_compare_old_fingerprint`
+      uses plain `up_to_date()`. For cacheable units this is behavior-
+      preserving (the dependency mtime loop was already skipped per #14, so
+      their fs-status could only be `UpToDate`/`Stale`/`StaleItem`), but the
+      API no longer advertises an mtime-tolerance mode.
+    * `CacheCompletionState::fs_up_to_date` is sourced from `up_to_date()`;
+      its remaining role is catching partially written cache entries (own
+      outputs missing), not dependency invalidation.
+    Transitive note: for `A(reg) -> B(reg) -> C(path-patched)`, `B` becomes
+    uncacheable by the direct rule; `A` stays cacheable and is protected by
+    its pinned checksum of `B`'s rmeta (#17): if editing `C` changes `B`'s
+    artifact bytes, `A` rebuilds; if `B`'s artifact is byte-identical, reuse
+    is semantically correct.
 
 ## Full test-suite results

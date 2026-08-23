@@ -1,7 +1,7 @@
 //! See [`CompilationFiles`].
 
-use crate::util::data_structures::HashMap;
 use std::cell::OnceCell;
+use std::collections::HashSet;
 use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
@@ -12,6 +12,7 @@ use tracing::debug;
 use super::{BuildContext, BuildRunner, CompileKind, FileFlavor, Layout};
 use crate::compiler::trim_paths;
 use crate::compiler::{CompileMode, CompileTarget, CrateType, FileType, Unit};
+use crate::util::data_structures::HashMap;
 use crate::util::{self, CargoResult, OnceExt, StableHasher};
 use crate::workspace::{Target, TargetKind, Workspace};
 
@@ -147,6 +148,13 @@ pub struct CompilationFiles<'a, 'gctx> {
     metas: HashMap<Unit, Metadata>,
     /// For each Unit, a list all files produced.
     outputs: HashMap<Unit, OnceCell<Arc<Vec<OutputFile>>>>,
+    /// Units that have at least one dependency on a path-sourced package —
+    /// most notably registry crates whose dependency is replaced by a
+    /// `[patch]` with a path. Such a dependency is mutable workspace state
+    /// (mtime-tracked), so these units are not eligible for the build cache:
+    /// cache units must be immutable, and mutable inputs must keep the
+    /// normal mtime-based freshness logic instead.
+    path_dep_units: HashSet<Unit>,
 }
 
 /// Info about a single file emitted by the compiler.
@@ -189,6 +197,16 @@ impl<'a, 'gctx: 'a> CompilationFiles<'a, 'gctx> {
             .map(|unit| (unit, OnceCell::new()))
             .collect();
         let cache_enabled = host.cache_enabled();
+        let path_dep_units = build_runner
+            .bcx
+            .unit_graph
+            .iter()
+            .filter(|(_unit, deps)| {
+                deps.iter()
+                    .any(|dep| dep.unit.pkg.package_id().source_id().is_path())
+            })
+            .map(|(unit, _deps)| unit.clone())
+            .collect();
         CompilationFiles {
             ws: build_runner.bcx.ws,
             host,
@@ -198,6 +216,7 @@ impl<'a, 'gctx: 'a> CompilationFiles<'a, 'gctx> {
             roots: build_runner.bcx.roots.clone(),
             metas,
             outputs,
+            path_dep_units,
         }
     }
 
@@ -305,6 +324,7 @@ impl<'a, 'gctx: 'a> CompilationFiles<'a, 'gctx> {
         self.ws.gctx().cli_unstable().build_dir_new_layout
             && self.cache_enabled
             && unit.is_cacheable()
+            && !self.path_dep_units.contains(unit)
     }
 
     /// Returns the directories where Rust crate dependencies are found for the

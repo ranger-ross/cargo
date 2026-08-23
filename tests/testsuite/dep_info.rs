@@ -295,7 +295,10 @@ fn relative_depinfo_paths_ws() {
             (1, &format!("{}/debug/build/bar/*/out/libbar-*.rlib", host)),
             (
                 1,
-                &cache.join("regdep/*/out/libregdep-*.rlib").to_str().unwrap(),
+                &cache
+                    .join("regdep/*/out/libregdep-*.rlib")
+                    .to_str()
+                    .unwrap(),
             ),
         ],
     );
@@ -305,7 +308,10 @@ fn relative_depinfo_paths_ws() {
         "target/debug/build/foo/*/fingerprint/dep-build-script-build-script-build",
         &[
             (0, "build.rs"),
-            (1, &cache.join("bdep/*/out/libbdep-*.rlib").to_str().unwrap()),
+            (
+                1,
+                &cache.join("bdep/*/out/libbdep-*.rlib").to_str().unwrap(),
+            ),
         ],
     );
 
@@ -439,7 +445,13 @@ fn relative_depinfo_paths_no_ws() {
                 ),
             ),
             (1, "debug/build/bar/*/out/libbar-*.rlib"),
-            (1, &cache.join("regdep/*/out/libregdep-*.rlib").to_str().unwrap()),
+            (
+                1,
+                &cache
+                    .join("regdep/*/out/libregdep-*.rlib")
+                    .to_str()
+                    .unwrap(),
+            ),
         ],
     );
 
@@ -448,7 +460,10 @@ fn relative_depinfo_paths_no_ws() {
         "target/debug/build/foo/*/fingerprint/dep-build-script-build-script-build",
         &[
             (0, "build.rs"),
-            (1, &cache.join("bdep/*/out/libbdep-*.rlib").to_str().unwrap()),
+            (
+                1,
+                &cache.join("bdep/*/out/libbdep-*.rlib").to_str().unwrap(),
+            ),
         ],
     );
 
@@ -489,20 +504,16 @@ fn reg_dep_source_not_tracked() {
     // The registry dependency is cacheable, so its dep-info lives in the
     // build cache rather than the workspace target directory.
     let dep_info = paths::cargo_home().join("build-cache/regdep/*/fingerprint/dep-lib-regdep");
-    assert_deps(
-        &p,
-        dep_info.to_str().unwrap(),
-        |info_path, entries| {
-            for (kind, path) in entries {
-                if *kind == 1 {
-                    panic!(
-                        "Did not expect package root relative path type: {:?} in {:?}",
-                        path, info_path
-                    );
-                }
+    assert_deps(&p, dep_info.to_str().unwrap(), |info_path, entries| {
+        for (kind, path) in entries {
+            if *kind == 1 {
+                panic!(
+                    "Did not expect package root relative path type: {:?} in {:?}",
+                    path, info_path
+                );
             }
-        },
-    );
+        }
+    });
 }
 
 #[cargo_test(nightly, reason = "-Z binary-dep-depinfo is unstable")]

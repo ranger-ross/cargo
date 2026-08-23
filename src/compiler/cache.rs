@@ -83,9 +83,10 @@ pub struct CacheCoordination {
     expected_hash: String,
     /// Whether the fingerprint's filesystem-status was up-to-date when it was
     /// computed (see [`crate::compiler::fingerprint::CacheCompletionState`]).
-    /// A cache hit additionally requires this, so that changes to
-    /// non-cacheable dependencies (path patches) invalidate the unit.
-    fs_up_to_date: bool,    /// Lock keys, populated by [`CacheCoordination::coordinate`].
+    /// A cache hit additionally requires this so a partially written entry
+    /// (e.g. missing outputs) is rebuilt rather than skipped.
+    fs_up_to_date: bool,
+    /// Lock keys, populated by [`CacheCoordination::coordinate`].
     rmeta_key: OnceLock<LockKey>,
     rlib_key: OnceLock<LockKey>,
     /// Whether this process is (or became) the builder of the unit.
@@ -122,9 +123,9 @@ impl CacheCoordination {
     /// resolves the unit's dirtiness, so a content match alone is enough to
     /// skip when one was seen. Without an active builder, the unit is only
     /// complete when the fingerprint matches *and* the filesystem status was
-    /// up-to-date at prepare time — otherwise the staleness (e.g. a changed
-    /// path patch, or our own outputs missing on a cold cache) still needs to
-    /// be resolved by building.
+    /// up-to-date at prepare time — otherwise the staleness (our own outputs
+    /// missing on a cold or partially-written cache) still needs to be
+    /// resolved by building.
     fn is_complete(&self, builder_active: bool) -> bool {
         let content_matches = match cargo_util::paths::read(&self.fingerprint) {
             Ok(stored) => stored == self.expected_hash,

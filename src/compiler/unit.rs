@@ -186,6 +186,15 @@ impl UnitInner {
     ///   workspace `doc/` directory.
     /// - Artifact dependency units are excluded because their outputs are
     ///   routed through a separate `artifact/<kind>` directory.
+    ///
+    /// This predicate only sees the unit itself. One further, graph-dependent
+    /// rule is enforced by [`crate::compiler::build_runner::compilation_files::
+    /// CompilationFiles::is_cacheable`]: a unit that *depends on* a
+    /// path-sourced package (most notably a registry crate whose dependency is
+    /// replaced by a `[patch]` with a path) is not cacheable either — the
+    /// patched dependency is mutable workspace state, so the dependent must
+    /// use the normal mtime-based freshness logic rather than an immutable
+    /// cache entry.
     pub fn is_cacheable(&self) -> bool {
         !self.is_local()
             && !self.pkg.has_custom_build()

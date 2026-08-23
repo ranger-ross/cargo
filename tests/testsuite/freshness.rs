@@ -1678,10 +1678,10 @@ fn bust_patched_dep() {
 [DIRTY] registry1 v0.1.0 ([ROOT]/foo/reg1new): the file `reg1new/src/lib.rs` has changed ([TIME_DIFF_AFTER_LAST_BUILD])
 [COMPILING] registry1 v0.1.0 ([ROOT]/foo/reg1new)
 [RUNNING] `rustc --crate-name registry1 [..]
-[DIRTY] registry2 v0.1.0: info of dependency `registry1` changed
+[DIRTY] registry2 v0.1.0: the dependency `registry1` was rebuilt
 [COMPILING] registry2 v0.1.0
 [RUNNING] `rustc --crate-name registry2 [..]
-[DIRTY] foo v0.0.1 ([ROOT]/foo): info of dependency `registry2` changed
+[DIRTY] foo v0.0.1 ([ROOT]/foo): the dependency `registry2` was rebuilt
 [COMPILING] foo v0.0.1 ([ROOT]/foo)
 [RUNNING] `rustc --crate-name foo [..]
 [FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s

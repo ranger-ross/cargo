@@ -220,11 +220,13 @@ fn compile<'gctx>(
             // cache) are coordinated through the per-unit state locks: exactly
             // one process compiles them, others observe the progress and reuse
             // the result.
-            let cache = if build_runner.files().is_cacheable(unit)
-                && job.freshness().is_dirty()
-            {
+            let cache = if build_runner.files().is_cacheable(unit) && job.freshness().is_dirty() {
                 let completion = fingerprint::cache_completion_state(build_runner, unit)?;
-                Some(cache::CacheCoordination::new(build_runner, unit, completion)?)
+                Some(cache::CacheCoordination::new(
+                    build_runner,
+                    unit,
+                    completion,
+                )?)
             } else {
                 None
             };

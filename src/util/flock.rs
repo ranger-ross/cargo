@@ -70,8 +70,7 @@ pub(crate) fn open_ro_shared_no_msg(path: &Path) -> CargoResult<FileLock> {
         })
         .with_context(|| format!("failed to open: {}", path.display()))?;
     if !try_acquire(path, &|| imp::try_lock_shared(&f))? {
-        imp::lock_shared(&f)
-            .with_context(|| format!("failed to lock file: {}", path.display()))?;
+        imp::lock_shared(&f).with_context(|| format!("failed to lock file: {}", path.display()))?;
     }
     Ok(FileLock {
         f: Some(f),

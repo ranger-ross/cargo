@@ -61,7 +61,7 @@ Crash recovery falls out of the same protocol. A builder killed mid-compile rele
 - `src/compiler/mod.rs`. Job wiring for the coordination object, the `build cache: ... is fresh (hit ...)` diagnostics, and the `-Zbuild-analysis` lock summary.
 - `src/compiler/job_queue/`. Idempotent `rmeta_produced` (a waiter can signal it twice on the crash path), and a side-effect-free cache-hit probe on `Job` so the queue does not print `Compiling` for a unit it will only read from the cache.
 - `src/util/flock.rs`. flock primitives used by the state locks.
-- `tests/testsuite/build_cache.rs` (new). 15 integration tests: reuse across workspaces, concurrent builders, crash takeover, git rev bumps, exclusions, and output assertions.
+- `tests/testsuite/build_cache.rs` (new). 12 integration tests: reuse across workspaces, concurrent builders, crash takeover, git rev bumps, exclusions, and output assertions.
 
 ## Implementation details
 
@@ -93,6 +93,5 @@ Worker threads acquire cache locks silently (the closures are `'static` and cann
 ### Known limitations
 
 - No garbage collection. Git revision bumps and rustc upgrades accumulate entries; old ones are orphaned, never deleted.
-- A build script's `rerun-if-env-changed` variables are not part of the normalized fingerprint content. An environment change that alters a build script's output rebuilds the build-script crate itself, but a cached unit depending on it can still be reused (its pinned rmeta checksum will catch it only if the artifact bytes actually change).
 - If a builder crashes after the metadata is ready but before completion, a waiter's takeover rewrites the `.rmeta` that other waiters may already be reading. The rewrite is byte-identical in practice and the window is narrow, so this is accepted for now.
 - Entries written by a buggy intermediate cargo binary can poison the cache (the fingerprint is content-correct but the artifact references are not). The remedy is a one-time wipe of `~/.cargo/build-cache`; correct cargo versions never produce this.

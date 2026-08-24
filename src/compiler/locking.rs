@@ -28,26 +28,24 @@ pub struct LockManager {
     locks: RwLock<HashMap<LockKey, ManagedLock>>,
 }
 
-/// The mode a [`LockManager`] entry was last acquired or transitioned to.
+/// How a [`LockManager`] entry was last acquired.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LockMode {
     Shared,
     Exclusive,
 }
 
-/// A lock handle tracked by [`LockManager`], mirroring the counting
-/// discipline of the package cache locker (`util::cache_lock`).
+/// A lock handle tracked by [`LockManager`], with the same counting
+/// discipline as the package cache locker (`util::cache_lock`).
 #[derive(Debug)]
 struct ManagedLock {
     file: Arc<FileLock>,
-    /// Number of active acquisitions of this key within this process. The
-    /// underlying `flock` is taken on the 0-to-1 transition and released on
-    /// the 1-to-0 transition.
+    /// Active acquisitions of this key in this process. The underlying
+    /// `flock` is taken on 0 to 1 and released on 1 to 0.
     ///
-    /// Counts are per key, not per acquisition fd: one build unit maps to
-    /// exactly one job inside a process (the job queue dedupes units), so a
-    /// key has a single in-process owner. [`LockManager`] debug-asserts
-    /// acquisitions that would violate this.
+    /// Counts are per key, not per fd: one build unit maps to exactly one job
+    /// in a process (the job queue dedupes units), so a key has one in-process
+    /// owner. [`LockManager`] asserts in debug builds when this is violated.
     count: u32,
     mode: LockMode,
 }
@@ -69,13 +67,12 @@ impl LockManager {
         }
     }
 
-    /// Bumps the recursion count when `key` is already locked shared in this
-    /// process, mirroring the recursive locking of the package cache locker
+    /// Bumps the recursion count if `key` is already held shared in this
+    /// process. Same recursion rule as the package cache locker
     /// (`util::cache_lock`). Returns whether the bump happened.
     ///
     /// This only touches the lock table and never calls `flock`, so holding
-    /// the table lock while doing it cannot turn a cross-process wait into a
-    /// deadlock.
+    /// the table lock here cannot turn a cross-process wait into a deadlock.
     fn increment_shared(&self, key: &LockKey) -> bool {
         let mut locks = self.locks.write();
         match locks.get_mut(key) {
@@ -96,15 +93,13 @@ impl LockManager {
         }
     }
 
-    /// Takes a shared lock on a given [`Unit`]
-    /// This prevents other Cargo instances from compiling (writing) to
-    /// this build unit.
+    /// Takes a shared lock for a [`Unit`]. This stops other Cargo
+    /// instances from compiling this unit.
     ///
-    /// Recursive acquisitions are counted: the underlying `flock` is taken
-    /// once and released when the last acquisition is unlocked.
+    /// Recursive acquisitions are counted. The underlying `flock` is taken
+    /// once and released when the last holder unlocks.
     ///
-    /// This function returns a [`LockKey`] which can be used to
-    /// upgrade/unlock the lock.
+    /// Returns a [`LockKey`] that can be used to upgrade or unlock.
     #[instrument(skip_all, fields(key))]
     pub fn lock_shared(
         &self,
@@ -114,14 +109,13 @@ impl LockManager {
         let key = LockKey::from_unit(build_runner, unit);
         tracing::Span::current().record("key", key.0.to_str());
 
-        // Fast path: already held shared by this process; recursion is a
-        // pure count bump.
+        // Fast path: already held shared, just bump the count.
         if self.increment_shared(&key) {
             return Ok(key);
         }
 
-        // Slow path: ensure a handle exists, opening (and, if necessary,
-        // blocking for) the lock without holding the lock table.
+        // Slow path: ensure a handle exists. Opening and blocking for
+        // the lock happens without holding the lock table.
         if self.locks.read().get(&key).is_none() {
             let fs = Filesystem::new(key.0.clone());
             let lock_msg = format!(
@@ -144,31 +138,28 @@ impl LockManager {
         Ok(key)
     }
 
-    /// Takes a shared lock on an arbitrary lock file (not necessarily tied to
-    /// a build unit). Used for the per-build-unit state locks of the
-    /// cross-workspace build cache, which are acquired from worker threads
-    /// that have no shell access, so no "Blocking" message is printed.
+    /// Takes a shared lock on an arbitrary file, not necessarily tied to a
+    /// build unit. Used for the per-unit state locks of the cross-workspace
+    /// build cache, which are taken from worker threads with no shell, so no
+    /// "Blocking" message is printed.
     ///
-    /// Recursive acquisitions are counted: the underlying `flock` is taken
-    /// once and released when the last acquisition is unlocked.
+    /// Recursive acquisitions are counted. The underlying `flock` is taken
+    /// once and released when the last holder unlocks.
     ///
-    /// This function returns a [`LockKey`] which can be used to
-    /// upgrade/unlock the lock.
+    /// Returns a [`LockKey`] that can be used to upgrade or unlock.
     #[instrument(skip_all, fields(key))]
     pub fn lock_shared_path(&self, path: PathBuf) -> CargoResult<LockKey> {
         let key = LockKey(path);
         tracing::Span::current().record("key", key.0.to_str());
 
-        // Fast path: already held shared by this process; recursion is a
-        // pure count bump.
+        // Fast path: already held shared, just bump the count.
         if self.increment_shared(&key) {
             return Ok(key);
         }
 
-        // Slow path: ensure a handle exists, opening (and, if necessary,
-        // blocking for) the lock without holding the lock table, so a
-        // blocking `flock` does not serialize every other lock operation in
-        // this process.
+        // Slow path: ensure a handle exists. Opening and blocking for
+        // the lock happens without holding the table, so a blocking `flock`
+        // does not serialize other lock operations in this process.
         if self.locks.read().get(&key).is_none() {
             let lock = flock::open_ro_shared_no_msg(&key.0)?;
             self.locks
@@ -194,8 +185,7 @@ impl LockManager {
         let key = LockKey(path);
         tracing::Span::current().record("key", key.0.to_str());
 
-        // Fast path: already held shared by this process; recursion is a
-        // pure count bump.
+        // Fast path: already held shared, just bump the count.
         if self.increment_shared(&key) {
             return Ok(Some(key));
         }
@@ -234,10 +224,11 @@ impl LockManager {
 
     /// Takes an exclusive lock, blocking if another process holds it.
     ///
-    /// Callers must not hold the same key shared: a blocking shared-to-
-    /// exclusive conversion on one descriptor drops the old lock while
-    /// waiting, which allows lock-order cycles between contenders. Use
-    /// [`LockManager::exchange_for_exclusive`] to convert held shared locks.
+    /// Do not call this while holding the same key shared. A blocking
+    /// shared-to-exclusive conversion on one descriptor drops the old lock
+    /// while waiting, which can create lock-order cycles between contenders.
+    /// Use [`LockManager::exchange_for_exclusive`] to convert held shared
+    /// locks.
     #[instrument(skip(self))]
     pub fn lock(&self, key: &LockKey) -> CargoResult<()> {
         {
@@ -294,9 +285,9 @@ impl LockManager {
         Ok(true)
     }
 
-    /// Downgrades an existing exclusive lock into a shared lock. The
-    /// acquisition count is unchanged; the lock stays held (now shared) until
-    /// it is unlocked as many times as it was acquired.
+    /// Downgrades an exclusive lock to shared. The acquisition count stays
+    /// the same. The lock remains held (now shared) until unlocked as many
+    /// times as it was acquired.
     #[instrument(skip(self))]
     pub fn downgrade_to_shared(&self, key: &LockKey) -> CargoResult<()> {
         {
@@ -321,8 +312,8 @@ impl LockManager {
         Ok(())
     }
 
-    /// Releases one acquisition of `key`. The underlying `flock` is released
-    /// when the last acquisition is unlocked.
+    /// Releases one acquisition of `key`. The underlying `flock` is
+    /// released when the last one is unlocked.
     #[instrument(skip(self))]
     pub fn unlock(&self, key: &LockKey) -> CargoResult<()> {
         let mut locks = self.locks.write();
@@ -342,21 +333,20 @@ impl LockManager {
         Ok(())
     }
 
-    /// Converts held shared locks into an exclusive lock on `primary`,
-    /// following the package cache locker's rule that shared-to-exclusive
+    /// Turns held shared locks into an exclusive lock on `primary`.
+    /// This follows the package cache locker's rule that shared-to-exclusive
     /// conversions never happen in place.
     ///
     /// Each key in `keys` (which must include `primary`) has one acquisition
-    /// unlocked, then `primary` is probed non-blockingly. Returns `Ok(true)`
-    /// when the exclusive lock on `primary` was acquired; the caller must
-    /// re-acquire any remaining keys it needs. Returns `Ok(false)` when
-    /// another process holds `primary`; nothing is held afterwards, and the
-    /// caller should re-evaluate from scratch.
+    /// unlocked, then `primary` is probed without blocking. Returns `true`
+    /// if the exclusive lock on `primary` was acquired (caller must reacquire
+    /// any other keys it needs). Returns `false` if another process holds
+    /// `primary`; nothing is held and the caller should re-evaluate.
     ///
-    /// Releasing before probing is what keeps the multi-lock protocol free
-    /// of lock-order cycles: a blocking conversion would drop the old locks
-    /// while waiting anyway, but contenders probing at the same time could
-    /// then wait on each other in a cycle.
+    /// Releasing before probing keeps the multi-lock protocol free of
+    /// lock-order cycles. A blocking conversion would drop old locks while
+    /// waiting anyway, but contenders probing at the same time could then
+    /// wait on each other and cycle.
     pub fn exchange_for_exclusive(&self, primary: &LockKey, keys: &[LockKey]) -> CargoResult<bool> {
         debug_assert!(
             keys.iter().any(|k| k == primary),
@@ -368,12 +358,12 @@ impl LockManager {
         self.try_lock_exclusive(primary)
     }
 
-    /// Asserts (in debug builds) that `key` is currently held in `mode` by
+    /// Asserts in debug builds that `key` is currently held in `mode` by
     /// this process.
     ///
-    /// Mirrors the package cache locker's `assert_package_cache_locked`:
-    /// low-level code verifies the lock state its correctness depends on
-    /// instead of trusting its callers. Compiled out of release builds.
+    /// Same idea as the package cache locker's `assert_package_cache_locked`:
+    /// low-level code checks the lock state it depends on instead of trusting
+    /// callers. Compiled out in release builds.
     #[track_caller]
     pub(crate) fn assert_locked(&self, key: &LockKey, mode: LockMode) {
         if !cfg!(debug_assertions) {
@@ -392,12 +382,11 @@ impl LockManager {
         );
     }
 
-    /// Summarizes the locks currently held, for observability.
+    /// Summarizes currently held locks, for observability.
     ///
-    /// Worker threads acquire locks silently (they have no shell access to
-    /// print "Blocking" messages), so this post-build summary restores
-    /// visibility into what the build ended up holding. Returns
-    /// `(path, mode, count)` sorted by path for stable output.
+    /// Worker threads take locks silently (no shell to print "Blocking"
+    /// messages), so this post-build summary shows what the build held at the
+    /// end. Returns `(path, mode, count)` sorted by path.
     pub fn active_locks(&self) -> Vec<(String, &'static str, u32)> {
         let locks = self.locks.read();
         let mut summary: Vec<_> = locks
@@ -430,8 +419,8 @@ impl LockKey {
         Self(build_runner.files().build_unit_lock(unit))
     }
 
-    /// Creates a key for an arbitrary lock file path. Used by the build cache
-    /// coordination, which knows its state-lock paths up front.
+    /// Creates a key for an arbitrary lock file path. Used by the build
+    /// cache coordination, which knows its state-lock paths upfront.
     pub(crate) fn from_path(path: PathBuf) -> Self {
         Self(path)
     }

@@ -466,16 +466,15 @@ pub fn prepare_target(
 
     debug!("fingerprint at: {}", loc.display());
 
-    // Cacheable units use the normal fingerprint comparison (hash match plus
-    // filesystem status of the unit's *own* outputs). The hash match catches
-    // identity changes that are not part of the unit hash (e.g. a git
-    // revision, which appears in the checkout directory path and surfaces as
-    // `PathToSourceChanged`) and, via the pinned dependency rmeta checksums,
-    // artifact divergence of dependencies rebuilt in this workspace. Units
-    // with mutable (path-sourced) inputs — e.g. registry crates whose
-    // dependency is replaced by a `[patch]` with a path — are not cacheable
-    // at all (see `CompilationFiles::is_cacheable`), so they keep upstream's
-    // mtime-based freshness logic and never touch immutable cache entries.
+    // Cacheable units use the normal fingerprint comparison (hash plus
+    // filesystem status for the unit's own outputs). The hash catches identity
+    // changes not in the unit hash, for example a git revision that appears in
+    // the checkout path and shows up as `PathToSourceChanged`, and also
+    // catches artifact divergence through pinned dependency rmeta checksums.
+    // Units with mutable path-sourced inputs, such as a registry crate with a
+    // `[patch]` that points to a local path, are not cacheable at all (see
+    // `CompilationFiles::is_cacheable`). They keep the normal mtime-based
+    // logic and never use immutable cache entries.
 
     // Figure out if this unit is up to date. After calculating the fingerprint
     // compare it to an old version, if any, and attempt to print diagnostic
@@ -562,13 +561,12 @@ pub fn prepare_target(
     // But the executable is corrupt and needs to be rebuilt. Clearing the
     // fingerprint at step 3 ensures that Cargo never mistakes a partially
     // written output as up-to-date.
-    // Cacheable units must not truncate: their fingerprint file lives inside
-    // the immutable cache entry, and wiping it would destroy a still-valid
-    // entry whenever the unit is planned as dirty (e.g. a workspace clean
-    // made a non-cacheable dependency's fingerprint disappear). The
-    // coordination protocol re-checks completion under the unit's exclusive
-    // locks before skipping the compile, so a stale or partial entry is
-    // resolved there rather than by pre-wiping the fingerprint.
+    // Do not truncate fingerprints for cacheable units. Their file lives
+    // inside the immutable cache entry, and wiping it would delete a valid
+    // entry whenever Cargo plans the unit as dirty (for example after a
+    // workspace clean removes a non-cacheable dependency's fingerprint). The
+    // coordination protocol re-checks completion under exclusive locks before
+    // skipping the compile, so stale or partial entries are handled there.
     if loc.exists() && !is_cacheable {
         // Truncate instead of delete so that compare_old_fingerprint will
         // still log the reason for the fingerprint failure instead of just
@@ -611,13 +609,12 @@ pub fn prepare_target(
             write_fingerprint(&loc, &fingerprint)
         })
     } else if is_cacheable {
-        // The prepared fingerprint pins each dependency's rmeta content
-        // checksum (see `normalize_cache_deps`). For a cold cache the
-        // dependencies have not been built yet when the fingerprint is
-        // calculated, so their checksums are the "missing" placeholder;
-        // recompute them now that the dependencies exist so the persisted
-        // fingerprint reflects the artifacts the unit was actually compiled
-        // against.
+        // The prepared fingerprint pins each dependency's rmeta checksum
+        // (see `normalize_cache_deps`). On a cold cache the dependencies have
+        // not been built when the fingerprint is calculated, so checksums are
+        // still the "missing" placeholder. Recompute them now that dependencies
+        // exist, so the persisted fingerprint matches the artifacts the unit
+        // was compiled against.
         Work::new(move |_| {
             refresh_cache_dep_checksums(&fingerprint, &rmeta_checksum_paths)?;
             write_fingerprint(&loc, &fingerprint)
@@ -680,14 +677,13 @@ pub struct Fingerprint {
     rustc: u64,
     /// The unit's `-C metadata` value (its artifact identity).
     ///
-    /// The fingerprint must capture the exact `-C metadata` the unit's
-    /// artifacts were compiled with: a dependency's artifacts embed each
-    /// other's metadata hashes, so if a dependency is (re)built with a
-    /// different metadata (e.g. a stale workspace artifact produced by an
-    /// older cargo binary, or a divergent unit graph), every cached artifact
-    /// that links it becomes unusable (`E0460`/`E0463`) even though the
-    /// source content is unchanged. Without this field the freshness check
-    /// would accept such an entry forever.
+    /// The fingerprint must record the exact `-C metadata` used to compile the
+    /// unit. Dependency artifacts embed each other's metadata hashes, so if a
+    /// dependency is rebuilt with different metadata (for example a stale
+    /// workspace artifact from an older Cargo or a divergent unit graph),
+    /// every cached artifact linking it becomes unusable (`E0460`/`E0463`)
+    /// even though source content is unchanged. Without this field the
+    /// freshness check would keep accepting that bad entry.
     #[serde(default)]
     metadata: u64,
     /// Sorted list of cfg features enabled.
@@ -1114,13 +1110,12 @@ impl Fingerprint {
         *self.memoized_hash.lock().unwrap() = None;
     }
 
-    /// Deep-clones this fingerprint (dependencies included).
+    /// Deep-clones this fingerprint including dependencies.
     ///
-    /// Unlike a `serde` round-trip this preserves the `index` field, which is
+    /// Unlike a `serde` round-trip this keeps the `index` field, which is
     /// needed to map dependency fingerprints back to their [`Unit`]s when
-    /// normalizing them for the build cache. The memoized hash is cleared so
-    /// the clone's hash recomputes from its (possibly modified) content; the
-    /// filesystem status is copied as-is.
+    /// normalizing for the build cache. The memoized hash is cleared so it
+    /// recomputes from the modified content; filesystem status is copied as is.
     fn deep_clone(&self) -> Fingerprint {
         Fingerprint {
             rustc: self.rustc,
@@ -1379,16 +1374,15 @@ impl Fingerprint {
             pkg_root, max_path, max_mtime
         );
 
-        // Cacheable units live in the shared build cache, whose artifacts'
-        // mtimes only reflect when the cache entry was written — not when the
-        // unit's dependencies were last rebuilt in a workspace. A cache entry
-        // is almost always *older* than freshly-rebuilt non-cacheable
-        // dependencies, so the mtime chain against dependencies is meaningless
-        // for them; their (normalized) fingerprint content is the authoritative
-        // signal. Skipping the dependency loop also prevents a dependency's
-        // mtime-bumped stale fs-status from leaking into dependents, which
-        // would otherwise rebuild a cache hit forever (the cache artifacts'
-        // mtimes are never refreshed).
+        // Cacheable units live in the shared build cache. Their artifact
+        // mtimes only show when the cache entry was written, not when
+        // workspace dependencies were last rebuilt. A cache entry is almost
+        // always older than freshly rebuilt non-cacheable dependencies, so
+        // the mtime chain against dependencies is not meaningful for them.
+        // Normalized fingerprint content is the authoritative signal. Skipping
+        // the dependency loop also stops a dependency's stale mtime status
+        // from leaking into dependents and rebuilding a cache hit forever
+        // (cache mtimes are never refreshed).
         if !cacheable_indices.contains(&self.index) {
             for dep in self.deps.iter() {
                 let dep_mtimes = match &dep.fingerprint.fs_status {
@@ -1405,12 +1399,11 @@ impl Fingerprint {
                     }
                 };
 
-                // Dependencies built into the cross-workspace build cache are
-                // immutable: their artifacts' mtimes only reflect when the
-                // shared cache entry was written, not whether the dependency
-                // changed. Their normalized fingerprint content (embedded in
-                // this fingerprint) is the authoritative freshness signal, so
-                // skip the mtime comparison for them.
+                // Dependencies in the cross-workspace cache are immutable.
+                // Their mtimes only show when the shared entry was written,
+                // not whether the dependency changed. Normalized fingerprint
+                // content embedded here is the real freshness signal, so skip
+                // the mtime check for them.
                 if cacheable_indices.contains(&dep.fingerprint.index) {
                     continue;
                 }
@@ -1633,31 +1626,29 @@ impl StaleItem {
     }
 }
 
-/// Normalizes a cacheable unit's fingerprint tree for stable cache entries.
+/// Normalizes a cacheable unit's fingerprint tree so cache entries stay
+/// stable.
 ///
-/// A `run-custom-build` unit's `local` fingerprint switches between the
-/// whole-crate `Precalculated` form (when the previous run's output is
-/// missing) and the `RerunIfChanged`/`RerunIfEnvChanged` form (when it is
-/// present). Which form applies depends on environmental state (was the
-/// workspace build dir cleaned since the build script last ran), so a
-/// fingerprint that embeds it differs between builds of identical inputs —
-/// invalidating otherwise-immutable cache entries after a `cargo clean`.
+/// A `run-custom-build` unit's `local` fingerprint changes with environment:
+/// it is `Precalculated` when the previous run's output is missing and
+/// `RerunIfChanged`/`RerunIfEnvChanged` when present. Whether the output is
+/// missing depends on whether the workspace build dir was cleaned since the
+/// script last ran, so embedding that state makes identical inputs look
+/// different and invalidates immutable cache entries after `cargo clean`.
 ///
 /// For cacheable units the dependency fingerprint is replaced by the
-/// deterministic, content-based `Precalculated(pkg_fingerprint)` form
-/// (recursively):
+/// content-based `Precalculated(pkg_fingerprint)` form, applied recursively:
 ///
-/// * For `run-custom-build` dependencies the build script's inputs are its
-///   package (captured by `pkg_fingerprint`) — the `rerun-if-*` bookkeeping
-///   adds no information for immutable registry/git sources.
-/// * Local (path) dependencies no longer occur under cacheable units: a unit
-///   depending on a path-sourced package is not eligible for the cache (see
-///   `CompilationFiles::is_cacheable`). If one ever did, the mtime-based
-///   package fingerprint keeps the entry conservative rather than stale.
+/// * For `run-custom-build` dependencies the inputs are the package itself
+///   (via `pkg_fingerprint`). The `rerun-if-*` bookkeeping adds nothing for
+///   immutable registry or git sources.
+/// * Path dependencies should not appear under cacheable units: a unit that
+///   depends on a path source is not cacheable (see
+///   `CompilationFiles::is_cacheable`). If one did, the mtime-based package
+///   fingerprint keeps the entry conservative rather than stale.
 ///
-/// The clone is private to the cacheable unit's fingerprint, so the shared
-/// fingerprints used for the dependencies' own freshness checks are
-/// untouched.
+/// The clone is private to the cacheable unit, so shared fingerprints used
+/// for dependencies' own freshness checks are not touched.
 fn normalize_cache_fingerprint(
     build_runner: &BuildRunner<'_, '_>,
     fingerprint: &Fingerprint,
@@ -1673,18 +1664,16 @@ fn normalize_cache_fingerprint(
     Ok(clone)
 }
 
-/// Recursively replaces the `local` fingerprints of `run-custom-build` and
-/// local dependencies of `fp` with their content-based package fingerprint,
-/// mixed with the dependency's `-C metadata` and the checksum of its rmeta
-/// artifact.
+/// Replaces `local` fingerprints of `run-custom-build` and local
+/// dependencies of `fp` with content-based package fingerprints, mixed with
+/// the dependency's `-C metadata` and rmeta checksum.
 ///
-/// The rmeta checksum matters because a dependency's rmeta embeds
-/// workspace-specific absolute paths (e.g. the `OUT_DIR` of a build-script
-/// dependency), so two artifacts for the *same* unit (same `-C metadata`)
-/// built in different workspaces are not interchangeable: rustc rejects the
+/// The rmeta checksum is needed because a dependency's rmeta can embed
+/// absolute workspace paths (for example `OUT_DIR` of a build-script
+/// dependency). Two artifacts for the same unit and metadata built in
+/// different workspaces are then not interchangeable, and rustc rejects the
 /// mismatch with `E0460`/`E0463` when a cached dependent links against them.
-/// Pinning the rmeta content makes the freshness check rebuild the cached
-/// entry whenever the dependency's artifact diverges.
+/// Pinning rmeta content forces a rebuild when the dependency artifact diverges.
 fn normalize_cache_deps(
     build_runner: &BuildRunner<'_, '_>,
     fp: &Fingerprint,
@@ -1708,11 +1697,11 @@ fn normalize_cache_deps(
     Ok(())
 }
 
-/// Returns the content hash of the given unit's rmeta artifact, or a marker
-/// string when the unit produces no rmeta (e.g. an overridden build script) or
-/// the artifact is not built yet (a cold cache, where the dependency has not
-/// been compiled; the "missing" marker then differs from any real checksum, so
-/// the entry is rebuilt once the dependency's artifact exists).
+/// Returns the content hash of the unit's rmeta, or a marker when the
+/// unit has no rmeta (overridden build script) or the artifact does not yet
+/// exist (cold cache where the dependency has not compiled). The "missing"
+/// marker differs from any real checksum, so the entry is rebuilt once the
+/// dependency artifact exists.
 fn dep_rmeta_checksum(build_runner: &BuildRunner<'_, '_>, unit: &Unit) -> CargoResult<String> {
     let outputs = build_runner.outputs(unit)?;
     if let Some(rmeta) = outputs.iter().find(|o| o.flavor == FileFlavor::Rmeta) {
@@ -1725,9 +1714,9 @@ fn dep_rmeta_checksum(build_runner: &BuildRunner<'_, '_>, unit: &Unit) -> CargoR
     Ok("none".to_string())
 }
 
-/// Collects the rmeta artifact path of every (transitive) dependency of the
-/// given fingerprint, in the same order [`refresh_cache_dep_checksums`] walks
-/// them. Dependencies without an rmeta artifact get an empty sentinel path.
+/// Collects the rmeta path for every transitive dependency of the
+/// fingerprint, in the same order [`refresh_cache_dep_checksums`] walks them.
+/// Dependencies without an rmeta get an empty sentinel path.
 fn collect_dep_rmeta_paths(
     build_runner: &BuildRunner<'_, '_>,
     fp: &Fingerprint,
@@ -1766,10 +1755,10 @@ fn collect_dep_rmeta_paths_inner(
     Ok(())
 }
 
-/// Replaces the `:missing` checksum placeholders in the fingerprint's
-/// dependency locals with the actual rmeta content checksums. The rmeta files
-/// exist at this point because the dependencies have been built (this runs
-/// when the unit's own fingerprint is persisted after a successful compile).
+/// Replaces `:missing` checksum placeholders in dependency locals with
+/// real rmeta checksums. Rmeta files exist at this point because dependencies
+/// have been built (this runs when persisting the unit's fingerprint after a
+/// successful compile).
 fn refresh_cache_dep_checksums(fp: &Fingerprint, paths: &[PathBuf]) -> CargoResult<()> {
     refresh_dep_checksums(fp, &mut paths.iter())?;
     // The dependency locals changed, so the memoized hash of this fingerprint
@@ -1882,13 +1871,12 @@ fn calculate_normal(
         // built. The only exception here are artifact dependencies,
         // which is an actual dependency that needs a recompile.
         //
-        // Note: cacheable dependencies ARE included here. Even though their own
-        // freshness is determined by fingerprint-file existence in the build
-        // cache (they are immutable), their dependents still need to know when
-        // the dependency *identity* changes (e.g. a git dependency moving to a
-        // new revision, which produces a new build unit). That change must
-        // propagate as dirtiness to non-cacheable dependents such as binaries
-        // and build scripts.
+        // Cacheable dependencies are included here. Their own freshness comes
+        // from the fingerprint in the build cache (they are immutable), but
+        // dependents still need to see identity changes (for example a git
+        // dependency moving to a new revision, which creates a new unit). That
+        // change must mark non-cacheable dependents such as binaries and build
+        // scripts as dirty.
         //
         // Create Vec since mutable build_runner is needed in closure.
         let deps = Vec::from(build_runner.unit_deps(unit));
@@ -1917,16 +1905,15 @@ fn calculate_normal(
     } else {
         let dep_info = dep_info_loc(build_runner, unit);
         let dep_info = if build_runner.files().is_cacheable(unit) {
-            // The dep-info for a cacheable unit lives in the build cache, not
-            // under the workspace build root, so it cannot be encoded relative
+            // Dep-info for a cacheable unit lives in the build cache, not
+            // under the workspace build root, so it cannot be stored relative
             // to it. Store the absolute path: `find_stale_item` joins it with
-            // the build root, which is a no-op for absolute paths. This is
-            // acceptable because the fingerprint itself lives in the build
-            // cache and is therefore not portable between machines anyway.
-            // Keeping `CheckDepInfo` (rather than a precalculated value)
-            // preserves the dep-info's environment-variable tracking (used by
-            // `-Zrustdoc-depinfo` and `-Zbinary-dep-depinfo`) and any source
-            // mtime checking.
+            // the build root, which is a no-op for absolute paths. This is ok
+            // because the fingerprint itself lives in the cache and is not
+            // portable between machines anyway. Keeping `CheckDepInfo` instead
+            // of a precalculated value preserves env-var tracking from dep-info
+            // (used by `-Zrustdoc-depinfo` and `-Zbinary-dep-depinfo`) and
+            // source mtime checks.
             dep_info
         } else {
             dep_info.strip_prefix(&build_root).unwrap().to_path_buf()
@@ -2082,8 +2069,8 @@ See https://doc.rust-lang.org/cargo/reference/build-scripts.html#rerun-if-change
         // Create Vec since mutable build_runner is needed in closure.
         let deps = Vec::from(build_runner.unit_deps(unit));
         deps.into_iter()
-            // Cacheable dependencies are included so that a dependency identity
-            // change (e.g. a new git revision) re-runs the build script.
+                // Include cacheable dependencies so an identity change
+            // (for example a new git revision) reruns the build script.
             .map(|dep| DepFingerprint::new(build_runner, unit, &dep))
             .collect::<CargoResult<Vec<_>>>()?
     };
@@ -2285,8 +2272,6 @@ fn local_fingerprints_deps(
 fn write_fingerprint(loc: &Path, fingerprint: &Fingerprint) -> CargoResult<()> {
     debug_assert_ne!(fingerprint.rustc, 0);
 
-    // FIXME: There is probably a smart (and faster) way to do this.
-    //        This is quick and dirty for a prototype
     if !loc.exists() {
         paths::create_dir_all(&loc.parent().unwrap())?;
     }
@@ -2319,40 +2304,35 @@ pub fn prepare_init(build_runner: &mut BuildRunner<'_, '_>, unit: &Unit) -> Carg
     Ok(())
 }
 
-/// The state needed by the build cache's coordination protocol to decide
-/// whether a cached unit is complete *for this unit's identity and filesystem
-/// state*.
+/// State the build cache protocol uses to decide if a cached unit is
+/// complete for this identity and filesystem state.
 pub(crate) struct CacheCompletionState {
-    /// The unit's normalized fingerprint as a private clone. The pinned
-    /// dependency rmeta checksums start as "missing" placeholders when the
-    /// dependencies are not built yet (a cold workspace); call
-    /// [`CacheCompletionState::expected_hash`] to refresh them from the
-    /// artifacts that exist at check time.
+    /// Normalized fingerprint as a private clone. Pinned dependency rmeta
+    /// checksums start as "missing" placeholders when dependencies are not yet
+    /// built (cold workspace). Call [`CacheCompletionState::expected_hash`] to
+    /// refresh them from artifacts present at check time.
     pub(crate) fingerprint: parking_lot::Mutex<Fingerprint>,
     /// The rmeta artifact paths of every transitive dependency, in the order
     /// [`refresh_cache_dep_checksums`] walks them.
     pub(crate) rmeta_paths: Vec<PathBuf>,
-    /// Whether the fingerprint's filesystem-status was up-to-date when it was
-    /// computed, i.e. the unit's own outputs exist and its own local inputs
-    /// (dep-info tracked) are unchanged. Dependency staleness is not part of
-    /// this: units with mutable dependencies are not cacheable in the first
-    /// place, and cache artifacts' mtimes never refresh, so dependency mtime
-    /// chains carry no signal for cacheable units.
+    /// Whether filesystem status was up to date when computed, meaning the
+    /// unit's own outputs exist and its own local inputs (dep-info tracked)
+    /// are unchanged. Dependency staleness is not included: units with
+    /// mutable dependencies are not cacheable, and cache mtimes never refresh,
+    /// so dependency mtime chains carry no signal for cacheable units.
     pub(crate) fs_up_to_date: bool,
 }
 
 impl CacheCompletionState {
     /// Returns the hex hash a complete cache entry must match.
     ///
-    /// The stored fingerprint was written after this unit compiled against
-    /// its dependencies' actual rmeta bytes (`refresh_cache_dep_checksums`
-    /// runs before `write_fingerprint`). Comparing against it therefore
-    /// requires the same refresh here: on a cold workspace the plan-time
-    /// checksums were placeholders because the dependencies had not been
-    /// built yet, but by the time a dirty unit's job executes they have
-    /// been (the job queue compiles dependencies first), so refreshing
-    /// yields the values the entry was persisted with and an intact entry
-    /// is recognized instead of rebuilt.
+    /// The stored fingerprint was written after the unit compiled against its
+    /// dependencies' actual rmeta bytes (`refresh_cache_dep_checksums` runs
+    /// before `write_fingerprint`). Checking against it needs the same refresh
+    /// here. On a cold workspace checksums were placeholders at plan time
+    /// because dependencies had not built yet. By the time a dirty unit's job
+    /// runs they have been built (dependencies run first), so refreshing gives
+    /// the persisted values and an intact entry is recognized instead of rebuilt.
     pub(crate) fn expected_hash(&self) -> CargoResult<String> {
         let fp = self.fingerprint.lock();
         refresh_cache_dep_checksums(&fp, &self.rmeta_paths)?;
@@ -2360,7 +2340,7 @@ impl CacheCompletionState {
     }
 }
 
-/// Returns the fingerprint state a cacheable `unit` would persist.
+/// Returns the fingerprint state that would be persisted for a cacheable `unit`.
 pub(crate) fn cache_completion_state(
     build_runner: &mut BuildRunner<'_, '_>,
     unit: &Unit,

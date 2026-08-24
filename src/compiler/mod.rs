@@ -216,10 +216,9 @@ fn compile<'gctx>(
         } else {
             let force = exec.force_rebuild(unit) || force_rebuild;
             let mut job = fingerprint::prepare_target(build_runner, unit, force)?;
-            // Cacheable units that are dirty (missing or stale in the build
-            // cache) are coordinated through the per-unit state locks: exactly
-            // one process compiles them, others observe the progress and reuse
-            // the result.
+            // Dirty cacheable units (missing or stale in the build cache)
+            // are coordinated through per-unit state locks. Exactly one
+            // process compiles them; others watch and reuse the result.
             let cache = if build_runner.files().is_cacheable(unit) && job.freshness().is_dirty() {
                 let completion = fingerprint::cache_completion_state(build_runner, unit)?;
                 Some(cache::CacheCoordination::new(
@@ -242,9 +241,9 @@ fn compile<'gctx>(
                 };
                 work.then(link_targets(build_runner, unit, false)?)
             } else {
-                // A fresh cacheable unit is a hit in the cross-workspace build
-                // cache: its fingerprint matches and its filesystem state is
-                // up-to-date, so there is nothing for us to compile.
+                // A fresh cacheable unit is a hit in the cross-workspace
+                // cache. Its fingerprint matches and filesystem state is up to
+                // date, so there is nothing to compile.
                 if build_runner.files().is_cacheable(unit) {
                     let cache_entry = build_runner.files().cache_rmeta_lock(unit);
                     let cache_entry = cache_entry
@@ -270,8 +269,8 @@ fn compile<'gctx>(
                 work.then(link_targets(build_runner, unit, true)?)
             });
             if let Some(cache) = &cache {
-                // Runs after the fingerprint is written, so that waiters
-                // acquiring the rlib lock shared always observe the completed
+                // Runs after the fingerprint is written, so waiters that
+                // acquire the rlib lock shared always see the completed
                 // fingerprint.
                 job.after(cache::CacheCoordination::after_work(cache));
             }
@@ -328,11 +327,11 @@ fn make_failed_scrape_diagnostic(
     )
 }
 
-/// Creates a unit of work invoking `rustc` for building the `unit`.
+/// Creates work that runs `rustc` for `unit`.
 ///
-/// `cache` carries the build-cache coordination state for cacheable units; for
-/// such units the returned work first runs the coordination protocol (possibly
-/// waiting on or taking over from another Cargo process) before compiling.
+/// `cache` is the build-cache coordination state for cacheable units. For
+/// those units the work first runs the coordination protocol, which may wait
+/// for or take over from another Cargo process, before compiling.
 fn rustc(
     build_runner: &mut BuildRunner<'_, '_>,
     unit: &Unit,
@@ -384,8 +383,8 @@ fn rustc(
         .unwrap_or_else(|| build_runner.bcx.gctx.cwd())
         .to_path_buf();
     let is_cacheable = build_runner.files().is_cacheable(unit);
-    // Display identity for the cache-hit diagnostics in the work closure
-    // below (the closure cannot borrow the build runner).
+    // Identity for cache-hit messages in the work closure below. The
+    // closure cannot borrow the build runner, so save it here.
     let cache_identity = if is_cacheable {
         let cache_entry = build_runner.files().cache_rmeta_lock(unit);
         let cache_entry = cache_entry
@@ -439,13 +438,13 @@ fn rustc(
     }
     let env_config = Arc::clone(build_runner.bcx.gctx.env_config()?);
     return Ok(Work::new(move |state| {
-        // Cacheable units are coordinated through the build cache's per-unit
-        // state locks: if another process is (or already did) build this unit,
-        // there is nothing for us to compile.
+        // Cacheable units are coordinated through per-unit state locks in
+        // the build cache. If another process already built this unit, there
+        // is nothing to compile.
         if let Some(cache) = &cache {
             if !cache.coordinate(state)? {
-                // Another process (or a previous run) already built this unit
-                // in the build cache while we waited, so we skip compiling.
+                // Another process already built this unit in the cache while
+                // we waited, so skip compiling.
                 if let Some((name, target, cache_entry)) = &cache_identity {
                     println!(
                         "build cache: `{}` {} is fresh (hit {})",
@@ -533,10 +532,10 @@ fn rustc(
             }
         }
 
-        // When rustc reports the `.rmeta` artifact, a cacheable unit's rmeta
-        // lock is downgraded to shared (before signaling `rmeta_produced`) so
-        // other Cargo processes can start pipelined compilation against the
-        // metadata while this process still codegens.
+        // When rustc reports the `.rmeta`, a cacheable unit downgrades its
+        // rmeta lock to shared before signaling `rmeta_produced`. That lets
+        // other Cargo processes start pipelined compiles against the metadata
+        // while this process still runs codegen.
         let on_rmeta: Option<&dyn Fn() -> CargoResult<()>> = match &cache {
             Some(cache) => Some(&|| cache.downgrade_rmeta(state)),
             None => None,

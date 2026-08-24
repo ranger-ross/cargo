@@ -221,10 +221,10 @@ pub struct Layout {
     artifact_dir: Option<ArtifactDirLayout>,
     build_dir: BuildDirLayout,
     build_cache: BuildCacheLayout,
-    /// Whether the build cache is usable for this build. This is `false` when
-    /// `$CARGO_HOME/build-cache` cannot be written (e.g. a read-only
-    /// `CARGO_HOME`), in which case cacheable units fall back to the workspace
-    /// build directory.
+    /// Whether the build cache can be used for this build. False when
+    /// `$CARGO_HOME/build-cache` cannot be written (for example a read-only
+    /// `CARGO_HOME`). Cacheable units then fall back to the workspace build
+    /// directory.
     cache_enabled: bool,
     _lock: Option<FileLock>,
 }
@@ -329,8 +329,8 @@ impl Layout {
                 if e.downcast_ref::<std::io::Error>()
                     .is_some_and(|e| e.kind() == std::io::ErrorKind::PermissionDenied) =>
             {
-                // A read-only `$CARGO_HOME` (e.g. a read-only registry cache
-                // setup) must not break the build; just disable the cache.
+                // A read-only `$CARGO_HOME` (for example a read-only registry
+                // cache) must not break the build. Just disable the cache.
                 tracing::debug!(
                     "build cache disabled: cannot create {:?}: {e:?}",
                     build_cache_root
@@ -384,8 +384,8 @@ impl Layout {
         &self.build_cache
     }
 
-    /// Returns whether the cross-workspace build cache is usable for this
-    /// build (i.e. `$CARGO_HOME/build-cache` is writable).
+    /// Returns whether the cross-workspace build cache can be used for
+    /// this build (whether `$CARGO_HOME/build-cache` is writable).
     pub fn cache_enabled(&self) -> bool {
         self.cache_enabled
     }
@@ -568,11 +568,11 @@ impl BuildCacheLayout {
     pub fn out(&self, pkg_dir: &str) -> PathBuf {
         self.build_unit(pkg_dir).join("out")
     }
-    /// Fetch the incremental path for a build unit.
+    /// Incremental path for a build unit.
     ///
-    /// Incremental data is stored per build unit (rather than per profile as
-    /// in the workspace build dir) so that concurrent Cargo processes never
-    /// share incremental state; the per-unit locks cover this directory.
+    /// Incremental data is stored per build unit rather than per profile as in
+    /// the workspace build dir, so concurrent Cargo processes never share
+    /// incremental state. Per-unit locks cover this directory.
     pub fn incremental(&self, pkg_dir: &str) -> PathBuf {
         self.build_unit(pkg_dir).join("incremental")
     }

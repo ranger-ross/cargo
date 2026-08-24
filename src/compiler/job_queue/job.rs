@@ -12,10 +12,10 @@ use crate::util::CargoResult;
 pub struct Job {
     work: Work,
     fresh: Freshness,
-    /// For dirty cacheable units: reports, without side effects, whether the
-    /// unit's build-cache entry is already complete. The job queue consults
-    /// it at spawn time so a unit that will only be *read* from the cache is
-    /// not announced as "Compiling"; the job itself reports the hit.
+    /// For dirty cacheable units: checks without side effects whether the
+    /// build-cache entry is already complete. The job queue calls this at
+    /// spawn time so a unit that will only be read from the cache is not
+    /// announced as "Compiling". The job itself reports the hit.
     cache_hit_probe: Option<std::sync::Arc<dyn Fn() -> CargoResult<bool> + Send + Sync>>,
 }
 
@@ -74,8 +74,8 @@ impl Job {
         }
     }
 
-    /// Attaches the build-cache completeness probe used to suppress the
-    /// "Compiling" status for units that will only be reused from the cache.
+    /// Attaches the build-cache probe that suppresses "Compiling" for
+    /// units that will only be reused from the cache.
     pub fn set_cache_hit_probe(
         &mut self,
         probe: std::sync::Arc<dyn Fn() -> CargoResult<bool> + Send + Sync>,

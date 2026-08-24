@@ -1,66 +1,61 @@
 //! Coordination for the cross-workspace build cache.
 //!
-//! Cacheable build units (see [`Unit::is_cacheable`]) are compiled directly
-//! inside `$CARGO_HOME/build-cache` and are immutable once complete. Because
-//! multiple Cargo processes may build and read the same unit concurrently,
-//! each cacheable unit directory carries two state lock files:
+//! Cacheable units (see [`Unit::is_cacheable`]) are built directly in
+//! `$CARGO_HOME/build-cache` and treated as immutable once complete. Multiple
+//! Cargo processes can build and read the same unit at the same time, so each
+//! cache directory uses two state locks:
 //!
-//! * `.rmeta.lock` — held **exclusively** while the unit is being compiled and
-//!   its `.rmeta` has not yet been produced; downgraded to **shared** as soon
-//!   as rustc reports the `.rmeta` artifact (which rustc writes completely
-//!   before emitting the artifact notification). Other processes acquiring it
-//!   shared therefore know the `.rmeta` is safe to read, even though the
-//!   `.rlib` (or other final artifacts) are still being produced.
-//! * `.rlib.lock` — held **exclusively** while the unit is being compiled and
-//!   downgraded to **shared** only after all artifacts have been written *and*
-//!   the fingerprint file has been persisted. Acquiring it shared therefore
-//!   guarantees the fingerprint file exists, which is the cache's definition of
-//!   "complete".
+//! * `.rmeta.lock`: held exclusively while the unit compiles and the `.rmeta`
+//!   has not been produced. It is downgraded to shared once rustc reports the
+//!   `.rmeta` (rustc finishes writing it before sending the notification).
+//!   A shared holder can then read the `.rmeta` safely while the `.rlib`
+//!   or other outputs are still being produced.
+//! * `.rlib.lock`: held exclusively while the unit compiles and downgraded
+//!   to shared only after all outputs are written and the fingerprint is
+//!   persisted. A shared holder knows the fingerprint exists, which means the
+//!   cache entry is complete.
 //!
-//! Locks are always acquired in the same order (`.rmeta.lock` before
-//! `.rlib.lock`) and contenders release their shared locks before attempting
-//! an exclusive upgrade, which keeps the multi-lock protocol free of
+//! Locks are always taken in the same order (`.rmeta.lock` then `.rlib.lock`).
+//! Contenders release shared locks before trying for exclusive, which avoids
 //! lock-order cycles.
 //!
 //! ## Roles
 //!
-//! A job for a cacheable unit that was dirty at fingerprint-check time runs
-//! [`CacheCoordination::coordinate`] before compiling. It either becomes the
-//! **builder** (it compiles the unit) or a **waiter** (it observes the
-//! builder's progress):
+//! A job for a cacheable unit that is dirty at fingerprint-check time runs
+//! [`CacheCoordination::coordinate`] before compiling. It becomes either the
+//! **builder** (it compiles the unit) or a **waiter** (it watches the
+//! builder):
 //!
-//! * **Builder**: holds both locks exclusively (after a fingerprint
-//!   double-check, since another process may have completed the unit while it
+//! * **Builder**: holds both locks exclusively (after double-checking the
+//!   fingerprint, since another process may have finished the unit while it
 //!   waited), compiles, downgrades `.rmeta.lock` to shared as soon as rustc
-//!   reports the `.rmeta` artifact so other processes can start pipelined
-//!   compilation against the metadata, and finally downgrades `.rlib.lock` to
-//!   shared after the fingerprint is written.
-//! * **Waiter**: takes `.rmeta.lock` shared (blocking until the rmeta is ready
-//!   or the builder is gone). If the unit is complete it is done. If the
-//!   builder is still compiling, it signals `rmeta_produced` early so its own
+//!   reports the `.rmeta` so other processes can pipeline against it, then
+//!   downgrades `.rlib.lock` to shared after the fingerprint is written.
+//! * **Waiter**: takes `.rmeta.lock` shared (blocks until the rmeta is ready
+//!   or the builder is gone). If the unit is complete it returns. If the
+//!   builder is still active, it signals `rmeta_produced` early so its own
 //!   dependents can start type-checking against the metadata while the builder
-//!   still codegens, then blocks on `.rlib.lock` shared. If the builder crashed
-//!   (the fingerprint never appeared), it transitions to the builder role.
+//!   finishes codegen, then blocks on `.rlib.lock` shared. If the builder
+//!   crashed (no fingerprint appeared), it takes over the build.
 //!
 //! ## Crash recovery
 //!
-//! If a builder dies mid-compile it releases its locks, leaving a partial unit
-//! with no fingerprint. The next process to run the protocol observes the
-//! missing fingerprint and takes over the build. All shared locks acquired
-//! while waiting are released before taking the exclusive locks, and the
-//! fingerprint is double-checked after acquisition, so concurrent contenders
-//! resolve to a single builder without deadlock.
+//! If a builder dies mid-compile it releases its locks and leaves a partial
+//! unit with no fingerprint. The next process to run the protocol sees the
+//! missing fingerprint and takes over. All shared locks are released before
+//! trying for exclusive, and the fingerprint is checked again after
+//! acquisition, so concurrent contenders resolve to a single builder without
+//! deadlock.
 //!
 //! ## Known limitation
 //!
-//! If a builder crashes *after* producing the `.rmeta` but before completing
-//! the unit, a waiter may already have signaled `rmeta_produced` and started
-//! its dependents compiling against that `.rmeta`. When the waiter then takes
-//! over the build, its rustc invocation rewrites the `.rmeta` file while those
-//! dependents may still be reading it, which can in theory cause a torn read.
-//! The rewrite is byte-identical in practice (same unit, same inputs, same
-//! rustc), and the window requires a builder crash at a precise moment, so
-//! this is accepted for the PoC.
+//! If a builder crashes after producing the `.rmeta` but before finishing,
+//! a waiter may have already signaled `rmeta_produced` and started dependents
+//! against that `.rmeta`. When the waiter takes over, rustc rewrites the
+//! `.rmeta` while dependents may still be reading it, which can cause a torn
+//! read in theory. The rewrite is byte-identical in practice (same unit, same
+//! inputs, same rustc) and needs a crash at a precise moment, so this is
+//! accepted for the PoC.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -71,13 +66,12 @@ use crate::compiler::locking::{LockKey, LockMode};
 use crate::compiler::{BuildRunner, Unit};
 use crate::util::CargoResult;
 
-/// The lock keys and role flags for one coordinated cacheable unit.
+/// Lock keys and role flags for one coordinated cacheable unit.
 ///
-/// The keys are known up front (they are derived from the unit's cache
-/// directory), so they are constructed once instead of being recovered from
-/// lookups after acquisition. The wait phases hold both keys shared; the
-/// builder holds them exclusively after the exchange, and downgrades them
-/// in [`CacheCoordination::downgrade_rmeta`] and
+/// Keys are derived from the unit's cache directory and built once upfront,
+/// instead of being looked up after acquisition. Waiters hold both keys
+/// shared; the builder holds them exclusively after the exchange and
+/// downgrades them in [`CacheCoordination::downgrade_rmeta`] and
 /// [`CacheCoordination::after_work`].
 struct UnitLocks {
     /// `.rmeta.lock`: held exclusively while compiling, downgraded to shared
@@ -119,27 +113,27 @@ impl UnitLocks {
     }
 }
 
-/// The next step of the coordination protocol.
+/// Next step in the coordination state machine.
 enum Attempt {
-    /// Take `.rmeta.lock` shared, waiting until the rmeta is readable or the
-    /// builder is gone.
+    /// Acquire `.rmeta.lock` shared. Blocks until the rmeta is readable or
+    /// the builder releases its locks.
     WaitForRmeta,
-    /// Detect an active builder via a non-blocking probe of `.rlib.lock`.
+    /// Probe `.rlib.lock` without blocking to see if a builder is active.
     ProbeBuilder,
-    /// Convert the held shared locks into exclusive ownership of the unit
-    /// (builder takeover), re-evaluating if another process got there first.
+    /// Turn held shared locks into exclusive ownership (take over the build),
+    /// checking again whether another process already finished it.
     TakeOver,
-    /// Finished. `true` means compile (builder role); `false` means skip
-    /// (the unit is complete).
+    /// Done. `true` means this process should compile, `false` means skip
+    /// because the unit is already complete.
     Done(bool),
 }
 
-/// Per-job coordination state for building one cacheable unit.
+/// Per-job coordination state for a single cacheable unit.
 pub struct CacheCoordination {
     locks: UnitLocks,
     fingerprint: PathBuf,
-    /// The unit's normalized fingerprint and filesystem state used to decide
-    /// whether a cache entry is complete (see
+    /// Normalized fingerprint and filesystem state that decides whether a
+    /// cache entry counts as complete (see
     /// [`crate::compiler::fingerprint::CacheCompletionState`]).
     completion: crate::compiler::fingerprint::CacheCompletionState,
 }
@@ -161,17 +155,16 @@ impl CacheCoordination {
         }))
     }
 
-    /// Returns whether the cached unit is complete for this unit's identity
-    /// and filesystem state.
+    /// Checks whether the cached unit is complete for this identity and
+    /// filesystem state.
     ///
-    /// `builder_active` says whether another process was observed holding the
-    /// unit's locks (i.e. actively compiling) before this check. A builder
-    /// resolves the unit's dirtiness, so a content match alone is enough to
-    /// skip when one was seen. Without an active builder, the unit is only
-    /// complete when the fingerprint matches *and* the filesystem status was
-    /// up-to-date at prepare time, otherwise the staleness (our own outputs
-    /// missing on a cold or partially-written cache) still needs to be
-    /// resolved by building.
+    /// `builder_active` is true if another process held the unit's locks
+    /// just before this check, meaning it is actively compiling. In that
+    /// case a content match alone is enough to skip, because the builder
+    /// will resolve any remaining dirtiness. Without an active builder the
+    /// unit is only complete when the fingerprint matches and the filesystem
+    /// was up to date at prepare time (otherwise missing outputs on a cold
+    /// or partial cache still need a build).
     pub(crate) fn is_complete(&self, builder_active: bool) -> CargoResult<bool> {
         let content_matches = match cargo_util::paths::read(&self.fingerprint) {
             Ok(stored) => stored == self.completion.expected_hash()?,
@@ -180,22 +173,20 @@ impl CacheCoordination {
         Ok(content_matches && (self.completion.fs_up_to_date || builder_active))
     }
 
-    /// Returns whether any fingerprint file exists at all.
+    /// Checks whether any fingerprint file exists.
     ///
-    /// A missing fingerprint means the unit was never built (cold cache). A
-    /// *present but mismatched* fingerprint means the unit is being rebuilt in
-    /// place with different identity content (e.g. a new git revision), in
-    /// which case pipelining against the stale rmeta would be incorrect.
+    /// Missing means the unit has never been built (cold cache). Present but
+    /// mismatched means the unit is being rebuilt in place with different
+    /// content (for example a new git revision). In the latter case pipelining
+    /// against the stale rmeta would be wrong.
     fn fingerprint_exists(&self) -> bool {
         self.fingerprint.exists()
     }
 
-    /// Runs the coordination protocol for a cacheable unit.
+    /// Runs the coordination protocol for one cacheable unit.
     ///
-    /// Returns `Ok(true)` if this process should compile the unit (builder
-    /// role). Returns `Ok(false)` if the unit is already complete (or was
-    /// completed while we waited), in which case the caller must skip the
-    /// compilation.
+    /// Returns `true` if this process should compile the unit (builder role)
+    /// and `false` if the unit is already complete.
     pub(crate) fn coordinate(&self, state: &JobState<'_, '_>) -> CargoResult<bool> {
         let mut attempt = Attempt::WaitForRmeta;
         loop {
@@ -208,16 +199,14 @@ impl CacheCoordination {
         }
     }
 
-    /// Takes `.rmeta.lock` shared, blocking until the rmeta is readable (the
-    /// builder downgraded its lock), the unit is complete, or the builder
-    /// crashed and released its locks.
+    /// Takes `.rmeta.lock` shared. Blocks until the rmeta is readable,
+    /// the unit is complete, or the builder crashes and releases its locks.
     fn wait_for_rmeta(&self, state: &JobState<'_, '_>) -> CargoResult<Attempt> {
         state.lock_shared_path(self.locks.rmeta.path().clone())?;
         self.locks.held_rmeta.store(true, Ordering::SeqCst);
 
-        // A fingerprint matching our expected hash, with an up-to-date
-        // filesystem status, means the unit is complete and immutable;
-        // there is nothing for us to do.
+        // Matching fingerprint with up-to-date filesystem state means the unit
+        // is complete and immutable, so there is nothing to do.
         if self.is_complete(false)? {
             self.locks.release_shared(state)?;
             return Ok(Attempt::Done(false));
@@ -225,14 +214,13 @@ impl CacheCoordination {
         Ok(Attempt::ProbeBuilder)
     }
 
-    /// Detects an active builder via a non-blocking probe of `.rlib.lock`,
-    /// then either waits for it or prepares a takeover of the crashed build.
+    /// Checks for an active builder by probing `.rlib.lock` without blocking,
+    /// then either waits for it or prepares to take over a crashed build.
     fn probe_builder(&self, state: &JobState<'_, '_>) -> CargoResult<Attempt> {
         match state.try_lock_shared_path(self.locks.rlib.path().clone())? {
-            // No builder is currently compiling the unit. The unit was
-            // either never built, already complete (completed while we
-            // waited for the rmeta lock), or a previous builder crashed;
-            // the first and last cases are handled by taking over below.
+            // No builder is active. The unit was either never built,
+            // already complete (finished while we waited for the rmeta lock),
+            // or a previous builder crashed. The first and last cases take over below.
             Some(_) => {
                 self.locks.held_rlib.store(true, Ordering::SeqCst);
                 if self.is_complete(false)? {
@@ -241,18 +229,15 @@ impl CacheCoordination {
                 }
                 Ok(Attempt::TakeOver)
             }
-            // A builder is actively compiling. If the unit was never built
-            // (no fingerprint at all), our `.rmeta.lock` acquisition proves
-            // its `.rmeta` is ready, so signal our own dependents to start
-            // pipelined compilation against the metadata while the builder
-            // still codegens. If the unit is being *rebuilt* in place (a
-            // stale fingerprint still exists), pipelining against the
-            // about-to-be-replaced rmeta would be incorrect, so we simply
-            // wait for completion.
+            // A builder is active. If the unit was never built, our
+            // `.rmeta.lock` acquisition proves the `.rmeta` is ready, so we
+            // signal dependents to start pipelining against it while the
+            // builder finishes codegen. If a stale fingerprint still exists
+            // (rebuild in place), pipelining against the about-to-be-replaced
+            // rmeta would be wrong, so we wait for completion.
             None => {
-                // The early pipelining signal requires that we can prove the
-                // rmeta is readable, which rests on holding `.rmeta.lock`
-                // shared.
+                // Early pipelining needs proof that the rmeta is readable,
+                // which means holding `.rmeta.lock` shared.
                 state.assert_locked(&self.locks.rmeta, LockMode::Shared);
                 if !self.fingerprint_exists() {
                     state.rmeta_produced();
@@ -273,15 +258,13 @@ impl CacheCoordination {
         }
     }
 
-    /// Converts the held shared locks into exclusive ownership of the unit.
+    /// Turns held shared locks into exclusive ownership of the unit.
     ///
-    /// `exchange_for_exclusive` releases our shared locks first so we hold
-    /// nothing while probing, then probes the rmeta lock: if another process
-    /// holds it (a builder that just finished, or another waiter), it will
-    /// resolve the unit's state. Waiting for that process on the shared rlib
-    /// lock (again holding nothing) is bounded by its job and cannot
-    /// deadlock, even when it is itself waiting on a unit whose locks we
-    /// hold.
+    /// Releases shared locks first so we hold nothing while probing, then
+    /// probes the rmeta lock. If another process holds it, that process
+    /// will resolve the unit's state. Waiting for it on the shared rlib lock
+    /// (still holding nothing) is bounded by its job and cannot deadlock,
+    /// even if it is waiting on a unit whose locks we hold.
     fn take_over(&self, state: &JobState<'_, '_>) -> CargoResult<Attempt> {
         debug_assert!(
             self.locks.held_rmeta.load(Ordering::SeqCst)
@@ -308,9 +291,7 @@ impl CacheCoordination {
             return Ok(Attempt::WaitForRmeta);
         }
         // `exchange_for_exclusive` already took `.rmeta.lock` exclusively;
-        // only the rlib lock still needs acquiring. (A redundant
-        // re-acquisition would double-count against the lock manager's
-        // recursion accounting.)
+        // only the rlib lock still needs acquiring.
         state.lock_exclusive(&self.locks.rlib)?;
         if self.is_complete(false)? {
             state.unlock(&self.locks.rlib)?;
@@ -343,12 +324,11 @@ impl CacheCoordination {
         let this = Arc::clone(this);
         Work::new(move |state| {
             if this.locks.builder.load(Ordering::SeqCst) {
-                // The fingerprint is what makes shared `.rlib.lock` holders
-                // consider the unit complete, so it must be on disk before
-                // the lock goes shared. The content is not compared here:
-                // dependency rmeta checksums are legitimately refreshed at
-                // write time, so the persisted hash may differ from the one
-                // prepared at plan time.
+                // Shared `.rlib.lock` holders treat the unit as complete
+                // when the fingerprint exists, so it must be on disk before
+                // downgrading. Content is not compared here: dependency rmeta
+                // checksums are refreshed at write time, so the persisted hash
+                // can differ from the one prepared at plan time.
                 if cfg!(debug_assertions) {
                     let stored = cargo_util::paths::read(&this.fingerprint).ok();
                     assert!(

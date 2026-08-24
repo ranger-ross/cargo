@@ -165,36 +165,33 @@ impl UnitInner {
         self.pkg.package_id().source_id().is_path() && !self.is_std
     }
 
-    /// Returns whether this unit is eligible for the cross-workspace build
-    /// cache (`$CARGO_HOME/build-cache`).
+    /// Returns whether this unit can use the cross-workspace build cache
+    /// (`$CARGO_HOME/build-cache`).
     ///
-    /// Only build units whose inputs and outputs are immutable and shared
-    /// across workspaces can be cached:
+    /// Only units with immutable inputs and outputs shared across workspaces
+    /// can be cached:
     ///
-    /// - Local (path) packages can change between builds, so their units are
-    ///   never cached.
-    /// - Packages with build scripts are excluded: their library unit is
-    ///   compiled with workspace-local `$OUT_DIR` content and environment
-    ///   variables baked in, so a cached artifact would not be usable from
-    ///   another workspace.
-    /// - Build script units themselves are excluded (they execute in the
-    ///   workspace).
-    /// - Bins, tests, benches, and examples are excluded: bins are linked
-    ///   against workspace-local state, and test/bench units only exist for
-    ///   local packages anyway.
-    /// - Doc units are excluded because rustdoc output goes into the
-    ///   workspace `doc/` directory.
-    /// - Artifact dependency units are excluded because their outputs are
-    ///   routed through a separate `artifact/<kind>` directory.
+    /// - Local (path) packages can change between builds, so they are never
+    ///   cached.
+    /// - Packages with build scripts are excluded. Their library is compiled
+    ///   with workspace-local `$OUT_DIR` content and env vars baked in, so a
+    ///   cached artifact would not work in another workspace.
+    /// - Build script units are excluded (they run in the workspace).
+    /// - Bins, tests, benches, and examples are excluded. Bins link against
+    ///   workspace-local state, and test/bench units only exist for local
+    ///   packages.
+    /// - Doc units are excluded because rustdoc writes to the workspace `doc/`
+    ///   directory.
+    /// - Artifact dependencies are excluded because their outputs go through a
+    ///   separate `artifact/<kind>` directory.
     ///
-    /// This predicate only sees the unit itself. One further, graph-dependent
-    /// rule is enforced by [`crate::compiler::build_runner::compilation_files::
-    /// CompilationFiles::is_cacheable`]: a unit that *depends on* a
-    /// path-sourced package (most notably a registry crate whose dependency is
-    /// replaced by a `[patch]` with a path) is not cacheable either — the
-    /// patched dependency is mutable workspace state, so the dependent must
-    /// use the normal mtime-based freshness logic rather than an immutable
-    /// cache entry.
+    /// This checks only the unit itself. There is one more graph-dependent
+    /// rule in [`crate::compiler::build_runner::compilation_files::
+    /// CompilationFiles::is_cacheable`]: a unit that depends on a path-sourced
+    /// package (often a registry crate with a `[patch]` that points to a local
+    /// path) is also not cacheable. The patched dependency is mutable
+    /// workspace state, so the dependent must use normal mtime-based freshness
+    /// instead of an immutable cache entry.
     pub fn is_cacheable(&self) -> bool {
         !self.is_local()
             && !self.pkg.has_custom_build()

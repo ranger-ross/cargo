@@ -52,15 +52,14 @@ pub struct JobState<'a, 'gctx> {
 
     /// Whether `rmeta_produced` has already sent its message.
     ///
-    /// `rmeta_required` cannot serve this purpose: a job legitimately calls
-    /// `rmeta_produced` even when no dependency requires the metadata (the
-    /// `-Zbuild-analysis` timings record the rmeta finish regardless), but a
-    /// second call must not send a duplicate `Message::Finish`, which the
-    /// dependency queue would treat as a bug (its `finish` asserts that the
-    /// edge is still present). Double calls can happen legitimately with the
-    /// build cache: a job may first observe that a shared build unit became
-    /// rmeta-ready while another Cargo was compiling it, and then go on to
-    /// compile the unit itself.
+    /// `rmeta_required` cannot do this. A job can call `rmeta_produced` even
+    /// when no dependency needs the metadata (the `-Zbuild-analysis` timings
+    /// still record the rmeta finish), but a second call must not send a
+    /// duplicate `Message::Finish`. The dependency queue would treat that as a
+    /// bug (its `finish` asserts the edge is still present). Double calls can
+    /// happen with the build cache: a job may see that a shared unit became
+    /// rmeta-ready while another Cargo built it, then go on to compile the
+    /// unit itself.
     rmeta_sent: Cell<bool>,
 
     /// Manages locks for build units when fine grain locking is enabled.
@@ -160,12 +159,12 @@ impl<'a, 'gctx> JobState<'a, 'gctx> {
 
     /// A method used to signal to the coordinator thread that the rmeta file
     /// for an rlib has been produced. This is only called for some rmeta
-    /// builds when required, and can be called at any time before a job ends.
-    /// This should only be called once because a metadata file can only be
-    /// produced once!
+    /// builds when required, and can be called any time before a job ends.
+    /// A metadata file is produced once, so this should normally be called
+    /// once.
     ///
-    /// The message is only sent the first time this is called for a job; see
-    /// [`JobState::rmeta_sent`] for why.
+    /// The message is sent only the first time per job (see
+    /// [`JobState::rmeta_sent`] for why).
     pub fn rmeta_produced(&self) {
         if !self.rmeta_sent.replace(true) {
             self.rmeta_required.set(false);
@@ -190,13 +189,13 @@ impl<'a, 'gctx> JobState<'a, 'gctx> {
         self.lock_manager.lock(lock)
     }
 
-    /// Converts held shared locks into an exclusive lock on `primary`. See
+    /// Turns held shared locks into an exclusive lock on `primary`. See
     /// [`LockManager::exchange_for_exclusive`].
     pub fn exchange_for_exclusive(&self, primary: &LockKey, keys: &[LockKey]) -> CargoResult<bool> {
         self.lock_manager.exchange_for_exclusive(primary, keys)
     }
 
-    /// Asserts (in debug builds) that `key` is held in `mode`. See
+    /// Asserts in debug builds that `key` is held in `mode`. See
     /// [`LockManager::assert_locked`].
     pub fn assert_locked(&self, key: &LockKey, mode: LockMode) {
         self.lock_manager.assert_locked(key, mode);

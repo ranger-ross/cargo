@@ -33,17 +33,25 @@ Each entry carries two flock-backed state locks. A job for a dirty cacheable uni
 
 ```mermaid
 stateDiagram-v2
+    direction LR
     [*] --> WaitForRmeta
     WaitForRmeta --> ProbeBuilder: rmeta lock shared, entry not complete
     WaitForRmeta --> Reuse: fingerprint matches
     ProbeBuilder --> Reuse: entry completed while waiting
     ProbeBuilder --> TakeOver: still incomplete, take exclusive locks
-    TakeOver --> Builder: won the race, fingerprint still absent
     TakeOver --> Reuse: entry complete after all
+    TakeOver --> Builder: won the race, fingerprint still absent
     TakeOver --> WaitForRmeta: contended, re-evaluate
     Builder --> [*]: compile, downgrade locks
     Reuse --> [*]
 ```
+
+* WaitForRmeta blocks on `.rmeta.lock` shared. If the entry is already complete (stored hash matches and own outputs exist) the job releases the lock and reuses. Otherwise it moves to ProbeBuilder.
+* ProbeBuilder tries `.rlib.lock` shared without blocking. If that succeeds and the entry is complete it reuses. If no builder is active it goes to TakeOver. If a builder is active it uses the `.rmeta.lock` it already holds as proof the metadata is readable: on a cold cache with no fingerprint yet it signals `rmeta_produced` so dependents can pipeline, on a rebuild with a stale fingerprint it waits without signaling, then blocks on `.rlib.lock` shared.
+* TakeOver releases both shared locks first, then tries to take `.rmeta.lock` exclusive with `exchange_for_exclusive`. If contended it waits on `.rlib.lock` shared and restarts at WaitForRmeta. If it wins it takes `.rlib.lock` exclusive; if the entry is still incomplete it becomes Builder, otherwise it releases and reuses.
+* Builder compiles the unit. It downgrades `.rmeta.lock` to shared as soon as rustc reports the `.rmeta` artifact, then downgrades `.rlib.lock` to shared after the fingerprint is written. Both locks stay shared until the process exits or the job is found complete and released early.
+* Reuse is the fast path. The job found `is_complete` true, releases any held shared locks, and skips compilation.
+
 
 Crash recovery falls out of the same protocol. A builder killed mid-compile releases its locks and leaves no fingerprint, so the next job through the state machine takes over and finishes the unit.
 

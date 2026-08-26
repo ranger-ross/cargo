@@ -43,9 +43,11 @@ struct ManagedLock {
     /// Active acquisitions of this key in this process. The underlying
     /// `flock` is taken on 0 to 1 and released on 1 to 0.
     ///
-    /// Counts are per key, not per fd: one build unit maps to exactly one job
-    /// in a process (the job queue dedupes units), so a key has one in-process
-    /// owner. [`LockManager`] asserts in debug builds when this is violated.
+    /// Counts are per key, not per fd: several acquisitions of one key in a
+    /// process share a single flock, and the count tracks how many are
+    /// active. Holding one key shared multiple times is allowed; mode
+    /// conflicts (for example an exclusive conversion while shared) assert
+    /// in debug builds.
     count: u32,
     mode: LockMode,
 }

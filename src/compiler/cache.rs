@@ -33,10 +33,13 @@
 //!   downgrades `.rlib.lock` to shared after the fingerprint is written.
 //! * **Waiter**: takes `.rmeta.lock` shared (blocks until the rmeta is ready
 //!   or the builder is gone). If the unit is complete it returns. If the
-//!   builder is still active, it signals `rmeta_produced` early so its own
-//!   dependents can start type-checking against the metadata while the builder
-//!   finishes codegen, then blocks on `.rlib.lock` shared. If the builder
-//!   crashed (no fingerprint appeared), it takes over the build.
+//!   builder is still active and no fingerprint exists yet (cold cache), it
+//!   signals `rmeta_produced` early so its own dependents can start
+//!   type-checking against the metadata while the builder finishes codegen.
+//!   A stale fingerprint (rebuild in place) means the current `.rmeta` is
+//!   about to be replaced, so it waits without signaling. Either way it then
+//!   blocks on `.rlib.lock` shared. If the builder crashed (no fingerprint
+//!   appeared), it takes over the build.
 //!
 //! ## Crash recovery
 //!
@@ -55,7 +58,7 @@
 //! `.rmeta` while dependents may still be reading it, which can cause a torn
 //! read in theory. The rewrite is byte-identical in practice (same unit, same
 //! inputs, same rustc) and needs a crash at a precise moment, so this is
-//! accepted for the PoC.
+//! accepted for now.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -158,13 +161,15 @@ impl CacheCoordination {
     /// Checks whether the cached unit is complete for this identity and
     /// filesystem state.
     ///
-    /// `builder_active` is true if another process held the unit's locks
-    /// just before this check, meaning it is actively compiling. In that
-    /// case a content match alone is enough to skip, because the builder
-    /// will resolve any remaining dirtiness. Without an active builder the
-    /// unit is only complete when the fingerprint matches and the filesystem
-    /// was up to date at prepare time (otherwise missing outputs on a cold
-    /// or partial cache still need a build).
+    /// `builder_active` is true when another holder was observed on the
+    /// unit's locks shortly before this check. Contention is treated as
+    /// evidence that another process is resolving the unit's state — it may
+    /// be a compiling builder or another waiter that observed one — so a
+    /// content match alone is enough to skip, because the holder will
+    /// resolve any remaining dirtiness. Without contention the unit is only
+    /// complete when the fingerprint matches and the filesystem was up to
+    /// date at prepare time (otherwise missing outputs on a cold or partial
+    /// cache still need a build).
     pub(crate) fn is_complete(&self, builder_active: bool) -> CargoResult<bool> {
         let content_matches = match cargo_util::paths::read(&self.fingerprint) {
             Ok(stored) => stored == self.completion.expected_hash()?,

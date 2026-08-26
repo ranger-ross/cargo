@@ -166,7 +166,6 @@ impl UnitInner {
     }
 
     /// Returns whether this unit can use the cross-workspace build cache
-    /// (`$CARGO_HOME/build-cache`).
     ///
     /// Only units with immutable inputs and outputs shared across workspaces
     /// can be cached:
@@ -178,8 +177,9 @@ impl UnitInner {
     ///   cached artifact would not work in another workspace.
     /// - Build script units are excluded (they run in the workspace).
     /// - Bins, tests, benches, and examples are excluded. Bins link against
-    ///   workspace-local state, and test/bench units only exist for local
-    ///   packages.
+    ///   workspace-local state. Test/bench units are rejected by the mode
+    ///   checks below; there is no explicit example-target check, but example
+    ///   units are always workspace-local, so `!is_local()` excludes them.
     /// - Doc units are excluded because rustdoc writes to the workspace `doc/`
     ///   directory.
     /// - Artifact dependencies are excluded because their outputs go through a

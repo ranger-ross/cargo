@@ -316,10 +316,7 @@ impl<'a, 'gctx: 'a> CompilationFiles<'a, 'gctx> {
     }
 
     /// Returns whether the unit should be built in the cross-workspace
-    /// build cache. True only if the unit is eligible, the cache is writable,
-    /// and the new build-dir layout is active (the cache assumes
-    /// `-Zbuild-dir-new-layout`, which is on by default and only off via
-    /// `__CARGO_TEMPORARY_BUILD_DIR_NEW_LAYOUT_OPT_OUT`).
+    /// build cache.
     pub fn is_cacheable(&self, unit: &Unit) -> bool {
         self.ws.gctx().cli_unstable().build_dir_new_layout
             && self.cache_enabled

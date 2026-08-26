@@ -13,7 +13,7 @@ issues, so observations are recorded as they are found.
 - [x] Locking implementation
 - [x] Cross-workspace / concurrency tests (manual)
 - [x] Crash recovery test (manual)
-- [x] Full test-suite pass (4375/4376 runnable; 1 environment-only failure)
+- [x] Full test-suite pass (4377 passed / 1 environment-only failure (build-std) / 28 ignored)
 - [x] Tests in the cargo testsuite
 
 ## Existing POC (commit 247c74dc1) — findings
@@ -49,11 +49,13 @@ The prior commit added a first cut. Key observations:
    relinked after a rev bump (the dep fingerprint was dropped, so the bin's
    fingerprint hash never changed). **Fixed**: the filter is removed. The
    original reason for it (the `dep_info.strip_prefix(build_root).unwrap()`
-   panic for cacheable dep-infos, which live outside the workspace build
-   root) is fixed properly: cacheable units now use
-   `LocalFingerprint::Precalculated(pkg_fingerprint)` instead of
-   `CheckDepInfo`. `calculate_run_custom_build` had the same filter issue and
-   the same fix.
+   root) is fixed properly: dep-infos of cacheable units are stored with
+   absolute paths (they live under `$CARGO_HOME/build-cache`, outside the
+   workspace build root), so `strip_prefix` never runs on them and the
+   `CheckDepInfo` form stays. `calculate_run_custom_build` had the same
+   filter issue and the same fix. (An intermediate version switched
+   cacheable units to `LocalFingerprint::Precalculated(pkg_fingerprint)`;
+   that was reverted in favor of keeping `CheckDepInfo` — see finding #3.)
 
 4. The abandoned move-based approach (FIXME in `compile()`): correct to
    abandon — with pipelining, consumers read `.rmeta` from the workspace path
@@ -94,18 +96,21 @@ Path routing funnels through `CompilationFiles`: `deps_dir`, `output_dir`,
 switch on `unit.is_cacheable()`. `pkg_dir` (`$pkgname/$hash`) is stable across
 workspaces because the unit hash covers pkg id (registry/git sources hash
 independent of workspace root), features, profile, mode, compile kind, rustc
-version, and rustflags (minus remap-path-prefix).
-
 ### Freshness
 
-Cacheable units use the **normal fingerprint comparison** (hash match plus
-filesystem status), like any other unit. The hash match catches identity
-changes that are not part of the unit hash; the filesystem-status check
-catches changes to non-cacheable dependencies (path patches) and to
-dep-info-tracked inputs (env vars under `-Zrustdoc-depinfo`). The fingerprint
-file is written after artifacts complete; a unit is reusable when the stored
-fingerprint matches the freshly computed one. The artifacts stay effectively
-immutable: nothing rebuilds them unless one of these conditions fires.
+Cacheable units do **not** use the full normal comparison. Their stored
+fingerprint must match the freshly computed hash, and their own outputs
+must exist, but the filesystem check skips the dependency-mtime loop
+entirely (cache artifacts are written once and never touched, so mtime
+chains carry no signal). Dependency identity is carried by the normalized
+fingerprint content: dependency local fingerprints are replaced with a
+content-based form pinning package fingerprint, `-C metadata`, and the
+checksum of the dependency's rmeta bytes (findings #13/#17), and units
+with a direct path-sourced dependency are excluded from caching outright
+(finding #18). Completion for reuse is judged by
+`CacheCoordination::is_complete`: stored-hash match plus own-output
+presence (or observed contention resolving it). Nothing rebuilds an entry
+unless identity changes or the entry is incomplete.
 
 ### Locking protocol (per build unit, two state locks)
 
@@ -138,15 +143,19 @@ Key ordering invariants:
   the exclusive upgrade**, so the multi-lock protocol cannot deadlock (a
   blocking SH→EX conversion drops the old lock while waiting, which would
   otherwise allow lock-order cycles between contenders);
-- locks are held (shared) until the end of the build, matching the existing
-  fine-grain-locking policy, which also makes crash recovery safe.
+- once acquired, locks stay held (shared) until the process exits, matching
+  the existing fine-grain-locking policy — except when the protocol finds
+  the entry already complete, in which case shared locks are released
+  immediately.
 
 ### `rmeta_produced` idempotence
 
-`JobState::rmeta_produced` now only pushes `Message::Finish(Metadata)` when it
-flips `rmeta_required` from true to false. The dependency queue's `finish`
+`JobState::rmeta_produced` pushes `Message::Finish(Metadata)` only when
+`rmeta_sent.replace(true)` returns false. The dependency queue's `finish`
 asserts the edge is still present, so a second Metadata finish would panic;
 the waiter-then-builder crash path can reach `rmeta_produced` twice.
+(`rmeta_required` cannot serve as the gate: a job may call
+`rmeta_produced` even when no dependency needs the metadata.)
 
 ## Findings during development
 
@@ -304,7 +313,7 @@ the waiter-then-builder crash path can reach `rmeta_produced` twice.
     reported as "info of dependency `X` changed" instead of "the dependency
     `X` was rebuilt" (content-based instead of mtime-based). Affected
     snapshots updated: `freshness::bust_patched_dep`,
-    `freshness_checksum::bust_patched_dep_checksum`, and the
+    `freshness_checksum::bust_patched_dep`, and the
     exact-stdout assertions in `features2` (3 tests), `offline`,
     `package::workspace_with_local_deps`, `replace::
     overriding_nonexistent_no_spurious`.

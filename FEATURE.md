@@ -8,9 +8,7 @@ The cache is part of the new build-dir layout work and is enabled whenever `-Zbu
 
 ### What gets cached
 
-A unit is cacheable when it is not workspace-local, has no build script, and is not a bin, doc, test, or artifact unit. A unit that depends on a path-sourced package (a `[patch]` target, a `[replace]`, or a directory source) is also excluded: path inputs are mtime-tracked workspace state, and the cache is keyed by content only. Eligibility is computed once from the unit graph in `CompilationFiles::is_cacheable`.
-
-The cache key is the unit hash plus the crate metadata hash. The unit hash deliberately excludes the git revision, so `compute_metadata` mixes the git `precise` in; each revision maps to its own entry and entries are truly immutable.
+A unit is cacheable when it is not workspace-local, has no build script, and is not a bin, doc, test, or artifact unit. A unit with a direct dependency on a path-sourced package (a `[patch]` target, a `[replace]`, or a directory source) is also excluded: path inputs are mtime-tracked workspace state, and the cache is keyed by content only. The exclusion is per direct edge in the unit graph — units further upstream stay cacheable, protected by the normalized fingerprint's pinned rmeta checksum of each dependency (see implementation details). Eligibility is computed once from the unit graph in `CompilationFiles::is_cacheable`.
 
 ### Where entries live
 
@@ -39,8 +37,7 @@ stateDiagram-v2
     WaitForRmeta --> ProbeBuilder: rmeta lock shared, entry not complete
     WaitForRmeta --> Reuse: fingerprint matches
     ProbeBuilder --> Reuse: entry completed while waiting
-    ProbeBuilder --> WaitForRmeta: builder active, wait for rlib lock
-    ProbeBuilder --> TakeOver: no builder, take exclusive locks
+    ProbeBuilder --> TakeOver: still incomplete, take exclusive locks
     TakeOver --> Builder: won the race, fingerprint still absent
     TakeOver --> Reuse: entry complete after all
     TakeOver --> WaitForRmeta: contended, re-evaluate
@@ -61,17 +58,14 @@ Crash recovery falls out of the same protocol. A builder killed mid-compile rele
 - `src/compiler/mod.rs`. Job wiring for the coordination object, the `build cache: ... is fresh (hit ...)` diagnostics, and the `-Zbuild-analysis` lock summary.
 - `src/compiler/job_queue/`. Idempotent `rmeta_produced` (a waiter can signal it twice on the crash path), and a side-effect-free cache-hit probe on `Job` so the queue does not print `Compiling` for a unit it will only read from the cache.
 - `src/util/flock.rs`. flock primitives used by the state locks.
-- `tests/testsuite/build_cache.rs` (new). 12 integration tests: reuse across workspaces, concurrent builders, crash takeover, git rev bumps, exclusions, and output assertions.
-
-## Implementation details
-
+- `tests/testsuite/build_cache.rs` (new). 12 integration tests: reuse across workspaces, concurrent builders, git rev bumps, exclusions, and output assertions.
 ### The two-lock protocol
 
 `.rmeta.lock` is exclusive while compiling and downgrades to shared as soon as rustc reports the `.rmeta` artifact. `.rlib.lock` downgrades to shared only after all artifacts are written and the fingerprint is persisted. Acquiring a lock shared therefore proves something: shared `.rmeta.lock` means the metadata is readable, shared `.rlib.lock` means the unit is complete.
 
 Two invariants keep the multi-lock protocol deadlock free. Every acquisition follows the same order (`.rmeta.lock` before `.rlib.lock`), and contenders release their shared locks before attempting the exclusive conversion, because a blocking shared-to-exclusive flock drops the old lock while it waits.
 
-Locks stay held (shared) until the process exits, matching the existing fine-grain-locking policy. `LockManager` counts acquisitions per key, so a downgraded lock is released only when it has been unlocked as many times as it was acquired. In debug builds, `assert_locked` checks the protocol's load-bearing conditions on every test-suite run: the early pipelining signal fires under shared `.rmeta.lock`, downgrades happen only in builder role, and the fingerprint exists before `.rlib.lock` goes shared.
+Locks stay held (shared) once acquired — either until the process exits or, when the coordination finds the entry complete, released immediately — matching the existing fine-grain-locking policy. `LockManager` counts acquisitions per key, so a downgraded lock is released only when it has been unlocked as many times as it was acquired. In debug builds, `assert_locked` checks the protocol's load-bearing conditions on every test-suite run: the early pipelining signal fires under shared `.rmeta.lock` only on a cold cache (no fingerprint yet), downgrades happen only in builder role, and the fingerprint exists before `.rlib.lock` goes shared.
 
 ### Fingerprint normalization
 

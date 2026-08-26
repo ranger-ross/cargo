@@ -45,9 +45,11 @@ pub struct JobState<'a, 'gctx> {
     /// messages back to the main thread.
     id: JobId,
 
-    /// Whether or not we're expected to have a call to `rmeta_produced`. Once
-    /// that method is called this is dynamically set to `false` to prevent
-    /// sending a double message later on.
+    /// Whether a dependency still expects this job's metadata message.
+    ///
+    /// Cleared by `rmeta_produced`. Clearing this flag does *not* suppress
+    /// a duplicate `Message::Finish`; duplicate suppression lives in
+    /// [`Self::rmeta_sent`].
     rmeta_required: Cell<bool>,
 
     /// Whether `rmeta_produced` has already sent its message.

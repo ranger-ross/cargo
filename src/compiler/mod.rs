@@ -70,10 +70,8 @@ use std::sync::{Arc, LazyLock};
 use anyhow::{Context as _, Error};
 use cargo_platform::{Cfg, Platform};
 use cargo_util_terminal::report::{AnnotationKind, Group, Level, Renderer, Snippet};
-use itertools::Itertools;
 use regex::Regex;
 use tracing::{debug, instrument, trace};
-
 pub use self::build_config::UserIntent;
 pub use self::build_config::{BuildConfig, CompileMode, MessageFormat};
 pub use self::build_context::BuildContext;
@@ -688,10 +686,22 @@ fn link_targets(
             .metabuild_path(build_runner.bcx.ws.build_dir());
         target.set_src_path(TargetSourcePath::Path(path));
     }
+    let virtual_deps = build_runner
+        .files()
+        .layout(unit.kind)
+        .build_dir()
+        .virtual_deps()
+        .to_path_buf();
+    let is_new_layout = bcx.gctx.cli_unstable().build_dir_new_layout;
+    let is_custom_build = unit.target.is_custom_build();
+    let is_run_custom_build = unit.mode.is_run_custom_build();
+    let is_artifact = unit.artifact.is_true();
+    let is_lib = unit.target.is_lib();
+    let is_doc = unit.mode.is_doc();
+    let is_doc_scrape = unit.mode.is_doc_scrape();
 
     Ok(Work::new(move |state| {
         // If we're a "root crate", e.g., the target of this compilation, then we
-        // hard link our outputs out of the `deps` directory into the directory
         // above. This means that `cargo build` will produce binaries in
         // `target/debug` which one probably expects.
         let mut destinations = vec![];
@@ -702,13 +712,33 @@ fn link_targets(
             if !src.exists() {
                 continue;
             }
+            // For the new build-dir layout, hardlink outputs to the
+            // `virtual-deps` directory. This directory contains hardlinks to
+            // outputs that were previously stored directly in `deps` in the
+            // old layout, allowing rustc to use a single `-L` search path
+            // instead of one per `<unit>/out` directory.
+            if is_new_layout && !is_custom_build && !is_run_custom_build && !is_artifact && is_lib && !is_doc && !is_doc_scrape {
+                if matches!(
+                    output.flavor,
+                    crate::compiler::FileFlavor::Normal
+                        | crate::compiler::FileFlavor::Linkable
+                        | crate::compiler::FileFlavor::Rmeta
+                ) {
+                    if let Some(file_name) = src.file_name() {
+                        let dest = virtual_deps.join(file_name);
+                        if dest != *src {
+                            paths::link_or_copy(src, &dest)?;
+                        }
+                    }
+                }
+            }
             let Some(dst) = output.hardlink.as_ref() else {
                 destinations.push(src.clone());
                 continue;
             };
             destinations.push(dst.clone());
             paths::link_or_copy(src, dst)?;
-            if let Some(ref path) = output.export_path {
+            if let Some(path) = &output.export_path {
                 let export_dir = export_dir.as_ref().unwrap();
                 paths::create_dir_all(export_dir)?;
 
@@ -1809,16 +1839,21 @@ pub fn lib_search_paths(
 ) -> CargoResult<Vec<OsString>> {
     let mut lib_search_paths = Vec::new();
     if build_runner.bcx.gctx.cli_unstable().build_dir_new_layout {
+        // Use the `virtual-deps` directory as the single search path instead of
+        // passing a `-L` for each `<unit>/out` directory. The virtual-deps
+        // directory contains hardlinks to outputs that were previously stored
+        // directly in `deps` in the old layout.
         let mut map = BTreeMap::new();
-
-        // Recursively add all dependency args to rustc process
         add_dep_arg(&mut map, build_runner, unit);
-
-        let paths = map.into_iter().map(|(_, path)| path).sorted_unstable();
-
-        for path in paths {
+        if !map.is_empty() {
             let mut deps = OsString::from("dependency=");
-            deps.push(path);
+            deps.push(
+                build_runner
+                    .files()
+                    .layout(unit.kind)
+                    .build_dir()
+                    .virtual_deps(),
+            );
             lib_search_paths.extend(["-L".into(), deps]);
         }
     } else {
@@ -1831,8 +1866,29 @@ pub fn lib_search_paths(
     // dependencies are correctly found (for reexported macros).
     if !unit.kind.is_host() {
         let mut deps = OsString::from("dependency=");
-        deps.push(build_runner.files().host_deps(unit));
-        lib_search_paths.extend(["-L".into(), deps]);
+        if build_runner.bcx.gctx.cli_unstable().build_dir_new_layout {
+            let host_virtual = build_runner
+                .files()
+                .layout(CompileKind::Host)
+                .build_dir()
+                .virtual_deps()
+                .to_path_buf();
+            let target_virtual = build_runner
+                .files()
+                .layout(unit.kind)
+                .build_dir()
+                .virtual_deps()
+                .to_path_buf();
+            // Avoid duplicate `-L` when host and target share the same
+            // virtual-deps directory (non-cross builds).
+            if host_virtual != target_virtual {
+                deps.push(host_virtual);
+                lib_search_paths.extend(["-L".into(), deps]);
+            }
+        } else {
+            deps.push(build_runner.files().host_deps(unit));
+            lib_search_paths.extend(["-L".into(), deps]);
+        }
     }
 
     Ok(lib_search_paths)

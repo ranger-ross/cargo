@@ -149,6 +149,13 @@
 //!         # incremental is enabled.
 //!         incremental/
 //!
+//!         # Directory that contains hardlinks to outputs in each `<unit>/out`
+//!         # directory that were previously stored directly in `deps` in the old
+//!         # layout. This `virtual-deps` directory is used as the single `-L`
+//!         # dependency search path for `rustc` invocations to avoid a large
+//!         # number of `-L` arguments.
+//!         deps/  # virtual-deps
+//!
 //!         # Main directory for storing build unit related files.
 //!         # Files are organized by Cargo build unit (`$pkgname/$META`) so that
 //!         # related files are stored in a single directory.
@@ -426,13 +433,17 @@ impl BuildDirLayout {
             paths::create_dir_all(&self.deps)?;
             paths::create_dir_all(&self.fingerprint)?;
             paths::create_dir_all(&self.examples)?;
+        } else {
+            // New build-dir layout uses a `virtual-deps` directory (backed by `deps`)
+            // that contains hardlinks to outputs in each `<unit>/out` directory.
+            // This was previously stored directly in `deps` in the old layout.
+            paths::create_dir_all(&self.deps)?;
         }
         paths::create_dir_all(&self.incremental)?;
         paths::create_dir_all(&self.build)?;
 
         Ok(())
     }
-    /// Fetch the deps path.
     pub fn deps(&self, pkg_dir: &str) -> PathBuf {
         if self.is_new_layout {
             self.out_force_new_layout(pkg_dir)
@@ -448,6 +459,15 @@ impl BuildDirLayout {
     }
     /// Fetch the deps path. (old layout)
     pub fn legacy_deps(&self) -> &Path {
+        &self.deps
+    }
+    /// Fetch the virtual-deps directory for the new layout.
+    ///
+    /// This directory contains hardlinks to outputs in each `<unit>/out`
+    /// directory that were previously stored directly in `deps` in the old
+    /// layout. Using a single `virtual-deps` directory reduces the number of
+    /// `-L` arguments passed to `rustc`.
+    pub fn virtual_deps(&self) -> &Path {
         &self.deps
     }
     pub fn root(&self) -> &Path {

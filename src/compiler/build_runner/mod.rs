@@ -499,6 +499,12 @@ impl<'a, 'gctx> BuildRunner<'a, 'gctx> {
                             .insert(dep_dir);
                     }
                 }
+                // Ensure the virtual-deps directory exists for the new layout.
+                // This directory contains hardlinks to outputs that were previously
+                // stored directly in `deps`, and is used as the single `-L`
+                // dependency search path for rustc.
+                let virtual_deps = layout.build_dir().virtual_deps().to_path_buf();
+                paths::create_dir_all(&virtual_deps)?;
             } else {
                 self.compilation
                     .deps_output
@@ -513,7 +519,6 @@ impl<'a, 'gctx> BuildRunner<'a, 'gctx> {
     pub fn files(&self) -> &CompilationFiles<'a, 'gctx> {
         self.files.as_ref().unwrap()
     }
-
     /// Returns the filenames that the given unit will generate.
     pub fn outputs(&self, unit: &Unit) -> CargoResult<Arc<Vec<OutputFile>>> {
         self.files.as_ref().unwrap().outputs(unit, self.bcx)

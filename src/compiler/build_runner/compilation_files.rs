@@ -400,16 +400,20 @@ impl<'a, 'gctx: 'a> CompilationFiles<'a, 'gctx> {
     }
 
     /// Directory where incremental output for the given unit should go.
+    ///
+    /// Incremental compilation is never enabled for cacheable (non-local)
+    /// units (`profile.incremental = false`), so this directory is inert for
+    /// them today. It must not be shared across workspaces via
+    /// `build-cache`, as incremental state embeds absolute paths and mtimes.
+    /// Always route to the per-workspace build-dir (or staging) instead.
     pub fn incremental_dir(&self, unit: &Unit) -> PathBuf {
-        let dir = self.pkg_dir(unit);
-        if self.is_cacheable(unit) {
-            self.layout(unit.kind).build_cache().incremental(&dir)
-        } else {
-            self.layout(unit.kind)
-                .build_dir()
-                .incremental()
-                .to_path_buf()
-        }
+        // Do not use build-cache for incremental state, even for cacheable
+        // units. Cacheable units have incremental disabled, but if it were
+        // ever enabled sharing across workspaces would be unsound.
+        self.layout(unit.kind)
+            .build_dir()
+            .incremental()
+            .to_path_buf()
     }
     /// Returns the host build cache layout.
     pub fn build_cache(&self) -> &crate::compiler::layout::BuildCacheLayout {

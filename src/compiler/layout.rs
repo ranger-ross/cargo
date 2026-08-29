@@ -586,14 +586,6 @@ impl BuildCacheLayout {
     pub fn out(&self, pkg_dir: &str) -> PathBuf {
         self.build_unit(pkg_dir).join("out")
     }
-    /// Incremental path for a build unit.
-    ///
-    /// Incremental data is stored per build unit rather than per profile as in
-    /// the workspace build dir, so concurrent Cargo processes never share
-    /// incremental state. Per-unit locks cover this directory.
-    pub fn incremental(&self, pkg_dir: &str) -> PathBuf {
-        self.build_unit(pkg_dir).join("incremental")
-    }
     /// Fetch the build unit path
     pub fn build_unit(&self, pkg_dir: &str) -> PathBuf {
         self.root.join(pkg_dir)
@@ -710,7 +702,8 @@ impl BuildCacheLayout {
                     // EEXIST - same as AlreadyExists, check poisoned
                     let is_poisoned = std::fs::read_dir(cache_unit_dir)
                         .map(|mut e| e.next().is_some())
-                        .unwrap_or(true) == false;
+                        .unwrap_or(true)
+                        == false;
                     if is_poisoned {
                         let _ = std::fs::remove_dir_all(cache_unit_dir);
                         if let Ok(()) = std::fs::rename(staging_unit_dir, cache_unit_dir) {

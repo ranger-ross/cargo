@@ -386,38 +386,6 @@ impl<'a, 'gctx: 'a> CompilationFiles<'a, 'gctx> {
         unit_dir.join(".lock")
     }
 
-    /// Lock file that guards rmeta availability for a cacheable unit.
-    ///
-    /// Held exclusively while the unit compiles and the `.rmeta` is not yet
-    /// produced. Once rustc reports the `.rmeta`, Cargo downgrades it to
-    /// shared so other processes can start pipelined compiles against the
-    /// metadata before the final artifacts are ready.
-    ///
-    /// Only used for cacheable units (see [`Unit::is_cacheable`]).
-    pub fn cache_rmeta_lock(&self, unit: &Unit) -> PathBuf {
-        let dir = self.pkg_dir(unit);
-        self.layout(unit.kind)
-            .build_cache()
-            .build_unit(&dir)
-            .join(".rmeta.lock")
-    }
-
-    /// Lock file that guards full completion of a cacheable unit.
-    ///
-    /// Held exclusively while the unit compiles and downgraded to shared
-    /// only after all outputs and the fingerprint are persisted. Holding it
-    /// shared means the fingerprint exists and the unit can be reused without
-    /// recompiling.
-    ///
-    /// Only used for cacheable units (see [`Unit::is_cacheable`]).
-    pub fn cache_rlib_lock(&self, unit: &Unit) -> PathBuf {
-        let dir = self.pkg_dir(unit);
-        self.layout(unit.kind)
-            .build_cache()
-            .build_unit(&dir)
-            .join(".rlib.lock")
-    }
-
     /// Directory where incremental output for the given unit should go.
     ///
     /// Incremental compilation is never enabled for cacheable (non-local)

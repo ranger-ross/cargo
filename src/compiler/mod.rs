@@ -217,28 +217,29 @@ fn compile<'gctx>(
         } else {
             let force = exec.force_rebuild(unit) || force_rebuild;
             let mut job = fingerprint::prepare_target(build_runner, unit, force)?;
-            // Dirty cacheable units (missing or stale in the build cache)
-            // are coordinated through per-unit state locks. Exactly one
-            // process compiles them; others watch and reuse the result.
-            let cache = if build_runner.files().is_cacheable(unit) && job.freshness().is_dirty() {
-                let completion = fingerprint::cache_completion_state(build_runner, unit)?;
-                Some(cache::CacheCoordination::new(
-                    build_runner,
-                    unit,
-                    completion,
-                )?)
-            } else {
-                None
-            };
-            if let Some(cache) = &cache {
-                let cache = std::sync::Arc::clone(cache);
-                job.set_cache_hit_probe(std::sync::Arc::new(move || cache.is_complete(false)));
-            }
+            // Dirty cacheable units are built in `_staging/<pid>` and published
+            // atomically. No per-unit locking is needed; concurrent processes
+            // that race to publish the same entry resolve via `AlreadyExists`.
+            // The hit probe checks at spawn time if the cache is already complete.
+            let cache_state: Option<(std::sync::Arc<fingerprint::CacheCompletionState>, std::path::PathBuf)> =
+                if build_runner.files().is_cacheable(unit) && job.freshness().is_dirty() {
+                    let completion = fingerprint::cache_completion_state(build_runner, unit)?;
+                    let path = build_runner.files().fingerprint_file_path(unit, "");
+                    let completion = std::sync::Arc::new(completion);
+                    let path_clone = path.clone();
+                    let completion_clone = std::sync::Arc::clone(&completion);
+                    job.set_cache_hit_probe(std::sync::Arc::new(move || {
+                        completion_clone.is_complete(&path_clone)
+                    }));
+                    Some((completion, path))
+                } else {
+                    None
+                };
             job.before(if job.freshness().is_dirty() {
                 let work = if unit.mode.is_doc() || unit.mode.is_doc_scrape() {
                     rustdoc(build_runner, unit)?
                 } else {
-                    rustc(build_runner, unit, exec, cache.clone())?
+                    rustc(build_runner, unit, exec, cache_state.clone())?
                 };
                 work.then(link_targets(build_runner, unit, false)?)
             } else {
@@ -246,10 +247,7 @@ fn compile<'gctx>(
                 // cache. Its fingerprint matches and filesystem state is up to
                 // date, so there is nothing to compile.
                 if build_runner.files().is_cacheable(unit) {
-                    let cache_entry = build_runner.files().cache_rmeta_lock(unit);
-                    let cache_entry = cache_entry
-                        .parent()
-                        .expect("cache lock path always has a parent");
+                    let cache_entry = build_runner.files().cache_build_unit(unit);
                     println!(
                         "build cache: `{}` {} is fresh (hit {})",
                         unit.pkg.name(),
@@ -269,12 +267,6 @@ fn compile<'gctx>(
                 // Need to link targets on both the dirty and fresh.
                 work.then(link_targets(build_runner, unit, true)?)
             });
-            if let Some(cache) = &cache {
-                // Runs after the fingerprint is written, so waiters that
-                // acquire the rlib lock shared always see the completed
-                // fingerprint.
-                job.after(cache::CacheCoordination::after_work(cache));
-            }
 
             // If -Zfine-grain-locking is enabled, we wrap the job with an upgrade to exclusive
             // lock before starting, then downgrade to a shared lock after the job is finished.
@@ -330,14 +322,14 @@ fn make_failed_scrape_diagnostic(
 
 /// Creates work that runs `rustc` for `unit`.
 ///
-/// `cache` is the build-cache coordination state for cacheable units. For
-/// those units the work first runs the coordination protocol, which may wait
-/// for or take over from another Cargo process, before compiling.
+/// `cache_state` is the build-cache completion state for cacheable units.
+/// Staging makes per-unit locking unnecessary; we only need to check if the
+/// cache entry became complete after dependencies were built.
 fn rustc(
     build_runner: &mut BuildRunner<'_, '_>,
     unit: &Unit,
     exec: &Arc<dyn Executor>,
-    cache: Option<Arc<cache::CacheCoordination>>,
+    cache_state: Option<(std::sync::Arc<fingerprint::CacheCompletionState>, std::path::PathBuf)>,
 ) -> CargoResult<Work> {
     let mut rustc = prepare_rustc(build_runner, unit)?;
 
@@ -424,10 +416,7 @@ fn rustc(
     // Identity for cache-hit messages in the work closure below. The
     // closure cannot borrow the build runner, so save it here.
     let cache_identity = if is_cacheable {
-        let cache_entry = build_runner.files().cache_rmeta_lock(unit);
-        let cache_entry = cache_entry
-            .parent()
-            .expect("cache lock path always has a parent");
+        let cache_entry = build_runner.files().cache_build_unit(unit);
         Some((
             unit.pkg.name().to_string(),
             unit.target.name().to_string(),
@@ -483,31 +472,12 @@ fn rustc(
         // Cacheable units use staging with atomic publish; no per-unit
         // locking is needed. Non-cacheable units with fine-grain locking
         // still use the coordination protocol.
-        if !is_cacheable {
-            if let Some(cache) = &cache {
-                if !cache.coordinate(state)? {
-                    // Another process already built this unit in the cache while
-                    // we waited, so skip compiling.
-                    if let Some((name, target, cache_entry)) = &cache_identity {
-                        println!(
-                            "build cache: `{}` {} is fresh (hit {})",
-                            name,
-                            target,
-                            cache_entry.display()
-                        );
-                    }
-                    return Ok(());
-                }
-            }
-        }
-        // For staging, check at execution time (after dependencies built)
-        // if the cache entry is already complete. This handles the case
-        // where the fingerprint was dirty at plan time due to placeholder
-        // rmeta checksums (cold workspace) but becomes complete after
-        // dependencies are built.
+        // Staging makes per-unit locking unnecessary. If the cache entry
+        // became complete after dependencies were built (e.g. placeholders
+        // resolved), skip compiling and reuse the cached artifacts.
         if is_cacheable {
-            if let Some(cache) = &cache {
-                if cache.is_complete(false)? {
+            if let Some((completion, path)) = &cache_state {
+                if completion.is_complete(path)? {
                     if let Some((name, target, cache_entry)) = &cache_identity {
                         println!(
                             "build cache: `{}` {} is fresh (hit {})",
@@ -596,14 +566,7 @@ fn rustc(
             }
         }
 
-        // When rustc reports the `.rmeta`, a cacheable unit downgrades its
-        // rmeta lock to shared before signaling `rmeta_produced`. That lets
-        // other Cargo processes start pipelined compiles against the metadata
-        // while this process still runs codegen.
-        let on_rmeta: Option<&dyn Fn() -> CargoResult<()>> = match &cache {
-            Some(cache) if !is_cacheable => Some(&|| cache.downgrade_rmeta(state)),
-            _ => None,
-        };
+        let on_rmeta: Option<&dyn Fn() -> CargoResult<()>> = None;
         let result = exec
             .exec(
                 &rustc,

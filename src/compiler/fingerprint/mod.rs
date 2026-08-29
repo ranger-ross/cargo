@@ -2385,6 +2385,18 @@ impl CacheCompletionState {
         let after = util::to_hex(fp.hash_u64());
         Ok(after)
     }
+
+    /// Whether the cache entry is complete for this identity.
+    ///
+    /// Checks that the stored fingerprint hash matches the expected hash
+    /// (with refreshed dependency rmeta checksums) and that filesystem state
+    /// indicates outputs exist. No locking is needed with the staging design:
+    /// each process builds in its own `_staging/<pid>` and publishes atomically.
+    pub(crate) fn is_complete(&self, fingerprint_path: &std::path::Path) -> CargoResult<bool> {
+        let stored = cargo_util::paths::read(fingerprint_path).unwrap_or_else(|_| "MISSING".to_string());
+        let expected = self.expected_hash()?;
+        Ok(stored.trim() == expected.trim() && self.fs_up_to_date)
+    }
 }
 
 pub(crate) fn cache_completion_state(

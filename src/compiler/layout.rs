@@ -323,19 +323,26 @@ impl Layout {
             None
         };
         let build_cache_root = ws.gctx().home().join("build-cache").into_path_unlocked();
-        let mut cache_enabled = match paths::create_dir_all(&build_cache_root) {
-            Ok(()) => true,
-            Err(e)
-                if e.downcast_ref::<std::io::Error>()
-                    .is_some_and(|e| e.kind() == std::io::ErrorKind::PermissionDenied) =>
-            {
-                tracing::debug!(
-                    "build cache disabled: cannot create {:?}: {e:?}",
-                    build_cache_root
-                );
-                false
+        // Only initialize the shared cache when the new layout is active.
+        // In legacy layout `is_cacheable` is always false, so cache errors
+        // should not fail the build.
+        let mut cache_enabled = if !is_new_layout {
+            false
+        } else {
+            match paths::create_dir_all(&build_cache_root) {
+                Ok(()) => true,
+                Err(e)
+                    if e.downcast_ref::<std::io::Error>()
+                        .is_some_and(|e| e.kind() == std::io::ErrorKind::PermissionDenied) =>
+                {
+                    tracing::debug!(
+                        "build cache disabled: cannot create {:?}: {e:?}",
+                        build_cache_root
+                    );
+                    false
+                }
+                Err(e) => return Err(e.into()),
             }
-            Err(e) => return Err(e.into()),
         };
         if cache_enabled {
             let staging_root = build_cache_root.join("_staging");
@@ -354,7 +361,6 @@ impl Layout {
                 Err(e) => return Err(e.into()),
             }
         }
-
         Ok(Layout {
             artifact_dir,
             build_dir: BuildDirLayout {
@@ -383,7 +389,7 @@ impl Layout {
             artifact_dir.prepare()?;
         }
         self.build_dir.prepare()?;
-
+        self.build_cache.prepare()?;
         Ok(())
     }
 

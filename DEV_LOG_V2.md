@@ -96,5 +96,9 @@ Fixed 5 actionable comments verified against current code:
 
 ### 9. PR 31 CodeRabbit review batch 2
 
-* `src/compiler/layout.rs:701` raw `EEXIST` (`errno 17`) branch used weak `read_dir(...).next().is_some()==false` check, while `AlreadyExists`/`DirectoryNotEmpty` used full `!has_out || !has_fp || !out_has_files`. Unified to full `is_poisoned` predicate (`has_out`, `has_fp`, `out_has_files`) so a nonempty incomplete destination is correctly treated as poisoned and retried, preserving complete staging.
 * `src/compiler/fingerprint/mod.rs:1788` staging fallback derived via `path.to_string_lossy().find("build-cache")` substring — if `CARGO_HOME` parent contains `build-cache` as substring the fallback could construct a path outside `$CARGO_HOME/build-cache/_staging/<pid>`. Rewrote to component-wise `Path::components()` search for exact `build-cache` component, then inserts `_staging/<pid>` after it, preserving `cargo-util` handling and keeping `CacheCompletionState::expected_hash` consistent. Added `ok_or` for missing component so non-cache paths correctly return `NotFound`.
+
+### 10. PR 31 CodeRabbit review batch 3
+
+* `src/compiler/layout.rs:325` cache init not gated on `is_new_layout` — legacy-layout builds still created `$CARGO_HOME/build-cache` and failed on any error except `PermissionDenied`, even though `is_cacheable` is always false in legacy mode. Wrapped `create_dir_all(build_cache_root/_staging)` in `if is_new_layout` so legacy builds treat cache as best-effort/disabled and preserve existing legacy error handling.
+* `src/compiler/layout.rs:386` `BuildCacheLayout::prepare` never called — `Layout::prepare` only called `artifact_dir.prepare` and `build_dir.prepare`, so `build_cache` root and orphaned `_staging/<pid>` cleanup never ran via the normal `BuildRunner::prepare` path. Added `self.build_cache.prepare()?;` to `Layout::prepare` so cache root is ensured and stale staging is wiped before any publish, propagating `CargoResult` errors.

@@ -32,7 +32,6 @@ pub mod artifact;
 mod build_config;
 pub(crate) mod build_context;
 pub(crate) mod build_runner;
-mod cache;
 mod compilation;
 use crate::compiler::build_runner::OutputFile;
 mod compile_kind;
@@ -221,20 +220,22 @@ fn compile<'gctx>(
             // atomically. No per-unit locking is needed; concurrent processes
             // that race to publish the same entry resolve via `AlreadyExists`.
             // The hit probe checks at spawn time if the cache is already complete.
-            let cache_state: Option<(std::sync::Arc<fingerprint::CacheCompletionState>, std::path::PathBuf)> =
-                if build_runner.files().is_cacheable(unit) && job.freshness().is_dirty() {
-                    let completion = fingerprint::cache_completion_state(build_runner, unit)?;
-                    let path = build_runner.files().fingerprint_file_path(unit, "");
-                    let completion = std::sync::Arc::new(completion);
-                    let path_clone = path.clone();
-                    let completion_clone = std::sync::Arc::clone(&completion);
-                    job.set_cache_hit_probe(std::sync::Arc::new(move || {
-                        completion_clone.is_complete(&path_clone)
-                    }));
-                    Some((completion, path))
-                } else {
-                    None
-                };
+            let cache_state: Option<(
+                std::sync::Arc<fingerprint::CacheCompletionState>,
+                std::path::PathBuf,
+            )> = if build_runner.files().is_cacheable(unit) && job.freshness().is_dirty() {
+                let completion = fingerprint::cache_completion_state(build_runner, unit)?;
+                let path = build_runner.files().fingerprint_file_path(unit, "");
+                let completion = std::sync::Arc::new(completion);
+                let path_clone = path.clone();
+                let completion_clone = std::sync::Arc::clone(&completion);
+                job.set_cache_hit_probe(std::sync::Arc::new(move || {
+                    completion_clone.is_complete(&path_clone)
+                }));
+                Some((completion, path))
+            } else {
+                None
+            };
             job.before(if job.freshness().is_dirty() {
                 let work = if unit.mode.is_doc() || unit.mode.is_doc_scrape() {
                     rustdoc(build_runner, unit)?
@@ -329,7 +330,10 @@ fn rustc(
     build_runner: &mut BuildRunner<'_, '_>,
     unit: &Unit,
     exec: &Arc<dyn Executor>,
-    cache_state: Option<(std::sync::Arc<fingerprint::CacheCompletionState>, std::path::PathBuf)>,
+    cache_state: Option<(
+        std::sync::Arc<fingerprint::CacheCompletionState>,
+        std::path::PathBuf,
+    )>,
 ) -> CargoResult<Work> {
     let mut rustc = prepare_rustc(build_runner, unit)?;
 
@@ -339,18 +343,24 @@ fn rustc(
     let outputs = build_runner.outputs(unit)?;
     let (root, rustc_dep_info_loc, dep_info_loc, fingerprint_dir) = if is_cacheable {
         let staging_root = build_runner.files().staging_deps_dir(unit);
-        let dep_info_name = if let Some(c_extra_filename) = build_runner.files().metadata(unit).c_extra_filename() {
+        let dep_info_name = if let Some(c_extra_filename) =
+            build_runner.files().metadata(unit).c_extra_filename()
+        {
             format!("{}-{}.d", unit.target.crate_name(), c_extra_filename)
         } else {
             format!("{}.d", unit.target.crate_name())
         };
         let rustc_dep = staging_root.join(dep_info_name);
-        let dep_info = build_runner.files().staging_fingerprint_file_path(unit, "dep-");
+        let dep_info = build_runner
+            .files()
+            .staging_fingerprint_file_path(unit, "dep-");
         let fp_dir = build_runner.files().staging_fingerprint_dir(unit);
         (staging_root, rustc_dep, dep_info, fp_dir)
     } else {
         let root = build_runner.files().output_dir(unit);
-        let dep_info_name = if let Some(c_extra_filename) = build_runner.files().metadata(unit).c_extra_filename() {
+        let dep_info_name = if let Some(c_extra_filename) =
+            build_runner.files().metadata(unit).c_extra_filename()
+        {
             format!("{}-{}.d", unit.target.crate_name(), c_extra_filename)
         } else {
             format!("{}.d", unit.target.crate_name())
@@ -1894,7 +1904,9 @@ fn add_dep_arg<'a, 'b: 'a>(
                 let cache_unit = build_runner.files().cache_build_unit(&dep.unit);
                 let has_out = cache_unit.join("out").exists();
                 let has_fp = cache_unit.join("fingerprint").exists();
-                let out_has_files = std::fs::read_dir(cache_unit.join("out")).map(|mut e| e.next().is_some()).unwrap_or(false);
+                let out_has_files = std::fs::read_dir(cache_unit.join("out"))
+                    .map(|mut e| e.next().is_some())
+                    .unwrap_or(false);
                 !(has_out && has_fp && out_has_files)
             }
         };
@@ -2044,7 +2056,9 @@ pub fn extern_args(
                 let cache_unit = build_runner.files().cache_build_unit(&dep.unit);
                 let has_out = cache_unit.join("out").exists();
                 let has_fp = cache_unit.join("fingerprint").exists();
-                let out_has_files = std::fs::read_dir(cache_unit.join("out")).map(|mut e| e.next().is_some()).unwrap_or(false);
+                let out_has_files = std::fs::read_dir(cache_unit.join("out"))
+                    .map(|mut e| e.next().is_some())
+                    .unwrap_or(false);
                 !(has_out && has_fp && out_has_files)
             }
         };

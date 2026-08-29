@@ -699,11 +699,18 @@ impl BuildCacheLayout {
             }
             Err(e) => {
                 if e.raw_os_error() == Some(17) {
-                    // EEXIST - same as AlreadyExists, check poisoned
-                    let is_poisoned = std::fs::read_dir(cache_unit_dir)
-                        .map(|mut e| e.next().is_some())
-                        .unwrap_or(true)
-                        == false;
+                    // EEXIST - same as AlreadyExists, apply full poisoned check
+                    let is_poisoned = match std::fs::read_dir(cache_unit_dir) {
+                        Ok(_) => {
+                            let has_out = cache_unit_dir.join("out").exists();
+                            let has_fp = cache_unit_dir.join("fingerprint").exists();
+                            let out_has_files = std::fs::read_dir(cache_unit_dir.join("out"))
+                                .map(|mut e| e.next().is_some())
+                                .unwrap_or(false);
+                            !has_out || !has_fp || !out_has_files
+                        }
+                        Err(_) => true,
+                    };
                     if is_poisoned {
                         let _ = std::fs::remove_dir_all(cache_unit_dir);
                         if let Ok(()) = std::fs::rename(staging_unit_dir, cache_unit_dir) {

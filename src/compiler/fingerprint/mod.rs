@@ -1783,19 +1783,35 @@ fn refresh_dep_checksums(
                 if let Some(path) = path {
                     // Try cache path first; if missing and this is a cacheable dep
                     // whose rmeta is still in staging (first build, before publish),
-                    // fall back to the staging location.
+                    // fall back to the staging location. Build the fallback
+                    // component-wise so a parent dir containing "build-cache"
+                    // as substring does not mis-direct.
                     let bytes = std::fs::read(path).or_else(|_| {
-                        if let Some(pos) = path.to_string_lossy().find("build-cache") {
-                            let before = &path.to_string_lossy()[..pos + "build-cache".len()];
-                            let after = &path.to_string_lossy()[pos + "build-cache".len()..];
-                            if after.starts_with("/_staging") {
-                                return Err(std::io::Error::new(std::io::ErrorKind::NotFound, "already staging"));
-                            }
-                            let staging = format!("{}/_staging/{}{}", before, std::process::id(), after);
-                            std::fs::read(&staging)
-                        } else {
-                            Err(std::io::Error::new(std::io::ErrorKind::NotFound, "no build-cache in path"))
+                        use std::path::{Component, Path};
+                        let p = Path::new(path);
+                        let mut comps: Vec<Component> = p.components().collect();
+                        // Find the build-cache component (exact match, not substring)
+                        let idx = comps
+                            .iter()
+                            .position(|c| c.as_os_str() == "build-cache")
+                            .ok_or_else(|| {
+                                std::io::Error::new(std::io::ErrorKind::NotFound, "no build-cache in path")
+                            })?;
+                        if comps.get(idx + 1).map(|c| c.as_os_str() == "_staging").unwrap_or(false) {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::NotFound,
+                                "already staging",
+                            ));
                         }
+                        let mut staging = std::path::PathBuf::new();
+                        for (i, comp) in comps.iter().enumerate() {
+                            staging.push(comp.as_os_str());
+                            if i == idx {
+                                staging.push("_staging");
+                                staging.push(std::process::id().to_string());
+                            }
+                        }
+                        std::fs::read(&staging)
                     });
                     if let Ok(bytes) = bytes {
                         if let Some(idx) = s.rfind(':') {

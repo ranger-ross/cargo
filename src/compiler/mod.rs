@@ -662,8 +662,10 @@ fn rustc(
         debug_assert_eq!(output_options.errors_seen, 0);
 
         if rustc_dep_info_loc.exists() {
-            if !dep_info_loc.parent().unwrap().exists() {
-                paths::create_dir_all(&dep_info_loc.parent().unwrap()).unwrap();
+            if let Some(parent) = dep_info_loc.parent() {
+                if !parent.exists() {
+                    paths::create_dir_all(parent)?;
+                }
             }
             fingerprint::translate_dep_info(
                 &rustc_dep_info_loc,

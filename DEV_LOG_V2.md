@@ -83,7 +83,14 @@ cargo test --test testsuite build_cache -- --nocapture  -> 14 passed, 0 failed
 
 Staging is cleaned on both success and failure via `cleanup_staging_pid` (ignores `NotFound`).
 
-## Notes
-
-* Staging layout is `$CARGO_HOME/build-cache/_staging/<pid>/<pkg>/<hash>` with `fingerprint`, `out` and `incremental`. `publish` does an atomic `rename` to `$CARGO_HOME/build-cache/<pkg>/<hash>` on success. `AlreadyExists`, `DirectoryNotEmpty` and `EXDEV` mean another process won the race, so staging is discarded. `cleanup_staging_pid` removes `_staging/<pid>` when the build ends or is canceled (best effort, ignores `NotFound`).
 * Fingerprint paths change after `rename`: `fingerprint` `outputs` move from staging to cache. `normalize_cache_deps` pins `rmeta` checksums, and `refresh_cache_dep_checksums` at write time and at `expected_hash` time handles that transition, with the staging fallback for the first build.
+
+### 8. PR 31 CodeRabbit review batch 1 (minor quick-wins)
+
+Fixed 5 actionable comments verified against current code:
+
+* `crates/cargo-util/src/paths.rs:913` partial dst leak on cross-device copy — `move_directory` slow path now removes `dst` on `copy_directory` failure before returning the error, so a later reader cannot see a partial cache unit.
+* `src/compiler/mod.rs:665` `unwrap()` panic on read-only/full FS — `paths::create_dir_all` on `dep_info_loc` parent now uses `if let Some(parent)` and propagates `?`, preserving `CargoResult` flow.
+* `src/compiler/build_runner/compilation_files.rs:964` precise hash changes `-C metadata` for every git dep even when cache inactive — gated the `precise.hash` on `build_dir_new_layout` (the flag that enables the cache), preserving existing hashes in legacy layout.
+* `src/compiler/build_runner/compilation_files.rs:200` `path_dep_units` only direct — made transitive via fixpoint loop over `unit_graph`: any unit depending on a path-dependent unit is now also excluded, so registry `A -> B -> path C` correctly makes both `B` and `A` non-cacheable.
+* `src/compiler/locking.rs:508,700,710` debug-assertion tests `unlock_below_zero_is_a_bug`, `assert_locked_rejects_*` fail in `--release` — added `#[cfg(debug_assertions)]` to all three. Also added `debug_assert!(!exclusively_held)` before blocking `lock_shared`/`lock_shared_path` to match `try_lock_shared_path`, preventing silent shared→exclusive downgrade. Fixed missing `entry.count += 1` regression introduced during the guard insertion.

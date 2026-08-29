@@ -132,6 +132,14 @@ impl LockManager {
                 .or_insert_with(|| ManagedLock::new(Arc::new(lock)));
         }
         let file = self.handle(&key)?;
+        debug_assert!(
+            !matches!(
+                self.locks.read().get(&key),
+                Some(entry) if entry.count > 0 && entry.mode == LockMode::Exclusive
+            ),
+            "taking shared while exclusively held within this process \
+             would silently downgrade the exclusive lock"
+        );
         flock::lock_shared(file.file())?;
         let mut locks = self.locks.write();
         let entry = locks.get_mut(&key).expect("handle lookup succeeded");
@@ -170,6 +178,14 @@ impl LockManager {
                 .or_insert_with(|| ManagedLock::new(Arc::new(lock)));
         }
         let file = self.handle(&key)?;
+        debug_assert!(
+            !matches!(
+                self.locks.read().get(&key),
+                Some(entry) if entry.count > 0 && entry.mode == LockMode::Exclusive
+            ),
+            "taking shared while exclusively held within this process \
+             would silently downgrade the exclusive lock"
+        );
         flock::lock_shared(file.file())?;
         let mut locks = self.locks.write();
         let entry = locks.get_mut(&key).expect("handle lookup succeeded");
@@ -497,6 +513,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(debug_assertions)]
     fn unlock_below_zero_is_a_bug() {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join(".rlib.lock");
@@ -694,8 +711,8 @@ mod tests {
         lm.assert_locked(&key, LockMode::Shared);
         lm.unlock(&key).unwrap();
     }
-
     #[test]
+    #[cfg(debug_assertions)]
     #[should_panic(expected = "expected lock")]
     fn assert_locked_rejects_a_wrong_mode() {
         let tmp = TempDir::new().unwrap();
@@ -706,6 +723,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(debug_assertions)]
     #[should_panic(expected = "expected lock")]
     fn assert_locked_rejects_an_unknown_key() {
         let tmp = TempDir::new().unwrap();

@@ -197,7 +197,7 @@ impl<'a, 'gctx: 'a> CompilationFiles<'a, 'gctx> {
             .map(|unit| (unit, OnceCell::new()))
             .collect();
         let cache_enabled = host.cache_enabled();
-        let path_dep_units = build_runner
+        let mut path_dep_units: HashSet<Unit> = build_runner
             .bcx
             .unit_graph
             .iter()
@@ -207,6 +207,25 @@ impl<'a, 'gctx: 'a> CompilationFiles<'a, 'gctx> {
             })
             .map(|(unit, _deps)| unit.clone())
             .collect();
+        // Propagate transitively: if a unit depends on a path-dependent unit,
+        // it must also be considered path-dependent, otherwise a registry crate
+        // A that depends on registry B (which is patched to local C) would be
+        // cached while its transitive input is mutable.
+        loop {
+            let mut added = Vec::new();
+            for (unit, deps) in build_runner.bcx.unit_graph.iter() {
+                if path_dep_units.contains(unit) {
+                    continue;
+                }
+                if deps.iter().any(|dep| path_dep_units.contains(&dep.unit)) {
+                    added.push(unit.clone());
+                }
+            }
+            if added.is_empty() {
+                break;
+            }
+            path_dep_units.extend(added);
+        }
         CompilationFiles {
             ws: build_runner.bcx.ws,
             host,
@@ -961,8 +980,12 @@ fn compute_metadata(
     // different artifacts and need different cache entries. Without this, two
     // Cargo processes building different revisions at the same time would race
     // on the same directory (see `concurrent::git_same_branch_different_revs`).
-    if let Some(precise) = unit.pkg.package_id().source_id().precise_git_fragment() {
-        precise.hash(&mut shared_hasher);
+    // Only mix this in when the new build-dir layout (which enables the cache)
+    // is active, so non-cache builds keep their existing hashes.
+    if bcx.ws.gctx().cli_unstable().build_dir_new_layout {
+        if let Some(precise) = unit.pkg.package_id().source_id().precise_git_fragment() {
+            precise.hash(&mut shared_hasher);
+        }
     }
 
     // Also mix in enabled features to our metadata. This'll ensure that

@@ -910,13 +910,16 @@ pub fn move_directory(src: &Path, dst: &Path) -> Result<()> {
     }
 
     // Slow path: different filesystems, copy then remove.
-    copy_directory(src, dst).with_context(|| {
-        format!(
-            "failed to copy directory `{}` to `{}` during move",
-            src.display(),
-            dst.display()
-        )
-    })?;
+    if let Err(e) = copy_directory(src, dst) {
+        let _ = remove_dir_all(dst);
+        return Err(e).with_context(|| {
+            format!(
+                "failed to copy directory `{}` to `{}` during move",
+                src.display(),
+                dst.display()
+            )
+        });
+    }
     remove_dir_all(src).with_context(|| {
         format!(
             "failed to remove source directory `{}` after copy during move",

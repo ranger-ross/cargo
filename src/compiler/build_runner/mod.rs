@@ -211,7 +211,28 @@ impl<'a, 'gctx> BuildRunner<'a, 'gctx> {
         }
 
         // Now that we've figured out everything that we're going to do, do it!
-        queue.execute(&mut self)?;
+        // Ensure staging cleanup even if execution fails, and publish staged
+        // cacheable units atomically on success.
+        let queue_result = queue.execute(&mut self);
+        // Publish staged build-cache units into the shared cache. This is
+        // done while the staging directory is still present. `AlreadyExists`
+        // is treated as success (another process won the race) and the
+        // staging copy is discarded. Failures are ignored to avoid breaking
+        // the build on a best-effort cache. This runs before cleanup so
+        // dependents that used staging during this build are not affected.
+        if queue_result.is_ok() {
+            if let Some(files) = &self.files {
+                let _ = files.publish_all_staged();
+            }
+        }
+        // Clean up per-PID staging area (`_staging/<pid>`) for cacheable units.
+        // This runs whether the build succeeded or was canceled/failed, and
+        // discards any staged units that lost the publish race. The removal
+        // is best-effort and ignores `NotFound`.
+        if let Some(files) = &self.files {
+            files.cleanup_staging();
+        }
+        queue_result?;
 
         // Locks were taken silently on worker threads (no shell to print
         // "Blocking" messages), so with `-Zbuild-analysis` summarize what is

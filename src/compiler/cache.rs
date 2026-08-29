@@ -171,11 +171,11 @@ impl CacheCoordination {
     /// date at prepare time (otherwise missing outputs on a cold or partial
     /// cache still need a build).
     pub(crate) fn is_complete(&self, builder_active: bool) -> CargoResult<bool> {
-        let content_matches = match cargo_util::paths::read(&self.fingerprint) {
-            Ok(stored) => stored == self.completion.expected_hash()?,
-            Err(_) => false,
-        };
-        Ok(content_matches && (self.completion.fs_up_to_date || builder_active))
+        let stored = cargo_util::paths::read(&self.fingerprint).unwrap_or_else(|_| "MISSING".to_string());
+        let expected = self.completion.expected_hash()?;
+        let content_matches = stored.trim() == expected.trim();
+        let result = content_matches && (self.completion.fs_up_to_date || builder_active);
+        Ok(result)
     }
 
     /// Checks whether any fingerprint file exists.

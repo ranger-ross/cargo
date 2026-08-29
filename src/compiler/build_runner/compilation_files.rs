@@ -411,6 +411,94 @@ impl<'a, 'gctx: 'a> CompilationFiles<'a, 'gctx> {
                 .to_path_buf()
         }
     }
+    /// Returns the host build cache layout.
+    pub fn build_cache(&self) -> &crate::compiler::layout::BuildCacheLayout {
+        self.host.build_cache()
+    }
+
+    /// Cleanup staging area for current PID.
+    pub fn cleanup_staging(&self) {
+        self.host.build_cache().cleanup_staging_pid();
+        for layout in self.target.values() {
+            layout.build_cache().cleanup_staging_pid();
+        }
+    }
+
+    /// Publish all staged units for the current PID into the cache.
+    pub fn publish_all_staged(&self) -> CargoResult<()> {
+        self.host.build_cache().publish_all_staged()?;
+        for layout in self.target.values() {
+            layout.build_cache().publish_all_staged()?;
+        }
+        Ok(())
+    }
+
+    /// Staging fingerprint directory for a cacheable unit (`_staging/<pid>/.../fingerprint`).
+    pub fn staging_fingerprint_dir(&self, unit: &Unit) -> PathBuf {
+        debug_assert!(self.is_cacheable(unit));
+        let dir = self.pkg_dir(unit);
+        self.layout(unit.kind)
+            .build_cache()
+            .staging_fingerprint(&dir)
+    }
+
+    /// Returns the path for a file in the staging fingerprint directory.
+    pub fn staging_fingerprint_file_path(&self, unit: &Unit, prefix: &str) -> PathBuf {
+        debug_assert!(self.is_cacheable(unit));
+        let kind = unit.target.kind().description();
+        let flavor = if unit.mode.is_any_test() {
+            "test-"
+        } else if unit.mode.is_doc() {
+            "doc-"
+        } else if unit.mode.is_run_custom_build() {
+            "run-"
+        } else {
+            ""
+        };
+        let name = format!("{}{}{}-{}", prefix, flavor, kind, unit.target.name());
+        self.staging_fingerprint_dir(unit).join(name)
+    }
+
+    /// Staging deps/out directory for a cacheable unit.
+    pub fn staging_deps_dir(&self, unit: &Unit) -> PathBuf {
+        debug_assert!(self.is_cacheable(unit));
+        let dir = self.pkg_dir(unit);
+        self.layout(unit.kind).build_cache().staging_out(&dir)
+    }
+
+    /// Directory where staging output for the given unit should go (out/).
+    pub fn staging_output_dir(&self, unit: &Unit) -> PathBuf {
+        self.staging_deps_dir(unit)
+    }
+
+    /// Staging path where compiler output is cached.
+    pub fn staging_message_cache_path(&self, unit: &Unit) -> PathBuf {
+        self.staging_fingerprint_file_path(unit, "output-")
+    }
+
+    /// Cache build unit dir (`build-cache/<pkg>/<hash>`).
+    pub fn cache_build_unit(&self, unit: &Unit) -> PathBuf {
+        let dir = self.pkg_dir(unit);
+        self.layout(unit.kind).build_cache().build_unit(&dir)
+    }
+
+    /// Staging build unit dir (`build-cache/_staging/<pid>/<pkg>/<hash>`).
+    pub fn staging_build_unit(&self, unit: &Unit) -> PathBuf {
+        let dir = self.pkg_dir(unit);
+        self.layout(unit.kind)
+            .build_cache()
+            .staging_build_unit(&dir)
+    }
+
+    /// Staging incremental directory.
+    pub fn staging_incremental_dir(&self, unit: &Unit) -> PathBuf {
+        debug_assert!(self.is_cacheable(unit));
+        let dir = self.pkg_dir(unit);
+        self.layout(unit.kind)
+            .build_cache()
+            .staging_incremental(&dir)
+    }
+
 
     /// Directory where timing output should go.
     pub fn timings_dir(&self) -> Option<&Path> {

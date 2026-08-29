@@ -609,15 +609,12 @@ pub fn prepare_target(
             write_fingerprint(&loc, &fingerprint)
         })
     } else if is_cacheable {
-        // The prepared fingerprint pins each dependency's rmeta checksum
-        // (see `normalize_cache_deps`). On a cold cache the dependencies have
-        // not been built when the fingerprint is calculated, so checksums are
-        // still the "missing" placeholder. Recompute them now that dependencies
-        // exist, so the persisted fingerprint matches the artifacts the unit
-        // was compiled against.
+        let staging_loc = build_runner
+            .files()
+            .staging_fingerprint_file_path(unit, "");
         Work::new(move |_| {
             refresh_cache_dep_checksums(&fingerprint, &rmeta_checksum_paths)?;
-            write_fingerprint(&loc, &fingerprint)
+            write_fingerprint(&staging_loc, &fingerprint)
         })
     } else {
         Work::new(move |_| write_fingerprint(&loc, &fingerprint))
@@ -725,7 +722,7 @@ pub struct Fingerprint {
     /// Description of whether the filesystem status for this unit is up to date
     /// or should be considered stale.
     #[serde(skip)]
-    fs_status: FsStatus,
+    pub(crate) fs_status: FsStatus,
     /// Files, relative to `target_root`, that are produced by the step that
     /// this `Fingerprint` represents. This is used to detect when the whole
     /// fingerprint is out of date if this is missing, or if previous
@@ -767,7 +764,7 @@ pub enum FsStatus {
 }
 
 impl FsStatus {
-    fn up_to_date(&self) -> bool {
+    pub(crate) fn up_to_date(&self) -> bool {
         match self {
             FsStatus::UpToDate { .. } => true,
             FsStatus::Stale
@@ -1784,7 +1781,23 @@ fn refresh_dep_checksums(
                 // replaced with the checksum of the actual rmeta the unit was
                 // compiled against.
                 if let Some(path) = path {
-                    if let Ok(bytes) = std::fs::read(path) {
+                    // Try cache path first; if missing and this is a cacheable dep
+                    // whose rmeta is still in staging (first build, before publish),
+                    // fall back to the staging location.
+                    let bytes = std::fs::read(path).or_else(|_| {
+                        if let Some(pos) = path.to_string_lossy().find("build-cache") {
+                            let before = &path.to_string_lossy()[..pos + "build-cache".len()];
+                            let after = &path.to_string_lossy()[pos + "build-cache".len()..];
+                            if after.starts_with("/_staging") {
+                                return Err(std::io::Error::new(std::io::ErrorKind::NotFound, "already staging"));
+                            }
+                            let staging = format!("{}/_staging/{}{}", before, std::process::id(), after);
+                            std::fs::read(&staging)
+                        } else {
+                            Err(std::io::Error::new(std::io::ErrorKind::NotFound, "no build-cache in path"))
+                        }
+                    });
+                    if let Ok(bytes) = bytes {
                         if let Some(idx) = s.rfind(':') {
                             refreshed = Some(format!("{}:{:x}", &s[..idx], util::hash_u64(&bytes)));
                         }
@@ -2294,11 +2307,27 @@ fn write_fingerprint(loc: &Path, fingerprint: &Fingerprint) -> CargoResult<()> {
 
 /// Prepare for work when a package starts to build
 pub fn prepare_init(build_runner: &mut BuildRunner<'_, '_>, unit: &Unit) -> CargoResult<()> {
-    let new1 = build_runner.files().fingerprint_dir(unit);
+    // For cacheable units the build happens in staging (`_staging/<pid>/...`),
+    // so ensure that staging fingerprint directory exists. For non-cacheable
+    // units use the normal (workspace) fingerprint directory.
+    let fingerprint_dir = if build_runner.files().is_cacheable(unit) {
+        build_runner.files().staging_fingerprint_dir(unit)
+    } else {
+        build_runner.files().fingerprint_dir(unit)
+    };
 
     // Doc tests have no output, thus no fingerprint.
-    if !new1.exists() && !unit.mode.is_doc_test() {
-        paths::create_dir_all(&new1)?;
+    if !fingerprint_dir.exists() && !unit.mode.is_doc_test() {
+        paths::create_dir_all(&fingerprint_dir)?;
+    }
+
+    // Also ensure the staging out directory exists for cacheable units so
+    // later `create_dir_all(root)` is cheap. Not required for correctness.
+    if build_runner.files().is_cacheable(unit) {
+        let staging_out = build_runner.files().staging_deps_dir(unit);
+        if !staging_out.exists() {
+            paths::create_dir_all(&staging_out)?;
+        }
     }
 
     Ok(())
@@ -2335,18 +2364,31 @@ impl CacheCompletionState {
     /// the persisted values and an intact entry is recognized instead of rebuilt.
     pub(crate) fn expected_hash(&self) -> CargoResult<String> {
         let fp = self.fingerprint.lock();
+        let before = util::to_hex(fp.hash_u64());
         refresh_cache_dep_checksums(&fp, &self.rmeta_paths)?;
-        Ok(util::to_hex(fp.hash_u64()))
+        let after = util::to_hex(fp.hash_u64());
+        Ok(after)
     }
 }
 
-/// Returns the fingerprint state that would be persisted for a cacheable `unit`.
 pub(crate) fn cache_completion_state(
     build_runner: &mut BuildRunner<'_, '_>,
     unit: &Unit,
 ) -> CargoResult<CacheCompletionState> {
     let fingerprint = calculate(build_runner, unit)?;
-    let fs_up_to_date = fingerprint.fs_status.up_to_date();
+    // For staging, the plan-time fingerprint uses the per-PID staging
+    // fingerprint dir (empty on a cold build), so its `fs_status` is
+    // always stale even when the cache entry is intact. Check the
+    // cache location directly.
+    let fs_up_to_date = if build_runner.files().is_cacheable(unit) {
+        let cache_unit = build_runner.files().cache_build_unit(unit);
+        let has_out = cache_unit.join("out").exists();
+        let has_fp = cache_unit.join("fingerprint").exists();
+        let out_has_files = std::fs::read_dir(cache_unit.join("out")).map(|mut e| e.next().is_some()).unwrap_or(false);
+        has_out && has_fp && out_has_files
+    } else {
+        fingerprint.fs_status.up_to_date()
+    };
     let rmeta_paths = collect_dep_rmeta_paths(build_runner, &fingerprint)?;
     Ok(CacheCompletionState {
         fingerprint: parking_lot::Mutex::new(fingerprint.deep_clone()),
@@ -2378,6 +2420,7 @@ fn compare_old_fingerprint(
     mtime_on_use: bool,
     forced: bool,
 ) -> FingerprintComparison {
+
     if mtime_on_use {
         // update the mtime so other cleaners know we used it
         let t = FileTime::from_system_time(SystemTime::now());

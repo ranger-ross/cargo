@@ -34,6 +34,7 @@ pub(crate) mod build_context;
 pub(crate) mod build_runner;
 mod cache;
 mod compilation;
+use crate::compiler::build_runner::OutputFile;
 mod compile_kind;
 mod crate_type;
 mod custom_build;
@@ -342,27 +343,64 @@ fn rustc(
 
     let name = unit.pkg.name();
 
+    let is_cacheable = build_runner.files().is_cacheable(unit);
     let outputs = build_runner.outputs(unit)?;
-    let root = build_runner.files().output_dir(unit);
-
-    // Prepare the native lib state (extra `-L` and `-l` flags).
-    let build_script_outputs = Arc::clone(&build_runner.build_script_outputs);
-    let current_id = unit.pkg.package_id();
-    let manifest = ManifestErrorContext::new(build_runner, unit);
-    let build_scripts = build_runner.build_scripts.get(unit).cloned();
-
-    // If we are a binary and the package also contains a library, then we
-    // don't pass the `-l` flags.
-    let pass_l_flag = unit.target.is_lib() || !unit.pkg.targets().iter().any(|t| t.is_lib());
-
-    let dep_info_name =
-        if let Some(c_extra_filename) = build_runner.files().metadata(unit).c_extra_filename() {
+    let (root, rustc_dep_info_loc, dep_info_loc, fingerprint_dir) = if is_cacheable {
+        let staging_root = build_runner.files().staging_deps_dir(unit);
+        let dep_info_name = if let Some(c_extra_filename) = build_runner.files().metadata(unit).c_extra_filename() {
             format!("{}-{}.d", unit.target.crate_name(), c_extra_filename)
         } else {
             format!("{}.d", unit.target.crate_name())
         };
-    let rustc_dep_info_loc = root.join(dep_info_name);
-    let dep_info_loc = fingerprint::dep_info_loc(build_runner, unit);
+        let rustc_dep = staging_root.join(dep_info_name);
+        let dep_info = build_runner.files().staging_fingerprint_file_path(unit, "dep-");
+        let fp_dir = build_runner.files().staging_fingerprint_dir(unit);
+        (staging_root, rustc_dep, dep_info, fp_dir)
+    } else {
+        let root = build_runner.files().output_dir(unit);
+        let dep_info_name = if let Some(c_extra_filename) = build_runner.files().metadata(unit).c_extra_filename() {
+            format!("{}-{}.d", unit.target.crate_name(), c_extra_filename)
+        } else {
+            format!("{}.d", unit.target.crate_name())
+        };
+        let rustc_dep = root.join(dep_info_name);
+        let dep_info = fingerprint::dep_info_loc(build_runner, unit);
+        let fp_dir = build_runner.files().fingerprint_dir(unit);
+        (root, rustc_dep, dep_info, fp_dir)
+    };
+    let rustc_dep_info_loc = rustc_dep_info_loc;
+    let dep_info_loc = dep_info_loc;
+    let fingerprint_dir = fingerprint_dir;
+    let physical_outputs: std::sync::Arc<Vec<OutputFile>> = if is_cacheable {
+        let cache_root = build_runner.files().deps_dir(unit);
+        let staging_root = build_runner.files().staging_deps_dir(unit);
+        let mapped = outputs
+            .iter()
+            .map(|o| {
+                let map_path = |p: &std::path::PathBuf| -> std::path::PathBuf {
+                    if let Ok(rel) = p.strip_prefix(&cache_root) {
+                        staging_root.join(rel)
+                    } else {
+                        p.clone()
+                    }
+                };
+                OutputFile {
+                    path: map_path(&o.path),
+                    hardlink: o.hardlink.as_ref().map(map_path),
+                    export_path: o.export_path.as_ref().map(map_path),
+                    flavor: o.flavor.clone(),
+                }
+            })
+            .collect::<Vec<_>>();
+        std::sync::Arc::new(mapped)
+    } else {
+        std::sync::Arc::clone(&outputs)
+    };
+    let build_script_outputs = std::sync::Arc::clone(&build_runner.build_script_outputs);
+    let current_id = unit.pkg.package_id();
+    let manifest = ManifestErrorContext::new(build_runner, unit);
+    let build_scripts = build_runner.build_scripts.get(unit).cloned();
+    let pass_l_flag = unit.target.is_lib() || !unit.pkg.targets().iter().any(|t| t.is_lib());
     // if !dep_info_loc.exists() {
     //     paths::create_dir_all(&dep_info_loc.parent().unwrap()).unwrap();
     // }
@@ -398,7 +436,11 @@ fn rustc(
     } else {
         None
     };
-    let fingerprint_dir = build_runner.files().fingerprint_dir(unit);
+    let fingerprint_dir = if is_cacheable {
+        build_runner.files().staging_fingerprint_dir(unit)
+    } else {
+        build_runner.files().fingerprint_dir(unit)
+    };
     let script_metadatas = build_runner.find_build_script_metadatas(unit);
     let is_local = unit.is_local();
     let artifact = unit.artifact;
@@ -438,22 +480,44 @@ fn rustc(
     }
     let env_config = Arc::clone(build_runner.bcx.gctx.env_config()?);
     return Ok(Work::new(move |state| {
-        // Cacheable units are coordinated through per-unit state locks in
-        // the build cache. If another process already built this unit, there
-        // is nothing to compile.
-        if let Some(cache) = &cache {
-            if !cache.coordinate(state)? {
-                // Another process already built this unit in the cache while
-                // we waited, so skip compiling.
-                if let Some((name, target, cache_entry)) = &cache_identity {
-                    println!(
-                        "build cache: `{}` {} is fresh (hit {})",
-                        name,
-                        target,
-                        cache_entry.display()
-                    );
+        // Cacheable units use staging with atomic publish; no per-unit
+        // locking is needed. Non-cacheable units with fine-grain locking
+        // still use the coordination protocol.
+        if !is_cacheable {
+            if let Some(cache) = &cache {
+                if !cache.coordinate(state)? {
+                    // Another process already built this unit in the cache while
+                    // we waited, so skip compiling.
+                    if let Some((name, target, cache_entry)) = &cache_identity {
+                        println!(
+                            "build cache: `{}` {} is fresh (hit {})",
+                            name,
+                            target,
+                            cache_entry.display()
+                        );
+                    }
+                    return Ok(());
                 }
-                return Ok(());
+            }
+        }
+        // For staging, check at execution time (after dependencies built)
+        // if the cache entry is already complete. This handles the case
+        // where the fingerprint was dirty at plan time due to placeholder
+        // rmeta checksums (cold workspace) but becomes complete after
+        // dependencies are built.
+        if is_cacheable {
+            if let Some(cache) = &cache {
+                if cache.is_complete(false)? {
+                    if let Some((name, target, cache_entry)) = &cache_identity {
+                        println!(
+                            "build cache: `{}` {} is fresh (hit {})",
+                            name,
+                            target,
+                            cache_entry.display()
+                        );
+                    }
+                    return Ok(());
+                }
             }
         }
 
@@ -488,7 +552,7 @@ fn rustc(
             add_custom_flags(&mut rustc, &script_outputs, script_metadatas)?;
         }
 
-        for output in outputs.iter() {
+        for output in physical_outputs.iter() {
             // If there is both an rmeta and rlib, rustc will prefer to use the
             // rlib, even if it is older. Therefore, we must delete the rlib to
             // force using the new rmeta.
@@ -537,8 +601,8 @@ fn rustc(
         // other Cargo processes start pipelined compiles against the metadata
         // while this process still runs codegen.
         let on_rmeta: Option<&dyn Fn() -> CargoResult<()>> = match &cache {
-            Some(cache) => Some(&|| cache.downgrade_rmeta(state)),
-            None => None,
+            Some(cache) if !is_cacheable => Some(&|| cache.downgrade_rmeta(state)),
+            _ => None,
         };
         let result = exec
             .exec(
@@ -639,7 +703,7 @@ fn rustc(
         //    a new mtime than existing crate rmeta, so re-checking the crate.
         //    However the check is a no-op (input has no change), so stuck.
         if mode.is_check() {
-            for output in outputs.iter() {
+            for output in physical_outputs.iter() {
                 if let Some(timestamp) = timestamp {
                     paths::set_file_time_no_err(&output.path, timestamp);
                 }
@@ -753,8 +817,33 @@ fn link_targets(
     unit: &Unit,
     fresh: bool,
 ) -> CargoResult<Work> {
+    let outputs = if build_runner.files().is_cacheable(unit) && !fresh {
+        let cache_outputs = build_runner.outputs(unit)?;
+        let cache_root = build_runner.files().deps_dir(unit);
+        let staging_root = build_runner.files().staging_deps_dir(unit);
+        let mapped = cache_outputs
+            .iter()
+            .map(|o| {
+                let map_path = |p: &std::path::PathBuf| -> std::path::PathBuf {
+                    if let Ok(rel) = p.strip_prefix(&cache_root) {
+                        staging_root.join(rel)
+                    } else {
+                        p.clone()
+                    }
+                };
+                OutputFile {
+                    path: map_path(&o.path),
+                    hardlink: o.hardlink.as_ref().map(map_path),
+                    export_path: o.export_path.as_ref().map(map_path),
+                    flavor: o.flavor.clone(),
+                }
+            })
+            .collect::<Vec<_>>();
+        std::sync::Arc::new(mapped)
+    } else {
+        build_runner.outputs(unit)?
+    };
     let bcx = build_runner.bcx;
-    let outputs = build_runner.outputs(unit)?;
     let export_dir = build_runner.files().export_dir();
     let package_id = unit.pkg.package_id();
     let manifest_path = PathBuf::from(unit.pkg.manifest_path());
@@ -1571,8 +1660,12 @@ fn build_base_args(
         cmd.arg("-C").arg("rpath");
     }
 
-    cmd.arg("--out-dir")
-        .arg(&build_runner.files().output_dir(unit));
+    let out_dir = if build_runner.files().is_cacheable(unit) {
+        build_runner.files().staging_output_dir(unit)
+    } else {
+        build_runner.files().output_dir(unit)
+    };
+    cmd.arg("--out-dir").arg(&out_dir);
 
     unit.kind.add_target_arg(cmd);
 
@@ -1829,7 +1922,23 @@ fn add_dep_arg<'a, 'b: 'a>(
         if map.contains_key(&dep.unit) {
             continue;
         }
-        map.insert(&dep.unit, build_runner.files().deps_dir(&dep.unit));
+        let use_staging = {
+            if !build_runner.files().is_cacheable(&dep.unit) {
+                false
+            } else {
+                let cache_unit = build_runner.files().cache_build_unit(&dep.unit);
+                let has_out = cache_unit.join("out").exists();
+                let has_fp = cache_unit.join("fingerprint").exists();
+                let out_has_files = std::fs::read_dir(cache_unit.join("out")).map(|mut e| e.next().is_some()).unwrap_or(false);
+                !(has_out && has_fp && out_has_files)
+            }
+        };
+        let dep_dir = if use_staging {
+            build_runner.files().staging_deps_dir(&dep.unit)
+        } else {
+            build_runner.files().deps_dir(&dep.unit)
+        };
+        map.insert(&dep.unit, dep_dir);
 
         // Proc macros are statically linked, so when including a proc-macro dependency we can skip
         // adding it's dependencies. Note that we still do add them when we are compiling the
@@ -1963,8 +2072,43 @@ pub fn extern_args(
             result.push(value);
         };
 
-        let outputs = build_runner.outputs(&dep.unit)?;
-
+        let use_staging = {
+            if !build_runner.files().is_cacheable(&dep.unit) {
+                false
+            } else {
+                let cache_unit = build_runner.files().cache_build_unit(&dep.unit);
+                let has_out = cache_unit.join("out").exists();
+                let has_fp = cache_unit.join("fingerprint").exists();
+                let out_has_files = std::fs::read_dir(cache_unit.join("out")).map(|mut e| e.next().is_some()).unwrap_or(false);
+                !(has_out && has_fp && out_has_files)
+            }
+        };
+        let outputs = if use_staging {
+            let cache_outputs = build_runner.outputs(&dep.unit)?;
+            let cache_root = build_runner.files().deps_dir(&dep.unit);
+            let staging_dir = build_runner.files().staging_deps_dir(&dep.unit);
+            let mapped = cache_outputs
+                .iter()
+                .map(|o| {
+                    let map_path = |p: &std::path::PathBuf| -> std::path::PathBuf {
+                        if let Ok(rel) = p.strip_prefix(&cache_root) {
+                            staging_dir.join(rel)
+                        } else {
+                            p.clone()
+                        }
+                    };
+                    OutputFile {
+                        path: map_path(&o.path),
+                        hardlink: o.hardlink.as_ref().map(map_path),
+                        export_path: o.export_path.as_ref().map(map_path),
+                        flavor: o.flavor.clone(),
+                    }
+                })
+                .collect::<Vec<_>>();
+            std::sync::Arc::new(mapped)
+        } else {
+            build_runner.outputs(&dep.unit)?
+        };
         if build_runner.only_requires_rmeta(unit, &dep.unit) || dep.unit.mode.is_check() {
             // Example: rlib dependency for an rlib, rmeta is all that is required.
             let output = outputs

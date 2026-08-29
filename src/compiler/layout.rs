@@ -323,14 +323,12 @@ impl Layout {
             None
         };
         let build_cache_root = ws.gctx().home().join("build-cache").into_path_unlocked();
-        let cache_enabled = match paths::create_dir_all(&build_cache_root) {
+        let mut cache_enabled = match paths::create_dir_all(&build_cache_root) {
             Ok(()) => true,
             Err(e)
                 if e.downcast_ref::<std::io::Error>()
                     .is_some_and(|e| e.kind() == std::io::ErrorKind::PermissionDenied) =>
             {
-                // A read-only `$CARGO_HOME` (for example a read-only registry
-                // cache) must not break the build. Just disable the cache.
                 tracing::debug!(
                     "build cache disabled: cannot create {:?}: {e:?}",
                     build_cache_root
@@ -339,6 +337,23 @@ impl Layout {
             }
             Err(e) => return Err(e.into()),
         };
+        if cache_enabled {
+            let staging_root = build_cache_root.join("_staging");
+            match paths::create_dir_all(&staging_root) {
+                Ok(()) => {}
+                Err(e)
+                    if e.downcast_ref::<std::io::Error>()
+                        .is_some_and(|e| e.kind() == std::io::ErrorKind::PermissionDenied) =>
+                {
+                    tracing::debug!(
+                        "build cache disabled: cannot create {:?}: {e:?}",
+                        staging_root
+                    );
+                    cache_enabled = false;
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
 
         Ok(Layout {
             artifact_dir,
@@ -579,5 +594,186 @@ impl BuildCacheLayout {
     /// Fetch the build unit path
     pub fn build_unit(&self, pkg_dir: &str) -> PathBuf {
         self.root.join(pkg_dir)
+    }
+    /// Staging root: `$CARGO_HOME/build-cache/_staging`
+    pub fn staging_root(&self) -> PathBuf {
+        self.root.join("_staging")
+    }
+
+    /// Staging directory for the current process (`_staging/<pid>`).
+    pub fn staging_pid_root(&self) -> PathBuf {
+        self.staging_root().join(std::process::id().to_string())
+    }
+
+    /// Fetch the staging build unit path for a package (`_staging/<pid>/<pkg>/<hash>`).
+    pub fn staging_build_unit(&self, pkg_dir: &str) -> PathBuf {
+        self.staging_pid_root().join(pkg_dir)
+    }
+
+    /// Fetch the staging fingerprint path.
+    pub fn staging_fingerprint(&self, pkg_dir: &str) -> PathBuf {
+        self.staging_build_unit(pkg_dir).join("fingerprint")
+    }
+
+    /// Fetch the staging output path.
+    pub fn staging_out(&self, pkg_dir: &str) -> PathBuf {
+        self.staging_build_unit(pkg_dir).join("out")
+    }
+
+    /// Incremental path in staging.
+    pub fn staging_incremental(&self, pkg_dir: &str) -> PathBuf {
+        self.staging_build_unit(pkg_dir).join("incremental")
+    }
+
+    /// Remove the staging area for the current PID. Called when the build
+    /// finishes or is canceled. Failures are ignored.
+    pub fn cleanup_staging_pid(&self) {
+        let dir = self.staging_pid_root();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Atomically publish a staged build unit into the cache.
+    ///
+    /// Moves `staging_unit_dir` (`_staging/<pid>/<pkg>/<hash>`) to
+    /// `cache_unit_dir` (`<pkg>/<hash>`). If the destination already exists,
+    /// another process published first; the staging dir is discarded and
+    /// `Ok(false)` is returned. On success `Ok(true)` is returned.
+    pub fn publish_staged_unit(
+        &self,
+        staging_unit_dir: &Path,
+        cache_unit_dir: &Path,
+    ) -> CargoResult<bool> {
+        if let Some(parent) = cache_unit_dir.parent() {
+            paths::create_dir_all(parent)?;
+        }
+        match std::fs::rename(staging_unit_dir, cache_unit_dir) {
+            Ok(()) => Ok(true),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                // If the existing cache entry is empty or incomplete (e.g. from a previous buggy run),
+                // remove it and retry. Otherwise discard staging (another process won the race).
+                let is_poisoned = match std::fs::read_dir(cache_unit_dir) {
+                    Ok(mut entries) => {
+                        let has_out = cache_unit_dir.join("out").exists();
+                        let has_fp = cache_unit_dir.join("fingerprint").exists();
+                        // Check if out has any files
+                        let out_has_files = std::fs::read_dir(cache_unit_dir.join("out"))
+                            .map(|mut e| e.next().is_some())
+                            .unwrap_or(false);
+                        !has_out || !has_fp || !out_has_files
+                    }
+                    Err(_) => true,
+                };
+                if is_poisoned {
+                    let _ = std::fs::remove_dir_all(cache_unit_dir);
+                    // Retry rename after removing poisoned entry
+                    match std::fs::rename(staging_unit_dir, cache_unit_dir) {
+                        Ok(()) => return Ok(true),
+                        Err(e2) => {
+                            let _ = std::fs::remove_dir_all(staging_unit_dir);
+                            return Ok(false);
+                        }
+                    }
+                }
+                let _ = std::fs::remove_dir_all(staging_unit_dir);
+                Ok(false)
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::DirectoryNotEmpty => {
+                let is_poisoned = match std::fs::read_dir(cache_unit_dir) {
+                    Ok(mut entries) => {
+                        let has_out = cache_unit_dir.join("out").exists();
+                        let has_fp = cache_unit_dir.join("fingerprint").exists();
+                        let out_has_files = std::fs::read_dir(cache_unit_dir.join("out"))
+                            .map(|mut e| e.next().is_some())
+                            .unwrap_or(false);
+                        !has_out || !has_fp || !out_has_files
+                    }
+                    Err(_) => true,
+                };
+                if is_poisoned {
+                    let _ = std::fs::remove_dir_all(cache_unit_dir);
+                    match std::fs::rename(staging_unit_dir, cache_unit_dir) {
+                        Ok(()) => return Ok(true),
+                        Err(e2) => {
+                            let _ = std::fs::remove_dir_all(staging_unit_dir);
+                            return Ok(false);
+                        }
+                    }
+                }
+                let _ = std::fs::remove_dir_all(staging_unit_dir);
+                Ok(false)
+            }
+            Err(e) => {
+                if e.raw_os_error() == Some(17) {
+                    // EEXIST - same as AlreadyExists, check poisoned
+                    let is_poisoned = std::fs::read_dir(cache_unit_dir)
+                        .map(|mut e| e.next().is_some())
+                        .unwrap_or(true) == false;
+                    if is_poisoned {
+                        let _ = std::fs::remove_dir_all(cache_unit_dir);
+                        if let Ok(()) = std::fs::rename(staging_unit_dir, cache_unit_dir) {
+                            return Ok(true);
+                        }
+                    }
+                    let _ = std::fs::remove_dir_all(staging_unit_dir);
+                    return Ok(false);
+                }
+                if e.raw_os_error() == Some(18) {
+                    if cache_unit_dir.exists() {
+                        let _ = std::fs::remove_dir_all(staging_unit_dir);
+                        return Ok(false);
+                    }
+                    fn copy_dir_all(src: &Path, dst: &Path) -> std::io::Result<()> {
+                        std::fs::create_dir_all(dst)?;
+                        for entry in std::fs::read_dir(src)? {
+                            let entry = entry?;
+                            let src_path = entry.path();
+                            let dst_path = dst.join(entry.file_name());
+                            if src_path.is_dir() {
+                                copy_dir_all(&src_path, &dst_path)?;
+                            } else {
+                                std::fs::copy(&src_path, &dst_path)?;
+                            }
+                        }
+                        Ok(())
+                    }
+                    copy_dir_all(staging_unit_dir, cache_unit_dir)?;
+                    let _ = std::fs::remove_dir_all(staging_unit_dir);
+                    return Ok(true);
+                }
+                Err(e.into())
+            }
+        }
+    }
+
+    /// Publish all staged units for the current PID into the cache.
+    ///
+    /// Iterates `_staging/<pid>/*/*` and moves each unit directory atomically
+    /// into the cache. `AlreadyExists` is treated as success (discard).
+    pub fn publish_all_staged(&self) -> CargoResult<()> {
+        let pid_root = self.staging_pid_root();
+        let Ok(entries) = std::fs::read_dir(&pid_root) else {
+            return Ok(());
+        };
+        for pkg_entry in entries.flatten() {
+            let pkg_path = pkg_entry.path();
+            if !pkg_path.is_dir() {
+                continue;
+            }
+            let Ok(hash_entries) = std::fs::read_dir(&pkg_path) else {
+                continue;
+            };
+            for hash_entry in hash_entries.flatten() {
+                let staging_unit = hash_entry.path();
+                if !staging_unit.is_dir() {
+                    continue;
+                }
+
+                let file_name = hash_entry.file_name();
+                let pkg_name = pkg_entry.file_name();
+                let cache_unit = self.root.join(&pkg_name).join(&file_name);
+                let _ = self.publish_staged_unit(&staging_unit, &cache_unit);
+            }
+        }
+        Ok(())
     }
 }

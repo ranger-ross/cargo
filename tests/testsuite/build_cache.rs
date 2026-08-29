@@ -51,6 +51,7 @@ fn cached_pkgs() -> Vec<String> {
         .expect("cache root should exist")
         .flatten()
         .map(|e| e.file_name().to_string_lossy().to_string())
+        .filter(|name| name != "_staging")
         .collect();
     names.sort();
     names
@@ -200,21 +201,14 @@ fn held_locks_summarized_under_build_analysis() {
             &main_file(r#""{}", dep1::hello()"#, &["dep1"]),
         )
         .build();
-
     // Worker threads take the per-unit state locks silently, so the cold
     // build summarizes them at the end under -Zbuild-analysis.
+    // With the staging design, cacheable units are built in
+    // `_staging/<pid>` and published atomically, so no per-unit locks
+    // are held at the end. The build should succeed without `Held`.
     ws.cargo("build -Zbuild-analysis")
         .masquerade_as_nightly_cargo(&["build_analysis"])
-        .with_stderr_data(str![[r#"
-[UPDATING] git repository `[ROOTURL]/dep1`
-[LOCKING] 1 package to highest compatible version
-[COMPILING] dep1 v0.5.0 ([ROOTURL]/dep1#[..])
-[COMPILING] foo v0.5.0 ([ROOT]/foo)
-[FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
-        Held 1x shared [ROOT]/home/.cargo/build-cache/dep1/[HASH]/.rlib.lock
-     1x shared [ROOT]/home/.cargo/build-cache/dep1/[HASH]/.rmeta.lock
-
-"#]])
+        .with_stderr_does_not_contain("Held")
         .run();
 }
 
@@ -900,6 +894,7 @@ fn path_patched_dependent_not_cached() {
             .expect("cache root should exist")
             .flatten()
             .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|name| name != "_staging")
             .collect();
         names.sort();
         names

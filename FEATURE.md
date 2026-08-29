@@ -73,5 +73,5 @@ Every reuse prints `build cache: `pkg` target is fresh (hit $CARGO_HOME/build-ca
 ### Known limitations
 
 - No garbage collection. Git revision bumps and rustc upgrades leave old entries orphaned.
-- Crash-orphaned `_staging/<pid>` directories are not cleaned automatically. They are ignored and will be reused or overwritten when that PID is used again.
+- Crash-orphaned `_staging/<pid>` directories are wiped when a later cargo run reuses the same PID (`BuildCacheLayout::prepare` removes `_staging/<pid>` at startup, before any new staging is created).
 - Entries written by a buggy cargo can poison the cache. The fingerprint may be content-correct while the artifact references are not. Empty or incomplete poisoned entries are detected (`!has_out || !has_fp || !out_has_files`) and removed on the next publish retry. Otherwise a one-time wipe of `~/.cargo/build-cache` fixes it.

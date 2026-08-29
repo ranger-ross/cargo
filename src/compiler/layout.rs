@@ -572,7 +572,10 @@ pub struct BuildCacheLayout {
 impl BuildCacheLayout {
     pub fn prepare(&mut self) -> CargoResult<()> {
         paths::create_dir_all(&self.root)?;
-
+        // Wipe any orphaned staging directory for this PID left by a previous
+        // crash. This handles the case where cargo was killed before it could
+        // call cleanup_staging_pid.
+        let _ = std::fs::remove_dir_all(self.staging_pid_root());
         Ok(())
     }
     /// Fetch the fingerprint path.

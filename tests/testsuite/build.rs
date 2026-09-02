@@ -6870,8 +6870,8 @@ fn should_not_include_proc_macro_deps_paths_in_rustc_args() {
 [COMPILING] my-proc-macro v0.1.0 ([ROOT]/foo/my-proc-macro)
 [RUNNING] `rustc --crate-name my_proc_macro [..]`
 [COMPILING] foo v0.0.0 ([ROOT]/foo)
-[RUNNING] `rustc --crate-name foo [..] --out-dir [ROOT]/foo/target/debug/build/foo/[HASH]/out -L dependency=[ROOT]/foo/target/debug/build/my-proc-macro/[HASH]/out --extern my_proc_macro=[ROOT]/foo/target/debug/build/my-proc-macro/[HASH]/out/[..] --force-warn=unused_crate_dependencies`
 [FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
+[RUNNING] `rustc --crate-name foo --edition=2021 src/main.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat,unused-externs-silent --diagnostic-width=400 --crate-type bin --emit=dep-info,link -C embed-bitcode=no -C debuginfo=2 --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values())' -C metadata=9ce0a143e209e7e6 --out-dir [ROOT]/foo/target/debug/build/foo/[HASH]/out -L dependency=[ROOT]/foo/target/debug/deps --extern my_proc_macro=[ROOT]/foo/target/debug/build/my-proc-macro/[HASH]/out/libmy_proc_macro-[HASH].so --force-warn=unused_crate_dependencies`
 
 "#]].unordered())
         .run();

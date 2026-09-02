@@ -312,6 +312,39 @@ fn clean_specs(
                             TargetKind::Test | TargetKind::Bench => None,
                             _ => Some(artifact_dir.dest()),
                         };
+                        // Clean hardlinks in the virtual-deps directory (new layout).
+                        // The virtual-deps directory contains hardlinks to outputs
+                        // that were previously stored directly in `deps` in the
+                        // old layout.
+                        let virtual_deps = layout.build_dir().virtual_deps();
+                        for file_type in &file_types {
+                            let (prefix, suffix) = file_type.output_prefix_suffix(target);
+                            let unhashed_name = file_type.output_filename(target, None);
+                            let unhashed_unremap =
+                                format!("{unhashed_name}{}", trim_paths::UNREMAP_SUFFIX);
+                            dirs_to_clean.mark_utf(&virtual_deps, |filename| {
+                                (filename.starts_with(&prefix) && filename.ends_with(&suffix))
+                                    || unhashed_name == filename
+                                    || unhashed_unremap == filename
+                            });
+                        }
+                        let path_dash = format!("{}-", crate_name);
+                        let path_dot = format!("{}.", crate_name);
+                        let unhashed_dep_info = format!("{}.d", crate_name);
+                        dirs_to_clean
+                            .mark_utf(&virtual_deps, |filename| filename == unhashed_dep_info);
+                        dirs_to_clean.mark_utf(&virtual_deps, |filename| {
+                            if filename.starts_with(&path_dash) {
+                                filename.ends_with(".d")
+                                    || filename.ends_with(trim_paths::UNREMAP_SUFFIX)
+                            } else if filename.starts_with(&path_dot) {
+                                [".o", ".dwo", ".dwp"]
+                                    .iter()
+                                    .any(|suffix| filename.ends_with(suffix))
+                            } else {
+                                false
+                            }
+                        });
                         if let Some(uplift_dir) = uplift_dir {
                             for file_type in file_types {
                                 let uplifted_filename = file_type.uplift_filename(target);
@@ -332,8 +365,6 @@ fn clean_specs(
                                 });
                             }
                         }
-                        let path_dash = format!("{}-", crate_name);
-
                         dirs_to_clean.mark_utf(layout.build_dir().incremental(), |filename| {
                             filename.starts_with(&path_dash)
                         });
@@ -344,7 +375,6 @@ fn clean_specs(
     } else {
         for pkg in packages {
             clean_ctx.progress.on_cleaning_package(&pkg.name())?;
-
             // Clean fingerprints.
             for (_, layout) in &layouts_with_host {
                 dirs_to_clean.mark_utf(layout.build_dir().legacy_fingerprint(), |filename| {

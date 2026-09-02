@@ -743,6 +743,8 @@ fn cargo_clean_should_remove_correct_files() {
 [ROOT]/foo/build-dir/debug/build/foo/[HASH]/fingerprint/output-bin-foo
 [ROOT]/foo/build-dir/debug/build/foo/[HASH]/out/foo[..][EXE]
 [ROOT]/foo/build-dir/debug/build/foo/[HASH]/out/foo[..].d
+[ROOT]/foo/build-dir/debug/deps/libbar-[HASH].rlib
+[ROOT]/foo/build-dir/debug/deps/libbar-[HASH].rmeta
 
 "#]]);
 
@@ -1058,6 +1060,7 @@ fn template_workspace_path_hash_should_handle_symlink() {
 [ROOT]/foo/foo/[HASH]/build-dir/debug/build/foo/[HASH]/fingerprint/output-lib-foo
 [ROOT]/foo/foo/[HASH]/build-dir/debug/build/foo/[HASH]/out/foo-[HASH].d
 [ROOT]/foo/foo/[HASH]/build-dir/debug/build/foo/[HASH]/out/libfoo-[HASH].rmeta
+[ROOT]/foo/foo/[HASH]/build-dir/debug/deps/libfoo-[HASH].rmeta
 
 "#]]);
 
@@ -1094,6 +1097,7 @@ fn template_workspace_path_hash_should_handle_symlink() {
 [ROOT]/foo/foo/[HASH]/build-dir/debug/build/foo/[HASH]/fingerprint/output-lib-foo
 [ROOT]/foo/foo/[HASH]/build-dir/debug/build/foo/[HASH]/out/foo-[HASH].d
 [ROOT]/foo/foo/[HASH]/build-dir/debug/build/foo/[HASH]/out/libfoo-[HASH].rmeta
+[ROOT]/foo/foo/[HASH]/build-dir/debug/deps/libfoo-[HASH].rmeta
 
 "#]]);
 

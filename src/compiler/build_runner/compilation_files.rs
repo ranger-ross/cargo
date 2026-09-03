@@ -1,7 +1,7 @@
 //! See [`CompilationFiles`].
 
-use crate::util::data_structures::HashMap;
 use std::cell::OnceCell;
+use std::collections::HashSet;
 use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
@@ -12,6 +12,7 @@ use tracing::debug;
 use super::{BuildContext, BuildRunner, CompileKind, FileFlavor, Layout};
 use crate::compiler::trim_paths;
 use crate::compiler::{CompileMode, CompileTarget, CrateType, FileType, Unit};
+use crate::util::data_structures::HashMap;
 use crate::util::{self, CargoResult, OnceExt, StableHasher};
 use crate::workspace::{Target, TargetKind, Workspace};
 
@@ -39,6 +40,13 @@ impl fmt::Display for UnitHash {
 impl fmt::Debug for UnitHash {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "UnitHash({:016x})", self.0)
+    }
+}
+
+impl UnitHash {
+    /// Returns the raw hash value.
+    pub fn hash(&self) -> u64 {
+        self.0
     }
 }
 
@@ -126,6 +134,10 @@ pub struct CompilationFiles<'a, 'gctx> {
     pub(super) host: Layout,
     /// The target directory layout for the target (if different from then host).
     pub(super) target: HashMap<CompileTarget, Layout>,
+    /// Whether the cross-workspace build cache can be used for this build.
+    /// When false, units that would be cacheable are built in the workspace
+    /// instead.
+    cache_enabled: bool,
     /// Additional directory to include a copy of the outputs.
     export_dir: Option<PathBuf>,
     /// The root targets requested by the user on the command line (does not
@@ -136,6 +148,13 @@ pub struct CompilationFiles<'a, 'gctx> {
     metas: HashMap<Unit, Metadata>,
     /// For each Unit, a list all files produced.
     outputs: HashMap<Unit, OnceCell<Arc<Vec<OutputFile>>>>,
+    /// Units that depend on at least one path-sourced package. This is
+    /// most common when a registry crate has a `[patch]` that replaces a
+    /// dependency with a local path. That dependency is mutable workspace
+    /// state tracked by mtime, so the unit cannot use the build cache, which
+    /// only holds immutable entries. These units stay on the normal
+    /// mtime-based freshness path.
+    path_dep_units: HashSet<Unit>,
 }
 
 /// Info about a single file emitted by the compiler.
@@ -177,14 +196,46 @@ impl<'a, 'gctx: 'a> CompilationFiles<'a, 'gctx> {
             .cloned()
             .map(|unit| (unit, OnceCell::new()))
             .collect();
+        let cache_enabled = host.cache_enabled();
+        let mut path_dep_units: HashSet<Unit> = build_runner
+            .bcx
+            .unit_graph
+            .iter()
+            .filter(|(_unit, deps)| {
+                deps.iter()
+                    .any(|dep| dep.unit.pkg.package_id().source_id().is_path())
+            })
+            .map(|(unit, _deps)| unit.clone())
+            .collect();
+        // Propagate transitively: if a unit depends on a path-dependent unit,
+        // it must also be considered path-dependent, otherwise a registry crate
+        // A that depends on registry B (which is patched to local C) would be
+        // cached while its transitive input is mutable.
+        loop {
+            let mut added = Vec::new();
+            for (unit, deps) in build_runner.bcx.unit_graph.iter() {
+                if path_dep_units.contains(unit) {
+                    continue;
+                }
+                if deps.iter().any(|dep| path_dep_units.contains(&dep.unit)) {
+                    added.push(unit.clone());
+                }
+            }
+            if added.is_empty() {
+                break;
+            }
+            path_dep_units.extend(added);
+        }
         CompilationFiles {
             ws: build_runner.bcx.ws,
             host,
             target,
+            cache_enabled,
             export_dir: build_runner.bcx.build_config.export_dir.clone(),
             roots: build_runner.bcx.roots.clone(),
             metas,
             outputs,
+            path_dep_units,
         }
     }
 
@@ -245,20 +296,14 @@ impl<'a, 'gctx: 'a> CompilationFiles<'a, 'gctx> {
     ///
     /// Note that some units may share the same directory, so care should be
     /// taken in those cases!
-    fn pkg_dir(&self, unit: &Unit) -> String {
+    pub fn pkg_dir(&self, unit: &Unit) -> String {
         let separator = match self.ws.gctx().cli_unstable().build_dir_new_layout {
             true => "/",
             false => "-",
         };
         let name = unit.pkg.package_id().name();
         let hash = self.unit_hash(unit);
-        // This function can be somewhat hot, so try to not cause unnecessary allocations here.
-        // Sadly, format! does not currently pre-allocate the correct size.
-        let mut pkg = String::with_capacity(name.len() + separator.len() + hash.len());
-        pkg.push_str(&name);
-        pkg.push_str(&separator);
-        pkg.push_str(&hash);
-        pkg
+        format!("{name}{separator}{hash}")
     }
 
     /// The directory hash to use for a given unit
@@ -283,6 +328,15 @@ impl<'a, 'gctx: 'a> CompilationFiles<'a, 'gctx> {
     pub fn host_deps(&self, unit: &Unit) -> PathBuf {
         let dir = self.pkg_dir(unit);
         self.host.build_dir().deps(&dir)
+    }
+
+    /// Returns whether the unit should be built in the cross-workspace
+    /// build cache.
+    pub fn is_cacheable(&self, unit: &Unit) -> bool {
+        self.ws.gctx().cli_unstable().build_dir_new_layout
+            && self.cache_enabled
+            && unit.is_cacheable()
+            && !self.path_dep_units.contains(unit)
     }
 
     /// Returns the directories where Rust crate dependencies are found for the
@@ -312,16 +366,95 @@ impl<'a, 'gctx: 'a> CompilationFiles<'a, 'gctx> {
     /// The lock location for a given build unit.
     pub fn build_unit_lock(&self, unit: &Unit) -> PathBuf {
         let dir = self.pkg_dir(unit);
-        self.layout(unit.kind)
-            .build_dir()
-            .build_unit(&dir)
-            .join(".lock")
+        let unit_dir = self.layout(unit.kind).build_dir().build_unit(&dir);
+        unit_dir.join(".lock")
     }
 
     /// Directory where incremental output for the given unit should go.
-    pub fn incremental_dir(&self, unit: &Unit) -> &Path {
-        self.layout(unit.kind).build_dir().incremental()
+    ///
+    /// Incremental compilation is never enabled for cacheable (non-local)
+    /// units (`profile.incremental = false`), so this directory is inert for
+    /// them today. It must not be shared across workspaces via
+    /// `build-cache`, as incremental state embeds absolute paths and mtimes.
+    /// Always route to the per-workspace build-dir.
+    pub fn incremental_dir(&self, unit: &Unit) -> PathBuf {
+        // Do not use build-cache for incremental state, even for cacheable
+        // units. Cacheable units have incremental disabled, but if it were
+        // ever enabled sharing across workspaces would be unsound.
+        self.layout(unit.kind)
+            .build_dir()
+            .incremental()
+            .to_path_buf()
     }
+    /// Returns the host build cache layout.
+    pub fn build_cache(&self) -> &crate::compiler::layout::BuildCacheLayout {
+        self.host.build_cache()
+    }
+
+    /// Publish cacheable units built in this workspace into the CAS (`content` + `entries`).
+    /// Best-effort, ignores errors to avoid breaking the build on cache failures.
+    /// Only output artifacts (`out/`) are published; fingerprint files are not uploaded
+    /// and not included in the manifest.
+    pub fn publish_to_cas(
+        &self,
+        build_runner: &mut crate::compiler::build_runner::BuildRunner<'_, '_>,
+    ) -> CargoResult<()> {
+        // Collect units first to avoid borrow conflicts with `cache_completion_state` mut borrow.
+        let units: Vec<_> = build_runner
+            .bcx
+            .unit_graph
+            .keys()
+            .cloned()
+            .collect();
+        for unit in units {
+            if !self.is_cacheable(&unit) {
+                continue;
+            }
+            // Only publish if the unit was actually built (its fingerprint file exists and is non-empty).
+            let fp_path = self.fingerprint_file_path(&unit, "");
+            if !fp_path.exists() {
+                continue;
+            }
+            if let Ok(meta) = std::fs::metadata(&fp_path) {
+                if meta.len() == 0 {
+                    continue;
+                }
+            }
+            let out_dir = self.deps_dir(&unit);
+            // If out is empty, nothing to publish.
+            let has_out_files = std::fs::read_dir(&out_dir)
+                .map(|mut e| e.next().is_some())
+                .unwrap_or(false);
+            if !has_out_files {
+                continue;
+            }
+            // Compute expected fingerprint hash for manifest (content-based).
+            let fingerprint_hash = match crate::compiler::fingerprint::cache_completion_state(
+                build_runner, &unit,
+            ) {
+                Ok(state) => match state.expected_hash() {
+                    Ok(h) => h,
+                    Err(_) => continue,
+                },
+                Err(_) => continue,
+            };
+            let pkg_dir = self.pkg_dir(&unit);
+            let layout = self.layout(unit.kind);
+            let _ = layout.build_cache().publish_unit_to_cas(
+                &pkg_dir,
+                &out_dir,
+                &fingerprint_hash,
+            );
+        }
+        Ok(())
+    }
+    /// Cache build unit dir (`build-cache/<pkg>/<hash>`).
+    pub fn cache_build_unit(&self, unit: &Unit) -> PathBuf {
+        let dir = self.pkg_dir(unit);
+        self.layout(unit.kind).build_cache().build_unit(&dir)
+    }
+
+
 
     /// Directory where timing output should go.
     pub fn timings_dir(&self) -> Option<&Path> {
@@ -773,6 +906,20 @@ fn compute_metadata(
         .package_id()
         .stable_hash(ws_root)
         .hash(&mut shared_hasher);
+
+    // Git revisions are left out of `stable_hash` so cache folder names
+    // stay stable across revisions, but the build cache must include them in
+    // the unit's identity. Different revisions of the same git URL produce
+    // different artifacts and need different cache entries. Without this, two
+    // Cargo processes building different revisions at the same time would race
+    // on the same directory (see `concurrent::git_same_branch_different_revs`).
+    // Only mix this in when the new build-dir layout (which enables the cache)
+    // is active, so non-cache builds keep their existing hashes.
+    if bcx.ws.gctx().cli_unstable().build_dir_new_layout {
+        if let Some(precise) = unit.pkg.package_id().source_id().precise_git_fragment() {
+            precise.hash(&mut shared_hasher);
+        }
+    }
 
     // Also mix in enabled features to our metadata. This'll ensure that
     // when changing feature sets each lib is separately cached.

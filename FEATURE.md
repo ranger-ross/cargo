@@ -25,7 +25,7 @@ $CARGO_HOME/build-cache/
 
 Cacheable units are compiled directly in the workspace `build-dir` (e.g. `target/debug/build/$pkg/$hash/{out,fingerprint}`) so that pipelined builds and `rmeta`/`rlib` ordering work naturally. After the unit finishes, `CompilationFiles::publish_to_cas` hashes each output and fingerprint file with SHA-256, hardlinks (or copies on `EXDEV`) them into `content/<sha256>`, and atomically writes a manifest at `entries/$pkg/$hash` containing the expected fingerprint hash and the `rel -> sha256` map. `AlreadyExists` is treated as success (another process published first); empty or incomplete manifests are treated as poisoned and retried. No per-unit `_staging/<pid>` directory is used.
 
-On a cache hit, `BuildCacheLayout::restore_from_cas` is called during `fingerprint::prepare_init` before the job is enqueued: it hardlinks the manifest's files from `content` back into the workspace `build-dir` locations and `touch`es the manifest (throttled to once per day). The subsequent `rustc` invocation is then skipped via the `CacheCompletionState::is_complete` probe.
+On a cache hit nothing is copied or linked out of the cache: the `rustc` invocation is skipped via the `CacheCompletionState::is_complete` probe and dependents read the blobs in place. Stored names keep the `lib<stem>-<fingerprint>.<ext>` shape so direct deps load via explicit `--extern` and transitive deps resolve via `-L dependency=<content-dir>` discovery (which requires an rmeta/rlib pair of one build to share the exact stem).
 
 ### Freshness
 

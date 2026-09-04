@@ -1705,7 +1705,11 @@ fn normalize_cache_deps(
 fn dep_rmeta_checksum(build_runner: &BuildRunner<'_, '_>, unit: &Unit) -> CargoResult<String> {
     let outputs = build_runner.outputs(unit)?;
     if let Some(rmeta) = outputs.iter().find(|o| o.flavor == FileFlavor::Rmeta) {
-        let bytes = match std::fs::read(&rmeta.path) {
+        // Resolve through the cache: on hits the workspace out dir is empty
+        // (nothing is ever copied out of the cache), so the build-dir path
+        // would pin "missing" and every dependent would rebuild forever.
+        let path = resolve_dep_rmeta_path(build_runner, unit, &rmeta.path);
+        let bytes = match std::fs::read(&path) {
             Ok(bytes) => bytes,
             Err(_) => return Ok("missing".to_string()),
         };
@@ -1732,6 +1736,59 @@ fn collect_dep_rmeta_paths(
     Ok(paths)
 }
 
+/// Resolve a dependency's build-dir rmeta path to the bytes that identify
+/// it: the CAS content file when the dep is cacheable and already published,
+/// otherwise the build-dir path itself (which may not exist yet on a cold
+/// workspace — callers treat absence as "missing").
+///
+/// Shared by checksum pinning and dep-checksum refreshing so plan-time and
+/// persist-time identities agree; without this, hits (empty workspace out
+/// dirs) would pin "missing" and every dependent would rebuild forever.
+fn resolve_dep_rmeta_path(
+    build_runner: &BuildRunner<'_, '_>,
+    unit: &Unit,
+    rmeta_path: &Path,
+) -> PathBuf {
+    // For cacheable deps that are already published, point at the CAS content file.
+    // Otherwise use the build-dir rmeta (dirty deps built in this invocation).
+    if !rmeta_path.as_os_str().is_empty() && build_runner.files().is_cacheable(unit) {
+        let pkg_dir = build_runner.files().pkg_dir(unit);
+        let layout = build_runner.files().build_cache();
+        if let Ok(Some(manifest)) = layout.read_manifest(&pkg_dir) {
+            // Manifest keys are `out/<file>` or `fingerprint/<file>`.
+            // Derive `out/<basename>` from the output path.
+            let out_dir = build_runner.files().deps_dir(unit);
+            let rel_key = rmeta_path
+                .strip_prefix(&out_dir)
+                .map(|rel| format!("out/{}", rel.display()))
+                .unwrap_or_else(|_| {
+                    // Fallback: use filename only if strip fails (e.g., legacy layout).
+                    format!(
+                        "out/{}",
+                        rmeta_path.file_name().unwrap_or_default().to_string_lossy()
+                    )
+                });
+            if let Some(hash) = manifest.files.get(&rel_key) {
+                let content = layout.content_path(hash);
+                if content.exists() {
+                    return content;
+                }
+                return rmeta_path.to_path_buf();
+            }
+            // Some manifests may store rmeta under slightly different key; try any out/*.rmeta
+            for (k, h) in &manifest.files {
+                if k.ends_with(".rmeta") {
+                    let c = layout.content_path(h);
+                    if c.exists() {
+                        return c;
+                    }
+                }
+            }
+        }
+    }
+    rmeta_path.to_path_buf()
+}
+
 fn collect_dep_rmeta_paths_inner(
     build_runner: &BuildRunner<'_, '_>,
     fp: &Fingerprint,
@@ -1748,55 +1805,7 @@ fn collect_dep_rmeta_paths_inner(
             .find(|o| o.flavor == FileFlavor::Rmeta)
             .map(|o| o.path.clone())
             .unwrap_or_default();
-        // For cacheable deps that are already published, point at the CAS content file.
-        // Otherwise use the build-dir rmeta (dirty deps built in this invocation).
-        let final_path = if !rmeta_path.as_os_str().is_empty()
-            && build_runner.files().is_cacheable(unit)
-        {
-            let pkg_dir = build_runner.files().pkg_dir(unit);
-            let layout = build_runner.files().build_cache();
-            if let Ok(Some(manifest)) = layout.read_manifest(&pkg_dir) {
-                // Manifest keys are `out/<file>` or `fingerprint/<file>`.
-                // Derive `out/<basename>` from the output path.
-                let out_dir = build_runner.files().deps_dir(unit);
-                let rel_key = rmeta_path
-                    .strip_prefix(&out_dir)
-                    .map(|rel| format!("out/{}", rel.display()))
-                    .unwrap_or_else(|_| {
-                        // Fallback: use filename only if strip fails (e.g., legacy layout).
-                        format!(
-                            "out/{}",
-                            rmeta_path.file_name().unwrap_or_default().to_string_lossy()
-                        )
-                    });
-                if let Some(hash) = manifest.files.get(&rel_key) {
-                    let content = layout.content_path(hash);
-                    if content.exists() {
-                        content
-                    } else {
-                        rmeta_path.clone()
-                    }
-                } else {
-                    // Some manifests may store rmeta under slightly different key; try any out/*.rmeta
-                    let mut found = None;
-                    for (k, h) in &manifest.files {
-                        if k.ends_with(".rmeta") {
-                            let c = layout.content_path(h);
-                            if c.exists() {
-                                found = Some(c);
-                                break;
-                            }
-                        }
-                    }
-                    found.unwrap_or(rmeta_path.clone())
-                }
-            } else {
-                rmeta_path.clone()
-            }
-        } else {
-            rmeta_path.clone()
-        };
-        paths.push(final_path);
+        paths.push(resolve_dep_rmeta_path(build_runner, unit, &rmeta_path));
         collect_dep_rmeta_paths_inner(build_runner, &dep.fingerprint, index_to_unit, paths)?;
     }
     Ok(())
@@ -1885,16 +1894,35 @@ fn calculate(build_runner: &mut BuildRunner<'_, '_>, unit: &Unit) -> CargoResult
         &build_runner.cacheable_unit_indices,
     )?;
 
-    let fingerprint = if build_runner.files().is_cacheable(unit) {
+    let mut fingerprint = if build_runner.files().is_cacheable(unit) {
         // Cacheable units must have stable fingerprints across workspace
         // cleans: see `normalize_cache_fingerprint`. The normalized clone is
         // what gets persisted and what dependents embed, so a cache entry
         // built once matches every later freshness check of identical inputs.
-        let normalized = normalize_cache_fingerprint(build_runner, &fingerprint)?;
-        Arc::new(normalized)
+        normalize_cache_fingerprint(build_runner, &fingerprint)?
     } else {
-        Arc::new(fingerprint)
+        fingerprint
     };
+    // A cacheable unit with a complete CAS entry counts as
+    // filesystem-fresh even when local outputs are absent (clean target
+    // dir, or an entry built by another workspace). Dependents check this
+    // status — without it every non-cacheable parent would observe a stale
+    // dependency fingerprint and rebuild every session. The manifest (same
+    // check the exec-time probe performs) is authoritative here.
+    if build_runner.files().is_cacheable(unit) {
+        let cache = build_runner.files().build_cache();
+        let pkg_dir = build_runner.files().pkg_dir(unit);
+        if let Ok(Some(manifest)) = cache.read_manifest(&pkg_dir) {
+            if manifest.fingerprint_hash.trim() == util::to_hex(fingerprint.hash_u64()).trim()
+                && cache.manifest_content_exists(&manifest)
+            {
+                fingerprint.fs_status = FsStatus::UpToDate {
+                    mtimes: HashMap::default(),
+                };
+            }
+        }
+    }
+    let fingerprint = Arc::new(fingerprint);
     build_runner
         .fingerprints
         .insert(unit.clone(), Arc::clone(&fingerprint));
@@ -2388,7 +2416,7 @@ pub(crate) struct CacheCompletionState {
     /// For cacheable units, the pkg_dir string used to locate the manifest.
     pub(crate) manifest_pkg_dir: Option<String>,
     /// For cacheable units, the layout to locate manifest/content.
-    pub(crate) build_cache_layout: Option<crate::compiler::layout::BuildCacheLayout>,
+    pub(crate) build_cache_layout: Option<crate::compiler::cache::BuildCache>,
 }
 impl CacheCompletionState {
     /// Returns the hex hash a complete cache entry must match.

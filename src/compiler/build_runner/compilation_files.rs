@@ -332,10 +332,41 @@ impl<'a, 'gctx: 'a> CompilationFiles<'a, 'gctx> {
 
     /// Returns whether the unit should be built in the cross-workspace
     /// build cache.
+    ///
+    /// Only units with immutable inputs and outputs shared across workspaces
+    /// can be cached:
+    ///
+    /// - Local (path) packages can change between builds, so they are never
+    ///   cached.
+    /// - Packages with build scripts are excluded. Their library is compiled
+    ///   with workspace-local `$OUT_DIR` content and env vars baked in, so a
+    ///   cached artifact would not work in another workspace.
+    /// - Build script units are excluded (they run in the workspace).
+    /// - Bins, tests, benches, and examples are excluded. Bins link against
+    ///   workspace-local state. Test/bench units are rejected by the mode
+    ///   checks below; there is no explicit example-target check, but example
+    ///   units are always workspace-local, so `!unit.is_local()` excludes them.
+    /// - Doc units are excluded because rustdoc writes to the workspace `doc/`
+    ///   directory.
+    /// - Artifact dependencies are excluded because their outputs go through a
+    ///   separate `artifact/<kind>` directory.
+    /// - Units that depend on a path-sourced package (often a registry crate
+    ///   with a `[patch]` that points to a local path) are excluded. The
+    ///   patched dependency is mutable workspace state, so the dependent must
+    ///   use normal mtime-based freshness instead of an immutable cache entry.
+    /// - The cache is only used when the new build-dir layout is active and
+    ///   the shared cache is writable.
     pub fn is_cacheable(&self, unit: &Unit) -> bool {
         self.ws.gctx().cli_unstable().build_dir_new_layout
             && self.cache_enabled
-            && unit.is_cacheable()
+            && !unit.is_local()
+            && !unit.pkg.has_custom_build()
+            && !unit.target.is_custom_build()
+            && !unit.target.is_bin()
+            && !unit.mode.is_doc()
+            && !unit.mode.is_doc_scrape()
+            && !unit.mode.is_any_test()
+            && !unit.artifact.is_true()
             && !self.path_dep_units.contains(unit)
     }
 

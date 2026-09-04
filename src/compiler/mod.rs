@@ -1866,7 +1866,7 @@ fn add_dep_arg<'a, 'b: 'a>(
         //       The issue is that for the first build, the artifacts are not in the yet.
         //       This can be solved by 1) hardlinking rmeta before calling rmeta_produced, and 2)
         //       hardlinking rlib before the build unit completes.
-        // if dep.unit.is_cacheable() {
+        // if build_runner.files().is_cacheable(&dep.unit) {
         //     continue;
         // }
         let dep_dir = build_runner.files().deps_dir(&dep.unit);

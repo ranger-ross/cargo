@@ -1981,10 +1981,7 @@ fn calculate_normal(
         // use a content-based `Precalculated` fingerprint.
         let local = if build_runner.files().is_cacheable(unit) {
             let fp = pkg_fingerprint(build_runner.bcx, &unit.pkg).with_context(|| {
-                format!(
-                    "failed to determine package fingerprint for {}",
-                    unit.pkg
-                )
+                format!("failed to determine package fingerprint for {}", unit.pkg)
             })?;
             vec![LocalFingerprint::Precalculated(fp)]
         } else {
@@ -2153,7 +2150,7 @@ See https://doc.rust-lang.org/cargo/reference/build-scripts.html#rerun-if-change
         // Create Vec since mutable build_runner is needed in closure.
         let deps = Vec::from(build_runner.unit_deps(unit));
         deps.into_iter()
-                // Include cacheable dependencies so an identity change
+            // Include cacheable dependencies so an identity change
             // (for example a new git revision) reruns the build script.
             .map(|dep| DepFingerprint::new(build_runner, unit, &dep))
             .collect::<CargoResult<Vec<_>>>()?
@@ -2464,7 +2461,8 @@ impl CacheCompletionState {
             }
             return Ok(false);
         }
-        let stored = cargo_util::paths::read(fingerprint_path).unwrap_or_else(|_| "MISSING".to_string());
+        let stored =
+            cargo_util::paths::read(fingerprint_path).unwrap_or_else(|_| "MISSING".to_string());
         let expected = self.expected_hash()?;
         Ok(stored.trim() == expected.trim() && self.fs_up_to_date)
     }
@@ -2476,34 +2474,35 @@ pub(crate) fn cache_completion_state(
 ) -> CargoResult<CacheCompletionState> {
     let fingerprint = calculate(build_runner, unit)?;
     let rmeta_paths = collect_dep_rmeta_paths(build_runner, &fingerprint)?;
-    let (fs_up_to_date, manifest_pkg_dir, build_cache_layout) = if build_runner.files().is_cacheable(unit) {
-        let pkg_dir = build_runner.files().pkg_dir(unit);
-        let layout = build_runner.files().build_cache().clone();
-        // Check manifest existence and content completeness + hash match.
-        let mut up_to_date = false;
-        if let Ok(Some(manifest)) = layout.read_manifest(&pkg_dir) {
-            if layout.manifest_content_exists(&manifest) {
-                // Also need to check fingerprint hash matches expected (with refreshed checksums).
-                // Do a provisional check: compute expected hash and compare.
-                let tmp_fp = fingerprint.deep_clone();
-                let tmp_state = CacheCompletionState {
-                    fingerprint: std::sync::Mutex::new(tmp_fp),
-                    rmeta_paths: rmeta_paths.clone(),
-                    fs_up_to_date: true,
-                    manifest_pkg_dir: None,
-                    build_cache_layout: None,
-                };
-                if let Ok(expected) = tmp_state.expected_hash() {
-                    if manifest.fingerprint_hash.trim() == expected.trim() {
-                        up_to_date = true;
+    let (fs_up_to_date, manifest_pkg_dir, build_cache_layout) =
+        if build_runner.files().is_cacheable(unit) {
+            let pkg_dir = build_runner.files().pkg_dir(unit);
+            let layout = build_runner.files().build_cache().clone();
+            // Check manifest existence and content completeness + hash match.
+            let mut up_to_date = false;
+            if let Ok(Some(manifest)) = layout.read_manifest(&pkg_dir) {
+                if layout.manifest_content_exists(&manifest) {
+                    // Also need to check fingerprint hash matches expected (with refreshed checksums).
+                    // Do a provisional check: compute expected hash and compare.
+                    let tmp_fp = fingerprint.deep_clone();
+                    let tmp_state = CacheCompletionState {
+                        fingerprint: std::sync::Mutex::new(tmp_fp),
+                        rmeta_paths: rmeta_paths.clone(),
+                        fs_up_to_date: true,
+                        manifest_pkg_dir: None,
+                        build_cache_layout: None,
+                    };
+                    if let Ok(expected) = tmp_state.expected_hash() {
+                        if manifest.fingerprint_hash.trim() == expected.trim() {
+                            up_to_date = true;
+                        }
                     }
                 }
             }
-        }
-        (up_to_date, Some(pkg_dir), Some(layout))
-    } else {
-        (fingerprint.fs_status.up_to_date(), None, None)
-    };
+            (up_to_date, Some(pkg_dir), Some(layout))
+        } else {
+            (fingerprint.fs_status.up_to_date(), None, None)
+        };
     Ok(CacheCompletionState {
         fingerprint: std::sync::Mutex::new(fingerprint.deep_clone()),
         rmeta_paths,
@@ -2535,7 +2534,6 @@ fn compare_old_fingerprint(
     mtime_on_use: bool,
     forced: bool,
 ) -> FingerprintComparison {
-
     if mtime_on_use {
         // update the mtime so other cleaners know we used it
         let t = FileTime::from_system_time(SystemTime::now());

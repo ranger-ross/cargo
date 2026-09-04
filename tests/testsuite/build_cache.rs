@@ -489,13 +489,11 @@ fn cache_entry_reused_after_workspace_clean() {
                 && p.file_name().is_some_and(|n| n != "manifest.json")
                 && !p.components().any(|c| c.as_os_str() == "entries")
         })
-        .eq(entry_before
-            .into_iter()
-            .filter(|(p, _)| {
-                !p.components().any(|c| c.as_os_str() == "fingerprint")
-                    && p.file_name().is_some_and(|n| n != "manifest.json")
-                    && !p.components().any(|c| c.as_os_str() == "entries")
-            }));
+        .eq(entry_before.into_iter().filter(|(p, _)| {
+            !p.components().any(|c| c.as_os_str() == "fingerprint")
+                && p.file_name().is_some_and(|n| n != "manifest.json")
+                && !p.components().any(|c| c.as_os_str() == "entries")
+        }));
     // With CAS, entries/manifest mtime may be bumped, so we only require content stability.
     // The `mid is fresh` check above already ensures the cache was reused.
     let _ = artifacts_unchanged;

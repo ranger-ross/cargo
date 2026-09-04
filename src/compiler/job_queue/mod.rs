@@ -994,7 +994,7 @@ impl<'gctx> DrainState<'gctx> {
         let rmeta_required = build_runner.rmeta_required(unit);
         let lock_manager = build_runner.lock_manager.clone();
         let warning_handling = build_runner.bcx.gctx.warning_handling().unwrap_or_default();
-        let cache = if unit.is_cacheable() {
+        let cache = if build_runner.files().is_cacheable(unit) {
             Some(build_runner.files().build_cache().clone())
         } else {
             None

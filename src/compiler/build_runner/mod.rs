@@ -211,22 +211,9 @@ impl<'a, 'gctx> BuildRunner<'a, 'gctx> {
         }
 
         // Now that we've figured out everything that we're going to do, do it!
-        // Ensure CAS publish even if execution fails? Publish only on success for atomicity.
+        // Cacheable units publish themselves into the CAS from per-unit
+        // `finalize_cache_entry` finalization as they complete.
         let queue_result = queue.execute(&mut self);
-        // Publish cacheable units built in this workspace into the CAS
-        // (`build-cache/content` + `entries`). Best-effort, ignore errors to avoid
-        // breaking the build. This runs after queue execution so that all
-        // dependencies are already built and rmeta checksums can be refreshed.
-        if queue_result.is_ok() {
-            if self.files.is_some() {
-                // SAFETY: `files` lives inside `self` and we keep `self.files` as `Some`
-                // for the duration of `publish_to_cas`. The raw pointer avoids the
-                // borrow-checker conflict of borrowing `self.files` immutably while
-                // also borrowing `self` mutably for fingerprint calculation.
-                let files_ptr = self.files.as_ref().unwrap() as *const CompilationFiles<'_, '_>;
-                let _ = unsafe { &*files_ptr }.publish_to_cas(&mut self);
-            }
-        }
         queue_result?;
         // Add `OUT_DIR` to env vars if unit has a build script.
         let units_with_build_script = &self

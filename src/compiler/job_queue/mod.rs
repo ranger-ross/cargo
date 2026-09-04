@@ -994,7 +994,11 @@ impl<'gctx> DrainState<'gctx> {
         let rmeta_required = build_runner.rmeta_required(unit);
         let lock_manager = build_runner.lock_manager.clone();
         let warning_handling = build_runner.bcx.gctx.warning_handling().unwrap_or_default();
-
+        let cache = if unit.is_cacheable() {
+            Some(build_runner.files().build_cache().clone())
+        } else {
+            None
+        };
         let doit = move |diag_dedupe| {
             let state = JobState::new(
                 id,
@@ -1003,6 +1007,7 @@ impl<'gctx> DrainState<'gctx> {
                 rmeta_required,
                 lock_manager,
                 warning_handling,
+                cache,
             );
             state.run_to_finish(job);
         };

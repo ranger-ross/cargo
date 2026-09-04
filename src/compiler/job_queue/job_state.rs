@@ -1,9 +1,13 @@
 //! See [`JobState`].
 
+use std::cell::RefCell;
+use std::path::{Path, PathBuf};
 use std::{cell::Cell, marker, sync::Arc};
 
 use cargo_util::ProcessBuilder;
 
+use crate::compiler::cache::BuildCache;
+use crate::compiler::fingerprint::CacheCompletionState;
 use crate::compiler::future_incompat::FutureBreakageItem;
 use crate::compiler::locking::LockKey;
 use crate::compiler::timings::SectionTiming;
@@ -53,6 +57,10 @@ pub struct JobState<'a, 'gctx> {
     /// Manages locks for build units when fine grain locking is enabled.
     lock_manager: Arc<LockManager>,
 
+    // None if its not cacheable
+    cache: Option<BuildCache>,
+    rmeta_cache_path: RefCell<Option<PathBuf>>,
+
     warning_handling: WarningHandling,
 
     // Historical versions of Cargo made use of the `'a` argument here, so to
@@ -68,6 +76,7 @@ impl<'a, 'gctx> JobState<'a, 'gctx> {
         rmeta_required: bool,
         lock_manager: Arc<LockManager>,
         warning_handling: WarningHandling,
+        cache: Option<BuildCache>,
     ) -> Self {
         Self {
             id,
@@ -76,6 +85,8 @@ impl<'a, 'gctx> JobState<'a, 'gctx> {
             rmeta_required: Cell::new(rmeta_required),
             lock_manager,
             warning_handling,
+            cache,
+            rmeta_cache_path: RefCell::new(None),
             _marker: marker::PhantomData,
         }
     }
@@ -149,10 +160,46 @@ impl<'a, 'gctx> JobState<'a, 'gctx> {
     /// builds when required, and can be called at any time before a job ends.
     /// This should only be called once because a metadata file can only be
     /// produced once!
-    pub fn rmeta_produced(&self) {
+    pub fn rmeta_produced(&self, path: &Path) {
+        if let Some(cache) = &self.cache {
+            let cache_path = cache.insert_rmeta(path).unwrap();
+            self.rmeta_cache_path.replace(Some(cache_path));
+        }
         self.rmeta_required.set(false);
         self.messages
             .push(Message::Finish(self.id, Artifact::Metadata, Ok(())));
+    }
+
+    /// Publish this job's unit into the CAS once its compile succeeded.
+    ///
+    /// Runs as `job.after` finalization, chained behind the compile and
+    /// fingerprint-write work via `Work::then`, which short-circuits: a
+    /// failed compile never reaches here, so the published bytes are always
+    /// the ones the just-persisted fingerprint describes. Still best-effort:
+    /// callers ignore the result so cache failures never fail the build.
+    /// A missing rmeta means nothing was built (belt-and-braces); a linkable
+    /// that was resolved but never materialized (e.g. failed codegen that
+    /// somehow still produced an rmeta) skips the whole publish — a partial
+    /// entry is worse than none, since dependents would miss the sibling.
+    pub fn finalize_cache_entry(
+        &self,
+        rmeta_src: &Path,
+        linkable_src: Option<&Path>,
+        completion: &CacheCompletionState,
+    ) -> CargoResult<()> {
+        if !rmeta_src.is_file() {
+            return Ok(());
+        }
+        if linkable_src.is_some_and(|p| !p.is_file()) {
+            return Ok(());
+        }
+        if let Some(cache) = &self.cache {
+            if let Some(pkg_dir) = completion.manifest_pkg_dir.as_deref() {
+                let fingerprint_hash = completion.expected_hash()?;
+                cache.publish_unit_to_cas(pkg_dir, &fingerprint_hash, rmeta_src, linkable_src)?;
+            }
+        }
+        Ok(())
     }
 
     pub fn lock_exclusive(&self, lock: &LockKey) -> CargoResult<()> {

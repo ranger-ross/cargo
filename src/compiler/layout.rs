@@ -208,10 +208,10 @@
 //! `target/$TUPLE`.
 
 use crate::compiler::CompileTarget;
+use crate::compiler::cache::BuildCache;
 use crate::util::flock::is_on_nfs_mount;
 use crate::util::{CargoResult, FileLock};
 use crate::workspace::Workspace;
-use anyhow::Context as _;
 use cargo_util::paths;
 use std::path::{Path, PathBuf};
 
@@ -221,7 +221,7 @@ use std::path::{Path, PathBuf};
 pub struct Layout {
     artifact_dir: Option<ArtifactDirLayout>,
     build_dir: BuildDirLayout,
-    build_cache: BuildCacheLayout,
+    build_cache: BuildCache,
     /// Whether the build cache can be used for this build. False when
     /// `$CARGO_HOME/build-cache` cannot be written (for example a read-only
     /// `CARGO_HOME`). Cacheable units then fall back to the workspace build
@@ -360,9 +360,7 @@ impl Layout {
                 _lock: build_dir_lock,
                 is_new_layout,
             },
-            build_cache: BuildCacheLayout {
-                root: build_cache_root,
-            },
+            build_cache: BuildCache::new(build_cache_root),
             cache_enabled,
             _lock: lock,
         })
@@ -386,7 +384,7 @@ impl Layout {
         &self.build_dir
     }
 
-    pub fn build_cache(&self) -> &BuildCacheLayout {
+    pub fn build_cache(&self) -> &BuildCache {
         &self.build_cache
     }
 
@@ -555,25 +553,17 @@ impl BuildDirLayout {
         Ok(&self.tmp)
     }
 }
+
 #[derive(Clone, Debug)]
 pub struct BuildCacheLayout {
     root: PathBuf,
 }
 
-/// Manifest stored at `entries/<pkg>/<hash>` describing content-addressed files.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct CacheEntryManifest {
-    pub version: u32,
-    pub fingerprint_hash: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub created: Option<String>,
-    /// Map from relative path (`out/foo.rlib`) to content sha256 hex.
-    /// Only output artifacts are stored; fingerprint files live in the workspace
-    /// build-dir and are not deduplicated into `content`.
-    pub files: std::collections::BTreeMap<String, String>,
-}
-
 impl BuildCacheLayout {
+    pub fn new(root: PathBuf) -> Self {
+        Self { root }
+    }
+
     pub fn prepare(&mut self) -> CargoResult<()> {
         paths::create_dir_all(&self.root)?;
         // Ensure CAS directories exist.
@@ -581,320 +571,25 @@ impl BuildCacheLayout {
         let _ = paths::create_dir_all(self.entries_dir());
         Ok(())
     }
-    /// Fetch the fingerprint path.
-    pub fn fingerprint(&self, pkg_dir: &str) -> PathBuf {
-        self.build_unit(pkg_dir).join("fingerprint")
-    }
-    /// Fetch the output path for build units.
-    pub fn out(&self, pkg_dir: &str) -> PathBuf {
-        self.build_unit(pkg_dir).join("out")
-    }
     /// Fetch the build unit path
     pub fn build_unit(&self, pkg_dir: &str) -> PathBuf {
         self.root.join(pkg_dir)
     }
-    // --- Content-addressable cache (CAS) helpers ---
-
-    /// Directory holding content-addressed blobs: `<build-cache>/content/<sha256>`.
+    /// Directory holding content-addressed blobs:
+    /// `<build-cache>/content/lib<stem>-<fingerprint>[.<ext>]`.
     pub fn content_dir(&self) -> PathBuf {
         self.root.join("content")
     }
-
     /// Directory holding manifests: `<build-cache>/entries`.
     pub fn entries_dir(&self) -> PathBuf {
         self.root.join("entries")
     }
-
     /// Manifest file for a unit: `entries/<pkg>/<hash>`.
     pub fn entry_manifest_path(&self, pkg_dir: &str) -> PathBuf {
         self.entries_dir().join(pkg_dir)
     }
-
-    /// Content file path for a hash.
+    /// Content file path for a stored name (`lib<stem>-<hash>[.<ext>]`).
     pub fn content_path(&self, hash: &str) -> PathBuf {
         self.content_dir().join(hash)
     }
-
-    /// Hash file at `path` with sha256 hex.
-    pub fn hash_file(path: &Path) -> CargoResult<String> {
-        let mut hasher = cargo_util::Sha256::new();
-        hasher
-            .update_path(path)
-            .with_context(|| format!("failed to hash `{}`", path.display()))?;
-        Ok(hasher.finish_hex())
-    }
-
-    /// Insert `src` into the content store, returning its hex hash.
-    /// Uses hardlink when possible, copies on cross-device, dedupes on `AlreadyExists`.
-    pub fn insert_into_content(&self, src: &Path) -> CargoResult<String> {
-        let hash = Self::hash_file(src)?;
-        let dst = self.content_path(&hash);
-        if dst.exists() {
-            return Ok(hash);
-        }
-        paths::create_dir_all(self.content_dir())?;
-        // Try hardlink first.
-        match std::fs::hard_link(src, &dst) {
-            Ok(()) => return Ok(hash),
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Ok(hash),
-            Err(e) if e.raw_os_error() == Some(17) => return Ok(hash),
-            Err(e) if e.raw_os_error() == Some(18) => {
-                // EXDEV: cross-device, copy via temp + rename.
-            }
-            Err(_) => {
-                // Fall through to copy; hardlink may fail for other reasons.
-            }
-        }
-        // Copy via temp file and atomic rename to avoid partial writes.
-        let tmp = self.content_dir().join(format!(".tmp-{}-{}", hash, std::process::id()));
-        std::fs::copy(src, &tmp).with_context(|| {
-            format!("failed to copy `{}` to content tmp", src.display())
-        })?;
-        match std::fs::rename(&tmp, &dst) {
-            Ok(()) => Ok(hash),
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                let _ = std::fs::remove_file(&tmp);
-                Ok(hash)
-            }
-            Err(e) if e.raw_os_error() == Some(17) => {
-                let _ = std::fs::remove_file(&tmp);
-                Ok(hash)
-            }
-            Err(e) => {
-                let _ = std::fs::remove_file(&tmp);
-                Err(e.into())
-            }
-        }
-    }
-
-    /// Atomically write a manifest at `entries/<pkg>/<hash>`.
-    pub fn write_manifest_atomic(
-        &self,
-        pkg_dir: &str,
-        manifest: &CacheEntryManifest,
-    ) -> CargoResult<()> {
-        let dst = self.entry_manifest_path(pkg_dir);
-        if let Some(parent) = dst.parent() {
-            paths::create_dir_all(parent)?;
-        }
-        let json = serde_json::to_string_pretty(manifest).context("failed to serialize manifest")?;
-        // Write to temp in same dir then rename for atomicity.
-        let tmp = dst.with_extension(format!("tmp-{}", std::process::id()));
-        paths::write(&tmp, json.as_bytes())?;
-        match std::fs::rename(&tmp, &dst) {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                // Another writer won; if fingerprints match, success, else keep existing.
-                let _ = std::fs::remove_file(&tmp);
-                Ok(())
-            }
-            Err(e) => Err(e.into()),
-        }
-    }
-
-    /// Read manifest at `entries/<pkg>/<hash>`, if present.
-    pub fn read_manifest(&self, pkg_dir: &str) -> CargoResult<Option<CacheEntryManifest>> {
-        let path = self.entry_manifest_path(pkg_dir);
-        if !path.exists() {
-            return Ok(None);
-        }
-        let bytes = paths::read_bytes(&path)?;
-        let m: CacheEntryManifest =
-            serde_json::from_slice(&bytes).context("failed to parse cache manifest")?;
-        Ok(Some(m))
-    }
-
-    /// Whether a manifest's content files all exist.
-    pub fn manifest_content_exists(&self, manifest: &CacheEntryManifest) -> bool {
-        manifest
-            .files
-            .values()
-            .all(|h| self.content_path(h).exists())
-    }
-
-    /// Touch manifest mtime to mark use (best-effort). Throttled to once per day to avoid SSD churn.
-    pub fn touch_manifest(&self, pkg_dir: &str) {
-        let path = self.entry_manifest_path(pkg_dir);
-        if let Ok(meta) = std::fs::metadata(&path) {
-            if let Ok(mtime) = meta.modified() {
-                if let Ok(elapsed) = std::time::SystemTime::now().duration_since(mtime) {
-                    if elapsed.as_secs() < 24 * 60 * 60 {
-                        return;
-                    }
-                }
-            }
-        }
-        let now = filetime::FileTime::now();
-        let _ = filetime::set_file_mtime(&path, now);
-    }
-
-    /// Publish a built unit from `build_dir` into CAS.
-    /// `build_unit_out` is `build-dir/.../build/$pkg/$hash/out`.
-    /// `fingerprint_hash` is the expected fingerprint hex to store in manifest.
-    pub fn publish_unit_to_cas(
-        &self,
-        pkg_dir: &str,
-        build_out: &Path,
-        fingerprint_hash: &str,
-    ) -> CargoResult<()> {
-        let mut files = std::collections::BTreeMap::new();
-        // Collect out files. Fingerprint files are intentionally not published:
-        // they are workspace-local build state, not needed for cache reuse. The
-        // manifest's `fingerprint_hash` is the authoritative identity check.
-        if build_out.exists() {
-            for entry in std::fs::read_dir(build_out)? {
-                let entry = entry?;
-                let src = entry.path();
-                if src.is_file() {
-                    let hash = self.insert_into_content(&src)?;
-                    let rel = format!("out/{}", entry.file_name().to_string_lossy());
-                    files.insert(rel, hash);
-                }
-            }
-        }
-        if files.is_empty() {
-            return Ok(());
-        }
-        let manifest = CacheEntryManifest {
-            version: 1,
-            fingerprint_hash: fingerprint_hash.to_string(),
-            created: Some(
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs()
-                    .to_string(),
-            ),
-            files,
-        };
-        // If manifest already exists with same fingerprint_hash, skip.
-        if let Ok(Some(existing)) = self.read_manifest(pkg_dir) {
-            if existing.fingerprint_hash == manifest.fingerprint_hash
-                && self.manifest_content_exists(&existing)
-            {
-                self.touch_manifest(pkg_dir);
-                return Ok(());
-            }
-        }
-        self.write_manifest_atomic(pkg_dir, &manifest)
-    }
-
-    /// Restore (hardlink) a cached entry's files into `build_dir` locations for reuse in current build.
-    /// `build_out` is the destination dir to populate from content. Only `out/` entries exist
-    /// in the manifest; fingerprint files are not restored.
-    pub fn restore_from_cas(
-        &self,
-        pkg_dir: &str,
-        build_out: &Path,
-    ) -> CargoResult<bool> {
-        let Some(manifest) = self.read_manifest(pkg_dir)? else {
-            return Ok(false);
-        };
-        if !self.manifest_content_exists(&manifest) {
-            return Ok(false);
-        }
-        for (rel, hash) in &manifest.files {
-            let content = self.content_path(hash);
-            let dst = if let Some(rest) = rel.strip_prefix("out/") {
-                build_out.join(rest)
-            } else {
-                continue;
-            };
-            if let Some(parent) = dst.parent() {
-                paths::create_dir_all(parent)?;
-            }
-            if dst.exists() {
-                continue;
-            }
-            match std::fs::hard_link(&content, &dst) {
-                Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-                Err(e) if e.raw_os_error() == Some(17) => {}
-                Err(e) if e.raw_os_error() == Some(18) => {
-                    std::fs::copy(&content, &dst)?;
-                }
-                Err(_) => {
-                    let _ = std::fs::copy(&content, &dst);
-                }
-            }
-        }
-        self.touch_manifest(pkg_dir);
-        Ok(true)
-    }
-
-    /// GC helper: remove manifests older than `max_age` and then unreferenced content.
-    pub fn gc(&self, max_age: std::time::Duration) -> CargoResult<(usize, usize)> {
-        let cutoff = std::time::SystemTime::now()
-            .checked_sub(max_age)
-            .unwrap_or(std::time::UNIX_EPOCH);
-        let mut removed_manifests = 0usize;
-        let entries_root = self.entries_dir();
-        if entries_root.exists() {
-            for pkg_entry in std::fs::read_dir(&entries_root)?.flatten() {
-                let pkg_path = pkg_entry.path();
-                if !pkg_path.is_dir() {
-                    continue;
-                }
-                for entry in std::fs::read_dir(&pkg_path)?.flatten() {
-                    let path = entry.path();
-                    if !path.is_file() {
-                        continue;
-                    }
-                    if let Ok(meta) = std::fs::metadata(&path) {
-                        if let Ok(mtime) = meta.modified() {
-                            if mtime < cutoff {
-                                let _ = std::fs::remove_file(&path);
-                                removed_manifests += 1;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        // Collect referenced hashes.
-        let mut referenced = std::collections::HashSet::new();
-        if entries_root.exists() {
-            for pkg_entry in std::fs::read_dir(&entries_root)?.flatten() {
-                let pkg_path = pkg_entry.path();
-                if !pkg_path.is_dir() {
-                    continue;
-                }
-                for entry in std::fs::read_dir(&pkg_path)?.flatten() {
-                    let path = entry.path();
-                    if !path.is_file() {
-                        continue;
-                    }
-                    if let Ok(bytes) = std::fs::read(&path) {
-                        if let Ok(m) =
-                            serde_json::from_slice::<CacheEntryManifest>(&bytes)
-                        {
-                            referenced.extend(m.files.values().cloned());
-                        }
-                    }
-                }
-            }
-        }
-        let mut removed_content = 0usize;
-        let content_root = self.content_dir();
-        if content_root.exists() {
-            for entry in std::fs::read_dir(&content_root)?.flatten() {
-                let p = entry.path();
-                if !p.is_file() {
-                    continue;
-                }
-                if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
-                    if name.starts_with(".tmp-") {
-                        continue;
-                    }
-                    if !referenced.contains(name) {
-                        let _ = std::fs::remove_file(&p);
-                        removed_content += 1;
-                    }
-                }
-            }
-        }
-        Ok((removed_manifests, removed_content))
-    }
-
-
 }

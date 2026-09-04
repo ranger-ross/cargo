@@ -1,8 +1,8 @@
 //! Tests for the cross-workspace build cache (`$CARGO_HOME/build-cache`).
 //!
 //! Cacheable build units (immutable non-local packages without build scripts)
-//! are compiled into `$CARGO_HOME/build-cache/content/<sha256>` and
-//! `$CARGO_HOME/build-cache/entries/<pkg>/<hash>` and shared across workspaces.
+//! are compiled into `$CARGO_HOME/build-cache/content/lib<stem>-<fingerprint>[.<ext>]`
+//! and `$CARGO_HOME/build-cache/entries/<pkg>/<hash>` and shared across workspaces.
 //! See `cargo::compiler::cache` and `DEV_LOG.md`.
 
 use std::path::{Path, PathBuf};
@@ -39,8 +39,9 @@ fn collect_files(root: &Path) -> Vec<PathBuf> {
 }
 
 /// Returns the paths of all `.rlib` files in the build cache (via CAS content).
-/// With the content-addressable layout, rlibs are stored as `content/<sha256>` blobs
-/// referenced by `entries/<pkg>/<hash>` manifests. We resolve rlib count via manifests.
+/// With the content-addressable layout, rlibs are stored as
+/// `content/lib<stem>-<sha256>.rlib` blobs referenced by
+/// `entries/<pkg>/<hash>` manifests. We resolve rlib count via manifests.
 fn cached_rlibs() -> Vec<PathBuf> {
     let mut out = Vec::new();
     let entries_root = build_cache_root().join("entries");
@@ -206,6 +207,171 @@ hello world
 hello world
 
 "#]])
+        .run();
+}
+
+#[cargo_test]
+fn cached_artifacts_keep_rustc_loadable_names() {
+    // rustc only accepts `--extern` paths shaped `lib*.<rlib|rmeta|so|...>`
+    // and rejects anything else (`E0463: can't find crate`); transitive deps
+    // are resolved by `-L` directory search, which requires an rmeta/rlib
+    // pair of one build to share the exact filename stem. Nothing is ever
+    // copied or linked out of the cache.
+    let git_project = git::new("dep1", |project| {
+        project
+            .file("Cargo.toml", &basic_lib_manifest("dep1"))
+            .file(
+                "src/lib.rs",
+                r#"pub fn hello() -> &'static str { "hello world" }"#,
+            )
+    });
+
+    let ws = project()
+        .file(
+            "Cargo.toml",
+            &format!(
+                r#"
+                    [package]
+                    name = "foo"
+                    version = "0.5.0"
+                    edition = "2015"
+
+                    [dependencies.dep1]
+                    git = '{}'
+                "#,
+                git_project.url()
+            ),
+        )
+        .file(
+            "src/main.rs",
+            &main_file(r#""{}", dep1::hello()"#, &["dep1"]),
+        )
+        .build();
+
+    ws.cargo("build").run();
+    assert_eq!(cached_rlibs().len(), 1, "cache should contain the dep rlib");
+    for file in collect_files(&build_cache_root().join("content")) {
+        let name = file.file_name().unwrap().to_string_lossy();
+        if name.starts_with(".tmp-") {
+            continue;
+        }
+        if file.extension().is_some() {
+            assert!(
+                name.starts_with("lib"),
+                "cached artifact `{name}` must keep the `lib` prefix rustc requires"
+            );
+        }
+    }
+
+    // Every manifest's linkable artifacts must share one stem so rustc finds
+    // the rlib sibling of a discovered rmeta (and vice versa).
+    for manifest_path in collect_files(&build_cache_root().join("entries")) {
+        let bytes = std::fs::read(&manifest_path).expect("manifest readable");
+        let v: serde_json::Value = serde_json::from_slice(&bytes).expect("valid manifest");
+        let files = v
+            .get("files")
+            .and_then(|f| f.as_object())
+            .expect("files map");
+        let mut stems = std::collections::BTreeSet::new();
+        for (k, h) in files {
+            let is_linkable = k.ends_with(".rmeta")
+                || k.ends_with(".rlib")
+                || k.ends_with(".so")
+                || k.ends_with(".dylib")
+                || k.ends_with(".dll")
+                || k.ends_with(".a");
+            if !is_linkable {
+                continue;
+            }
+            let stored = h.as_str().expect("stored name");
+            assert!(
+                stored.starts_with("lib") && stored.contains('-'),
+                "manifest `{manifest_path:?}` entry `{stored}` must keep the `lib<name>-` shape for `-L` discovery"
+            );
+            let stem = stored.rsplit_once('.').map(|(s, _)| s).unwrap_or(stored);
+            stems.insert(stem.to_string());
+        }
+        assert!(
+            stems.len() <= 1,
+            "manifest `{manifest_path:?}` linkables must share one stem, found {stems:?}"
+        );
+    }
+}
+
+#[cargo_test]
+fn cache_hit_transitive_deps_resolve_in_place() {
+    // `foo -> dep_mid -> dep_leaf`. After `cargo clean` (wipes workspace
+    // outputs, keeps the cache) the rebuild serves both deps from cache
+    // hits. The rebuilt `foo` resolves `dep_leaf` transitively through
+    // `dep_mid`'s cached rmeta via `-L` on the content dir — this failed
+    // with `E0463` when stored names did not match `lib<name>-*`.
+    let git_leaf = git::new("dep_leaf", |project| {
+        project
+            .file("Cargo.toml", &basic_lib_manifest("dep_leaf"))
+            .file("src/lib.rs", r#"pub fn leaf() -> u32 { 1 }"#)
+    });
+    let git_mid = git::new("dep_mid", |project| {
+        project
+            .file(
+                "Cargo.toml",
+                &format!(
+                    "{}\n[dependencies.dep_leaf]\ngit = '{}'",
+                    basic_lib_manifest("dep_mid"),
+                    git_leaf.url()
+                ),
+            )
+            .file(
+                "src/lib.rs",
+                r#"pub fn mid() -> u32 { dep_leaf::leaf() + 1 }"#,
+            )
+    });
+
+    let ws = project()
+        .file(
+            "Cargo.toml",
+            &format!(
+                r#"
+                    [package]
+                    name = "foo"
+                    version = "0.5.0"
+                    edition = "2015"
+
+                    [dependencies.dep_mid]
+                    git = '{}'
+                "#,
+                git_mid.url()
+            ),
+        )
+        .file(
+            "src/main.rs",
+            &main_file(r#""{}", dep_mid::mid()"#, &["dep_mid"]),
+        )
+        .build();
+
+    ws.cargo("build").run();
+    ws.process(&ws.bin("foo"))
+        .with_stdout_data(str![[r#"
+2
+
+"#]])
+        .run();
+
+    ws.cargo("clean").run();
+    // Rebuild entirely from cache hits; the binary links and runs.
+    ws.cargo("build")
+        .with_stdout_contains("build cache: [..] is fresh [..]")
+        .run();
+    ws.process(&ws.bin("foo"))
+        .with_stdout_data(str![[r#"
+2
+
+"#]])
+        .run();
+
+    // A no-change rebuild compiles nothing at all: manifest-complete deps
+    // report plan-Fresh, so the local parent's dep fingerprints stay fresh.
+    ws.cargo("build")
+        .with_stderr_does_not_contain("Compiling")
         .run();
 }
 

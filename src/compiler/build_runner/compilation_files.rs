@@ -386,75 +386,16 @@ impl<'a, 'gctx: 'a> CompilationFiles<'a, 'gctx> {
             .incremental()
             .to_path_buf()
     }
-    /// Returns the host build cache layout.
-    pub fn build_cache(&self) -> &crate::compiler::layout::BuildCacheLayout {
+    /// Returns the host build cache.
+    pub fn build_cache(&self) -> &crate::compiler::cache::BuildCache {
         self.host.build_cache()
     }
 
-    /// Publish cacheable units built in this workspace into the CAS (`content` + `entries`).
-    /// Best-effort, ignores errors to avoid breaking the build on cache failures.
-    /// Only output artifacts (`out/`) are published; fingerprint files are not uploaded
-    /// and not included in the manifest.
-    pub fn publish_to_cas(
-        &self,
-        build_runner: &mut crate::compiler::build_runner::BuildRunner<'_, '_>,
-    ) -> CargoResult<()> {
-        // Collect units first to avoid borrow conflicts with `cache_completion_state` mut borrow.
-        let units: Vec<_> = build_runner
-            .bcx
-            .unit_graph
-            .keys()
-            .cloned()
-            .collect();
-        for unit in units {
-            if !self.is_cacheable(&unit) {
-                continue;
-            }
-            // Only publish if the unit was actually built (its fingerprint file exists and is non-empty).
-            let fp_path = self.fingerprint_file_path(&unit, "");
-            if !fp_path.exists() {
-                continue;
-            }
-            if let Ok(meta) = std::fs::metadata(&fp_path) {
-                if meta.len() == 0 {
-                    continue;
-                }
-            }
-            let out_dir = self.deps_dir(&unit);
-            // If out is empty, nothing to publish.
-            let has_out_files = std::fs::read_dir(&out_dir)
-                .map(|mut e| e.next().is_some())
-                .unwrap_or(false);
-            if !has_out_files {
-                continue;
-            }
-            // Compute expected fingerprint hash for manifest (content-based).
-            let fingerprint_hash = match crate::compiler::fingerprint::cache_completion_state(
-                build_runner, &unit,
-            ) {
-                Ok(state) => match state.expected_hash() {
-                    Ok(h) => h,
-                    Err(_) => continue,
-                },
-                Err(_) => continue,
-            };
-            let pkg_dir = self.pkg_dir(&unit);
-            let layout = self.layout(unit.kind);
-            let _ = layout.build_cache().publish_unit_to_cas(
-                &pkg_dir,
-                &out_dir,
-                &fingerprint_hash,
-            );
-        }
-        Ok(())
-    }
     /// Cache build unit dir (`build-cache/<pkg>/<hash>`).
     pub fn cache_build_unit(&self, unit: &Unit) -> PathBuf {
         let dir = self.pkg_dir(unit);
         self.layout(unit.kind).build_cache().build_unit(&dir)
     }
-
-
 
     /// Directory where timing output should go.
     pub fn timings_dir(&self) -> Option<&Path> {

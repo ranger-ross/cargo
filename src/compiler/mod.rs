@@ -32,6 +32,7 @@ pub mod artifact;
 mod build_config;
 pub(crate) mod build_context;
 pub(crate) mod build_runner;
+pub(crate) mod cache;
 mod compilation;
 use crate::compiler::build_runner::OutputFile;
 mod compile_kind;
@@ -256,6 +257,10 @@ fn compile<'gctx>(
                         unit.target.name(),
                         cache_entry.display()
                     );
+                    // Hit artifacts stay in `content`: stored names keep the
+                    // `lib<name>-*` shape so dependents' rustc resolves
+                    // transitive deps via `-L` discovery. Nothing is copied
+                    // or linked out of the cache.
                 }
                 let output_options = OutputOptions::for_fresh(build_runner, unit);
                 let manifest = ManifestErrorContext::new(build_runner, unit);
@@ -269,6 +274,21 @@ fn compile<'gctx>(
                 // Need to link targets on both the dirty and fresh.
                 work.then(link_targets(build_runner, unit, true)?)
             });
+
+            // Publish runs as `job.after` finalization, chained behind the
+            // compile and fingerprint write: `then` short-circuits, so a
+            // failed compile never publishes. `expected_hash` is computed at
+            // finalize time, when dependencies are built and the checksums
+            // are real — capturing it now would bake in placeholders. Only
+            // dirty units carry a completion state; fresh hits are already
+            // published.
+            if let Some((completion, _)) = &cache_state {
+                job.after(finalize_cache_entry(
+                    &build_runner,
+                    unit,
+                    std::sync::Arc::clone(completion),
+                ));
+            }
 
             // If -Zfine-grain-locking is enabled, we wrap the job with an upgrade to exclusive
             // lock before starting, then downgrade to a shared lock after the job is finished.
@@ -342,13 +362,12 @@ fn rustc(
 
     let outputs = build_runner.outputs(unit)?;
     let root = build_runner.files().output_dir(unit);
-    let dep_info_name = if let Some(c_extra_filename) =
-        build_runner.files().metadata(unit).c_extra_filename()
-    {
-        format!("{}-{}.d", unit.target.crate_name(), c_extra_filename)
-    } else {
-        format!("{}.d", unit.target.crate_name())
-    };
+    let dep_info_name =
+        if let Some(c_extra_filename) = build_runner.files().metadata(unit).c_extra_filename() {
+            format!("{}-{}.d", unit.target.crate_name(), c_extra_filename)
+        } else {
+            format!("{}.d", unit.target.crate_name())
+        };
     let rustc_dep = root.join(dep_info_name);
     let dep_info = fingerprint::dep_info_loc(build_runner, unit);
     let rustc_dep_info_loc = rustc_dep;
@@ -383,7 +402,10 @@ fn rustc(
     // closure cannot borrow the build runner, so save it here.
     let cache_identity = if is_cacheable {
         let pkg_dir = build_runner.files().pkg_dir(unit);
-        let cache_entry = build_runner.files().build_cache().entry_manifest_path(&pkg_dir);
+        let cache_entry = build_runner
+            .files()
+            .build_cache()
+            .entry_manifest_path(&pkg_dir);
         Some((
             unit.pkg.name().to_string(),
             unit.target.name().to_string(),
@@ -432,12 +454,9 @@ fn rustc(
     }
     let env_config = Arc::clone(build_runner.bcx.gctx.env_config()?);
     return Ok(Work::new(move |state| {
-        // Cacheable units use CAS with atomic publish; no per-unit
-        // locking is needed. Non-cacheable units with fine-grain locking
-        // still use the coordination protocol.
-        // CAS makes per-unit locking unnecessary. If the cache entry
-        // became complete after dependencies were built (e.g. placeholders
-        // resolved), skip compiling and reuse the cached artifacts.
+        // If the cache entry became complete after dependencies were
+        // built (e.g. placeholders resolved), skip compiling and
+        // reuse the cached artifacts.
         if is_cacheable {
             if let Some((completion, path)) = &cache_state {
                 if completion.is_complete(path)? {
@@ -529,7 +548,6 @@ fn rustc(
             }
         }
 
-        let on_rmeta: Option<&dyn Fn() -> CargoResult<()>> = None;
         let result = exec
             .exec(
                 &rustc,
@@ -545,7 +563,6 @@ fn rustc(
                         &manifest,
                         &target,
                         &mut output_options,
-                        on_rmeta,
                     )
                 },
             )
@@ -738,6 +755,35 @@ fn downgrade_lock_to_shared(lock: LockKey) -> Work {
     })
 }
 
+fn finalize_cache_entry(
+    build_runner: &BuildRunner<'_, '_>,
+    unit: &Unit,
+    completion: std::sync::Arc<fingerprint::CacheCompletionState>,
+) -> Work {
+    // Output paths are deterministic, so resolving them at plan time is
+    // exact. The rmeta plus its linkable sibling are the whole publish set:
+    // no directory scan. Rmeta-only check builds publish just the rmeta;
+    // units with no rmeta finalize to a no-op.
+    let outputs = build_runner.outputs(unit).ok();
+    let find = |flavor: FileFlavor| {
+        outputs.as_ref().and_then(|outputs| {
+            outputs
+                .iter()
+                .find(|o| o.flavor == flavor)
+                .map(|o| o.path.clone())
+        })
+    };
+    let rmeta = find(FileFlavor::Rmeta);
+    let linkable = find(FileFlavor::Linkable);
+    Work::new(move |state| {
+        // Best-effort: cache failures must never fail the build.
+        if let Some(rmeta) = &rmeta {
+            let _ = state.finalize_cache_entry(rmeta, linkable.as_deref(), &completion);
+        }
+        Ok(())
+    })
+}
+
 /// Link the compiled target (often of form `foo-{metadata_hash}`) to the
 /// final target. This must happen during both "Fresh" and "Compile".
 fn link_targets(
@@ -747,7 +793,8 @@ fn link_targets(
 ) -> CargoResult<Work> {
     // CAS cacheable units build directly in the workspace build-dir (like
     // non-cacheable units); no staging remapping is needed. Fresh hits reuse
-    // artifacts hardlinked from `content` into the build-dir via `restore_from_cas`.
+    // the `content` blobs in place (missing build-dir outputs are skipped
+    // below); dependents resolve them via `-L` on the content dir.
     let _ = fresh;
     let outputs = build_runner.outputs(unit)?;
     let bcx = build_runner.bcx;
@@ -1200,7 +1247,6 @@ fn rustdoc(build_runner: &mut BuildRunner<'_, '_>, unit: &Unit) -> CargoResult<W
                         &manifest,
                         &target,
                         &mut output_options,
-                        None,
                     )
                 },
                 false,
@@ -1802,23 +1848,6 @@ fn build_deps_args(
 
     Ok(())
 }
-/// Ensure a cacheable unit's CAS entry is restored into `build-dir` if it is a hit.
-/// Best-effort: if manifest exists and build-dir out is empty, hardlink content files back.
-fn ensure_cas_entry_restored(build_runner: &BuildRunner<'_, '_>, unit: &Unit) {
-    if !build_runner.files().is_cacheable(unit) {
-        return;
-    }
-    let pkg_dir = build_runner.files().pkg_dir(unit);
-    let out_dir = build_runner.files().deps_dir(unit);
-    let has_out = std::fs::read_dir(&out_dir)
-        .map(|mut e| e.next().is_some())
-        .unwrap_or(false);
-    if has_out {
-        return;
-    }
-    let layout = build_runner.files().build_cache();
-    let _ = layout.restore_from_cas(&pkg_dir, &out_dir);
-}
 
 fn add_dep_arg<'a, 'b: 'a>(
     map: &mut BTreeMap<&'a Unit, PathBuf>,
@@ -1833,7 +1862,13 @@ fn add_dep_arg<'a, 'b: 'a>(
         if map.contains_key(&dep.unit) {
             continue;
         }
-        ensure_cas_entry_restored(build_runner, &dep.unit);
+        // TODO: It would be super nice if we could avoid passing the `-L` args for cache deps.
+        //       The issue is that for the first build, the artifacts are not in the yet.
+        //       This can be solved by 1) hardlinking rmeta before calling rmeta_produced, and 2)
+        //       hardlinking rlib before the build unit completes.
+        // if dep.unit.is_cacheable() {
+        //     continue;
+        // }
         let dep_dir = build_runner.files().deps_dir(&dep.unit);
         map.insert(&dep.unit, dep_dir);
 
@@ -1892,6 +1927,12 @@ pub fn lib_search_paths(
             deps.push(path);
             lib_search_paths.extend(["-L".into(), deps]);
         }
+
+        let layout = build_runner.files().build_cache();
+
+        let mut deps = OsString::from("dependency=");
+        deps.push(layout.content_dir());
+        lib_search_paths.extend(["-L".into(), deps]);
     } else {
         let mut deps = OsString::from("dependency=");
         deps.push(build_runner.files().deps_dir(unit));
@@ -1961,13 +2002,51 @@ pub fn extern_args(
         value.push(extern_crate_name.as_str());
         value.push("=");
 
-        let mut pass = |file| {
+        let mut pass = |file: &Path| {
             let mut value = value.clone();
             value.push(file);
             result.push(OsString::from("--extern"));
             result.push(value);
         };
-        ensure_cas_entry_restored(build_runner, &dep.unit);
+
+        // FIXME: We repeatedly read manifests here that were already read
+        // during fingerprinting
+        let cached_path_for = |output_path: &Path| -> Option<PathBuf> {
+            if !build_runner.files().is_cacheable(&dep.unit) {
+                return None;
+            }
+            let cache = build_runner.files().build_cache();
+            let pkg_dir = build_runner.files().pkg_dir(&dep.unit);
+            let manifest = cache.read_manifest(&pkg_dir).ok()??;
+            let out_dir = build_runner.files().deps_dir(&dep.unit);
+            let rel_key = output_path
+                .strip_prefix(&out_dir)
+                .map(|rel| format!("out/{}", rel.display()))
+                .unwrap_or_else(|_| {
+                    format!(
+                        "out/{}",
+                        output_path
+                            .file_name()
+                            .unwrap_or_default()
+                            .to_string_lossy()
+                    )
+                });
+            let hash = manifest.files.get(&rel_key).or_else(|| {
+                // Fallback for manifests storing the artifact under a
+                // slightly different key: any cached file with the same
+                // extension (e.g. `.rmeta` vs `.rlib` naming drift).
+                let ext = output_path.extension()?.to_str()?;
+                let suffix = format!(".{ext}");
+                manifest
+                    .files
+                    .iter()
+                    .find(|(k, _)| k.ends_with(&suffix))
+                    .map(|(_, h)| h)
+            })?;
+            let content = cache.content_path(hash);
+            content.exists().then_some(content)
+        };
+
         let outputs = build_runner.outputs(&dep.unit)?;
         if build_runner.only_requires_rmeta(unit, &dep.unit) || dep.unit.mode.is_check() {
             // Example: rlib dependency for an rlib, rmeta is all that is required.
@@ -1975,18 +2054,27 @@ pub fn extern_args(
                 .iter()
                 .find(|output| output.flavor == FileFlavor::Rmeta)
                 .expect("failed to find rmeta dep for pipelined dep");
-            pass(&output.path);
+            match cached_path_for(&output.path) {
+                Some(cached) => pass(&cached),
+                None => pass(&output.path),
+            }
         } else {
             // Example: a bin needs `rlib` for dependencies, it cannot use rmeta.
             for output in outputs.iter() {
                 if output.flavor == FileFlavor::Linkable {
-                    pass(&output.path);
+                    match cached_path_for(&output.path) {
+                        Some(cached) => pass(&cached),
+                        None => pass(&output.path),
+                    }
                 }
                 // If we use -Zembed-metadata=no, we also need to pass the path to the
                 // corresponding .rmeta file to the linkable artifact, because the
                 // normal dependency (rlib) doesn't contain the full metadata.
                 else if no_embed_metadata && output.flavor == FileFlavor::Rmeta {
-                    pass(&output.path);
+                    match cached_path_for(&output.path) {
+                        Some(cached) => pass(&cached),
+                        None => pass(&output.path),
+                    }
                 }
             }
         }
@@ -2160,9 +2248,8 @@ fn on_stderr_line(
     manifest: &ManifestErrorContext,
     target: &Target,
     options: &mut OutputOptions,
-    on_rmeta: Option<&dyn Fn() -> CargoResult<()>>,
 ) -> CargoResult<()> {
-    if on_stderr_line_inner(state, line, package_id, manifest, target, options, on_rmeta)? {
+    if on_stderr_line_inner(state, line, package_id, manifest, target, options)? {
         // Check if caching is enabled.
         if let Some((path, cell)) = &mut options.cache_cell {
             // Cache the output, which will be replayed later when Fresh.
@@ -2183,7 +2270,6 @@ fn on_stderr_line_inner(
     manifest: &ManifestErrorContext,
     target: &Target,
     options: &mut OutputOptions,
-    on_rmeta: Option<&dyn Fn() -> CargoResult<()>>,
 ) -> CargoResult<bool> {
     // We primarily want to use this function to process JSON messages from
     // rustc. The compiler should always print one JSON message per line, and
@@ -2422,10 +2508,8 @@ fn on_stderr_line_inner(
         trace!("found directive from rustc: `{}`", artifact.artifact);
         if artifact.artifact.ends_with(".rmeta") {
             debug!("looks like metadata finished early!");
-            if let Some(on_rmeta) = on_rmeta {
-                on_rmeta()?;
-            }
-            state.rmeta_produced();
+            let path = Path::new(artifact.artifact.as_ref());
+            state.rmeta_produced(path);
         }
         return Ok(false);
     }
@@ -2656,7 +2740,6 @@ fn replay_output_cache(
                 &manifest,
                 &target,
                 &mut output_options,
-                None,
             )?;
             line.clear();
         }

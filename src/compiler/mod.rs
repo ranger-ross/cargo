@@ -32,7 +32,9 @@ pub mod artifact;
 mod build_config;
 pub(crate) mod build_context;
 pub(crate) mod build_runner;
+pub(crate) mod cache;
 mod compilation;
+use crate::compiler::build_runner::OutputFile;
 mod compile_kind;
 mod crate_type;
 mod custom_build;
@@ -57,6 +59,7 @@ pub mod unused_deps;
 use crate::util::data_structures::{HashMap, HashSet};
 use std::borrow::Cow;
 use std::cell::OnceCell;
+use std::collections::BTreeMap;
 use std::env;
 use std::ffi::{OsStr, OsString};
 use std::fmt::Display;
@@ -69,6 +72,7 @@ use std::sync::{Arc, LazyLock};
 use anyhow::{Context as _, Error};
 use cargo_platform::{Cfg, Platform};
 use cargo_util_terminal::report::{AnnotationKind, Group, Level, Renderer, Snippet};
+use itertools::Itertools;
 use regex::Regex;
 use tracing::{debug, instrument, trace};
 
@@ -104,7 +108,6 @@ use crate::compiler::timings::SectionTiming;
 pub use crate::compiler::unit::Unit;
 pub use crate::compiler::unit::UnitIndex;
 pub use crate::compiler::unit::UnitInterner;
-use crate::context::FingerprintMethod;
 use crate::diagnostics::get_key_value;
 use crate::util::OnceExt;
 use crate::util::errors::{CargoResult, VerboseError};
@@ -198,23 +201,6 @@ fn compile<'gctx>(
         None
     };
 
-    match build_runner
-        .bcx
-        .gctx
-        .build_config()?
-        .fingerprint
-        .unwrap_or_default()
-    {
-        FingerprintMethod::Content => {
-            if !build_runner.bcx.gctx.cli_unstable().checksum_freshness {
-                build_runner.bcx.gctx.shell().warn(
-                    r#"ignoring `build.fingerprint = "content"` without `-Zchecksum-freshness`"#,
-                )?;
-            }
-        }
-        FingerprintMethod::Mtime => {}
-    }
-
     // If we are in `--compile-time-deps` and the given unit is not a compile time
     // dependency, skip compiling the unit and jumps to dependencies, which still
     // have chances to be compile time dependencies
@@ -231,14 +217,51 @@ fn compile<'gctx>(
         } else {
             let force = exec.force_rebuild(unit) || force_rebuild;
             let mut job = fingerprint::prepare_target(build_runner, unit, force)?;
+            // Dirty cacheable units are built in the workspace build-dir and published
+            // to CAS (`content` + `entries`) atomically. No per-unit locking is
+            // needed; concurrent processes that race to publish the same entry resolve
+            // via `AlreadyExists`. The hit probe checks at spawn time if the cache is
+            // already complete.
+            let cache_state: Option<(
+                std::sync::Arc<fingerprint::CacheCompletionState>,
+                std::path::PathBuf,
+            )> = if build_runner.files().is_cacheable(unit) && job.freshness().is_dirty() {
+                let completion = fingerprint::cache_completion_state(build_runner, unit)?;
+                let path = build_runner.files().fingerprint_file_path(unit, "");
+                let completion = std::sync::Arc::new(completion);
+                let path_clone = path.clone();
+                let completion_clone = std::sync::Arc::clone(&completion);
+                job.set_cache_hit_probe(std::sync::Arc::new(move || {
+                    completion_clone.is_complete(&path_clone)
+                }));
+                Some((completion, path))
+            } else {
+                None
+            };
             job.before(if job.freshness().is_dirty() {
                 let work = if unit.mode.is_doc() || unit.mode.is_doc_scrape() {
                     rustdoc(build_runner, unit)?
                 } else {
-                    rustc(build_runner, unit, exec)?
+                    rustc(build_runner, unit, exec, cache_state.clone())?
                 };
                 work.then(link_targets(build_runner, unit, false)?)
             } else {
+                // A fresh cacheable unit is a hit in the cross-workspace
+                // cache. Its fingerprint matches and filesystem state is up to
+                // date, so there is nothing to compile.
+                if build_runner.files().is_cacheable(unit) {
+                    let cache_entry = build_runner.files().cache_build_unit(unit);
+                    println!(
+                        "build cache: `{}` {} is fresh (hit {})",
+                        unit.pkg.name(),
+                        unit.target.name(),
+                        cache_entry.display()
+                    );
+                    // Hit artifacts stay in `content`: stored names keep the
+                    // `lib<name>-*` shape so dependents' rustc resolves
+                    // transitive deps via `-L` discovery. Nothing is copied
+                    // or linked out of the cache.
+                }
                 let output_options = OutputOptions::for_fresh(build_runner, unit);
                 let manifest = ManifestErrorContext::new(build_runner, unit);
                 let work = replay_output_cache(
@@ -251,6 +274,21 @@ fn compile<'gctx>(
                 // Need to link targets on both the dirty and fresh.
                 work.then(link_targets(build_runner, unit, true)?)
             });
+
+            // Publish runs as `job.after` finalization, chained behind the
+            // compile and fingerprint write: `then` short-circuits, so a
+            // failed compile never publishes. `expected_hash` is computed at
+            // finalize time, when dependencies are built and the checksums
+            // are real — capturing it now would bake in placeholders. Only
+            // dirty units carry a completion state; fresh hits are already
+            // published.
+            if let Some((completion, _)) = &cache_state {
+                job.after(finalize_cache_entry(
+                    &build_runner,
+                    unit,
+                    std::sync::Arc::clone(completion),
+                ));
+            }
 
             // If -Zfine-grain-locking is enabled, we wrap the job with an upgrade to exclusive
             // lock before starting, then downgrade to a shared lock after the job is finished.
@@ -304,12 +342,19 @@ fn make_failed_scrape_diagnostic(
     )
 }
 
-/// Creates a unit of work invoking `rustc` for building the `unit`.
-#[tracing::instrument(skip_all)]
+/// Creates work that runs `rustc` for `unit`.
+///
+/// `cache_state` is the build-cache completion state for cacheable units.
+/// Staging makes per-unit locking unnecessary; we only need to check if the
+/// cache entry became complete after dependencies were built.
 fn rustc(
     build_runner: &mut BuildRunner<'_, '_>,
     unit: &Unit,
     exec: &Arc<dyn Executor>,
+    cache_state: Option<(
+        std::sync::Arc<fingerprint::CacheCompletionState>,
+        std::path::PathBuf,
+    )>,
 ) -> CargoResult<Work> {
     let mut rustc = prepare_rustc(build_runner, unit)?;
 
@@ -317,25 +362,25 @@ fn rustc(
 
     let outputs = build_runner.outputs(unit)?;
     let root = build_runner.files().output_dir(unit);
-
-    // Prepare the native lib state (extra `-L` and `-l` flags).
-    let build_script_outputs = Arc::clone(&build_runner.build_script_outputs);
-    let current_id = unit.pkg.package_id();
-    let manifest = ManifestErrorContext::new(build_runner, unit);
-    let build_scripts = build_runner.build_scripts.get(unit).cloned();
-
-    // If we are a binary and the package also contains a library, then we
-    // don't pass the `-l` flags.
-    let pass_l_flag = unit.target.is_lib() || !unit.pkg.targets().iter().any(|t| t.is_lib());
-
     let dep_info_name =
         if let Some(c_extra_filename) = build_runner.files().metadata(unit).c_extra_filename() {
             format!("{}-{}.d", unit.target.crate_name(), c_extra_filename)
         } else {
             format!("{}.d", unit.target.crate_name())
         };
-    let rustc_dep_info_loc = root.join(dep_info_name);
-    let dep_info_loc = fingerprint::dep_info_loc(build_runner, unit);
+    let rustc_dep = root.join(dep_info_name);
+    let dep_info = fingerprint::dep_info_loc(build_runner, unit);
+    let rustc_dep_info_loc = rustc_dep;
+    let dep_info_loc = dep_info;
+    let physical_outputs: std::sync::Arc<Vec<OutputFile>> = std::sync::Arc::clone(&outputs);
+    let build_script_outputs = std::sync::Arc::clone(&build_runner.build_script_outputs);
+    let current_id = unit.pkg.package_id();
+    let manifest = ManifestErrorContext::new(build_runner, unit);
+    let build_scripts = build_runner.build_scripts.get(unit).cloned();
+    let pass_l_flag = unit.target.is_lib() || !unit.pkg.targets().iter().any(|t| t.is_lib());
+    // if !dep_info_loc.exists() {
+    //     paths::create_dir_all(&dep_info_loc.parent().unwrap()).unwrap();
+    // }
 
     let mut output_options = OutputOptions::for_dirty(build_runner, unit);
     let package_id = unit.pkg.package_id();
@@ -352,16 +397,29 @@ fn rustc(
         .get_cwd()
         .unwrap_or_else(|| build_runner.bcx.gctx.cwd())
         .to_path_buf();
-    let fingerprint_dir = build_runner.files().fingerprint_dir(unit);
-    let script_metadatas = build_runner.find_build_script_metadatas(unit);
-    let is_local = unit.is_local();
-    let artifact = unit.artifact;
-    let sbom_files = build_runner.sbom_output_files(unit)?;
-    let sbom = if !sbom_files.is_empty() {
-        Some(build_sbom(build_runner, unit)?)
+    let is_cacheable = build_runner.files().is_cacheable(unit);
+    // Identity for cache-hit messages in the work closure below. The
+    // closure cannot borrow the build runner, so save it here.
+    let cache_identity = if is_cacheable {
+        let pkg_dir = build_runner.files().pkg_dir(unit);
+        let cache_entry = build_runner
+            .files()
+            .build_cache()
+            .entry_manifest_path(&pkg_dir);
+        Some((
+            unit.pkg.name().to_string(),
+            unit.target.name().to_string(),
+            cache_entry.to_path_buf(),
+        ))
     } else {
         None
     };
+    let fingerprint_dir = build_runner.files().fingerprint_dir(unit);
+    let script_metadatas = build_runner.find_build_script_metadatas(unit);
+    let artifact_flag = unit.artifact;
+    let is_local = unit.is_local();
+    let sbom_files = build_runner.sbom_output_files(unit)?;
+    let sbom = build_sbom(build_runner, unit)?;
 
     let unremap_files = build_runner.unremap_output_files(unit)?;
     let unremap_content = if unremap_files.is_empty() {
@@ -396,10 +454,29 @@ fn rustc(
     }
     let env_config = Arc::clone(build_runner.bcx.gctx.env_config()?);
     return Ok(Work::new(move |state| {
+        // If the cache entry became complete after dependencies were
+        // built (e.g. placeholders resolved), skip compiling and
+        // reuse the cached artifacts.
+        if is_cacheable {
+            if let Some((completion, path)) = &cache_state {
+                if completion.is_complete(path)? {
+                    if let Some((name, target, cache_entry)) = &cache_identity {
+                        println!(
+                            "build cache: `{}` {} is fresh (hit {})",
+                            name,
+                            target,
+                            cache_entry.display()
+                        );
+                    }
+                    return Ok(());
+                }
+            }
+        }
+
         // Artifacts are in a different location than typical units,
         // hence we must assure the crate- and target-dependent
         // directory is present.
-        if artifact.is_true() {
+        if artifact_flag.is_true() || is_cacheable {
             paths::create_dir_all(&root)?;
         }
 
@@ -427,7 +504,7 @@ fn rustc(
             add_custom_flags(&mut rustc, &script_outputs, script_metadatas)?;
         }
 
-        for output in outputs.iter() {
+        for output in physical_outputs.iter() {
             // If there is both an rmeta and rlib, rustc will prefer to use the
             // rlib, even if it is older. Therefore, we must delete the rlib to
             // force using the new rmeta.
@@ -453,13 +530,15 @@ fn rustc(
         }
 
         state.running(&rustc);
-        let timestamp = paths::set_invocation_time(&fingerprint_dir)?;
-        if let Some(sbom) = sbom {
-            for file in sbom_files {
-                tracing::debug!("writing sbom to {}", file.display());
-                let outfile = BufWriter::new(paths::create(&file)?);
-                serde_json::to_writer(outfile, &sbom)?;
-            }
+        let timestamp = if !is_cacheable {
+            Some(paths::set_invocation_time(&fingerprint_dir)?)
+        } else {
+            None
+        };
+        for file in sbom_files {
+            tracing::debug!("writing sbom to {}", file.display());
+            let outfile = BufWriter::new(paths::create(&file)?);
+            serde_json::to_writer(outfile, &sbom)?;
         }
 
         if let Some(content) = &unremap_content {
@@ -526,6 +605,11 @@ fn rustc(
         debug_assert_eq!(output_options.errors_seen, 0);
 
         if rustc_dep_info_loc.exists() {
+            if let Some(parent) = dep_info_loc.parent() {
+                if !parent.exists() {
+                    paths::create_dir_all(parent)?;
+                }
+            }
             fingerprint::translate_dep_info(
                 &rustc_dep_info_loc,
                 &dep_info_loc,
@@ -545,7 +629,9 @@ fn rustc(
             })?;
             // This mtime shift allows Cargo to detect if a source file was
             // modified in the middle of the build.
-            paths::set_file_time_no_err(dep_info_loc, timestamp);
+            if let Some(timestamp) = timestamp {
+                paths::set_file_time_no_err(dep_info_loc, timestamp);
+            }
         }
 
         // This mtime shift for .rmeta is a workaround as rustc incremental build
@@ -562,8 +648,10 @@ fn rustc(
         //    a new mtime than existing crate rmeta, so re-checking the crate.
         //    However the check is a no-op (input has no change), so stuck.
         if mode.is_check() {
-            for output in outputs.iter() {
-                paths::set_file_time_no_err(&output.path, timestamp);
+            for output in physical_outputs.iter() {
+                if let Some(timestamp) = timestamp {
+                    paths::set_file_time_no_err(&output.path, timestamp);
+                }
             }
         }
 
@@ -667,6 +755,35 @@ fn downgrade_lock_to_shared(lock: LockKey) -> Work {
     })
 }
 
+fn finalize_cache_entry(
+    build_runner: &BuildRunner<'_, '_>,
+    unit: &Unit,
+    completion: std::sync::Arc<fingerprint::CacheCompletionState>,
+) -> Work {
+    // Output paths are deterministic, so resolving them at plan time is
+    // exact. The rmeta plus its linkable sibling are the whole publish set:
+    // no directory scan. Rmeta-only check builds publish just the rmeta;
+    // units with no rmeta finalize to a no-op.
+    let outputs = build_runner.outputs(unit).ok();
+    let find = |flavor: FileFlavor| {
+        outputs.as_ref().and_then(|outputs| {
+            outputs
+                .iter()
+                .find(|o| o.flavor == flavor)
+                .map(|o| o.path.clone())
+        })
+    };
+    let rmeta = find(FileFlavor::Rmeta);
+    let linkable = find(FileFlavor::Linkable);
+    Work::new(move |state| {
+        // Best-effort: cache failures must never fail the build.
+        if let Some(rmeta) = &rmeta {
+            let _ = state.finalize_cache_entry(rmeta, linkable.as_deref(), &completion);
+        }
+        Ok(())
+    })
+}
+
 /// Link the compiled target (often of form `foo-{metadata_hash}`) to the
 /// final target. This must happen during both "Fresh" and "Compile".
 fn link_targets(
@@ -674,8 +791,13 @@ fn link_targets(
     unit: &Unit,
     fresh: bool,
 ) -> CargoResult<Work> {
-    let bcx = build_runner.bcx;
+    // CAS cacheable units build directly in the workspace build-dir (like
+    // non-cacheable units); no staging remapping is needed. Fresh hits reuse
+    // the `content` blobs in place (missing build-dir outputs are skipped
+    // below); dependents resolve them via `-L` on the content dir.
+    let _ = fresh;
     let outputs = build_runner.outputs(unit)?;
+    let bcx = build_runner.bcx;
     let export_dir = build_runner.files().export_dir();
     let package_id = unit.pkg.package_id();
     let manifest_path = PathBuf::from(unit.pkg.manifest_path());
@@ -823,7 +945,6 @@ where
 /// This builds a static view of the invocation. Flags depending on the
 /// completion of other units will be added later in runtime, such as flags
 /// from build scripts.
-#[tracing::instrument(skip_all)]
 fn prepare_rustc(build_runner: &BuildRunner<'_, '_>, unit: &Unit) -> CargoResult<ProcessBuilder> {
     let gctx = build_runner.bcx.gctx;
     let is_primary = build_runner.is_primary_package(unit);
@@ -855,18 +976,7 @@ fn prepare_rustc(build_runner: &BuildRunner<'_, '_>, unit: &Unit) -> CargoResult
         base.arg("-Z").arg("binary-dep-depinfo");
     }
     if build_runner.bcx.gctx.cli_unstable().checksum_freshness {
-        match build_runner
-            .bcx
-            .gctx
-            .build_config()?
-            .fingerprint
-            .unwrap_or_default()
-        {
-            FingerprintMethod::Content => {
-                base.arg("-Z").arg("checksum-hash-algorithm=blake3");
-            }
-            FingerprintMethod::Mtime => {}
-        }
+        base.arg("-Z").arg("checksum-hash-algorithm=blake3");
     }
 
     if is_primary {
@@ -887,10 +997,6 @@ fn prepare_rustc(build_runner: &BuildRunner<'_, '_>, unit: &Unit) -> CargoResult
         base.env("CARGO_TARGET_TMPDIR", tmp.display().to_string());
     }
 
-    // Added last to reduce the risk of RUSTFLAGS or `[lints]` from interfering with
-    // `unused_dependencies` tracking
-    base.arg("--force-warn=unused_crate_dependencies");
-
     Ok(base)
 }
 
@@ -900,7 +1006,6 @@ fn prepare_rustc(build_runner: &BuildRunner<'_, '_>, unit: &Unit) -> CargoResult
 /// This builds a static view of the invocation. Flags depending on the
 /// completion of other units will be added later in runtime, such as flags
 /// from build scripts.
-#[tracing::instrument(skip_all)]
 fn prepare_rustdoc(build_runner: &BuildRunner<'_, '_>, unit: &Unit) -> CargoResult<ProcessBuilder> {
     let bcx = build_runner.bcx;
     // script_metadata is not needed here, it is only for tests.
@@ -956,18 +1061,7 @@ fn prepare_rustdoc(build_runner: &BuildRunner<'_, '_>, unit: &Unit) -> CargoResu
         rustdoc.arg(arg);
 
         if build_runner.bcx.gctx.cli_unstable().checksum_freshness {
-            match build_runner
-                .bcx
-                .gctx
-                .build_config()?
-                .fingerprint
-                .unwrap_or_default()
-            {
-                FingerprintMethod::Content => {
-                    rustdoc.arg("-Z").arg("checksum-hash-algorithm=blake3");
-                }
-                FingerprintMethod::Mtime => {}
-            }
+            rustdoc.arg("-Z").arg("checksum-hash-algorithm=blake3");
         }
     } else if build_runner.bcx.gctx.cli_unstable().rustdoc_mergeable_info && !wants_json_output {
         // toolchain resources are written at the end, at the same time as merging
@@ -1042,7 +1136,6 @@ fn prepare_rustdoc(build_runner: &BuildRunner<'_, '_>, unit: &Unit) -> CargoResu
 }
 
 /// Creates a unit of work invoking `rustdoc` for documenting the `unit`.
-#[tracing::instrument(skip_all)]
 fn rustdoc(build_runner: &mut BuildRunner<'_, '_>, unit: &Unit) -> CargoResult<Work> {
     let mut rustdoc = prepare_rustdoc(build_runner, unit)?;
 
@@ -1279,9 +1372,7 @@ fn add_error_format_and_color(build_runner: &BuildRunner<'_, '_>, cmd: &mut Proc
 
     cmd.arg("--error-format=json");
 
-    let mut json = String::from(
-        "--json=diagnostic-rendered-ansi,artifacts,future-incompat,unused-externs-silent",
-    );
+    let mut json = String::from("--json=diagnostic-rendered-ansi,artifacts,future-incompat");
     if let MessageFormat::Short | MessageFormat::Json { short: true, .. } =
         build_runner.bcx.build_config.message_format
     {
@@ -1513,8 +1604,8 @@ fn build_base_args(
         cmd.arg("-C").arg("rpath");
     }
 
-    cmd.arg("--out-dir")
-        .arg(&build_runner.files().output_dir(unit));
+    let out_dir = build_runner.files().output_dir(unit);
+    cmd.arg("--out-dir").arg(&out_dir);
 
     unit.kind.add_target_arg(cmd);
 
@@ -1758,6 +1849,38 @@ fn build_deps_args(
     Ok(())
 }
 
+fn add_dep_arg<'a, 'b: 'a>(
+    map: &mut BTreeMap<&'a Unit, PathBuf>,
+    build_runner: &'b BuildRunner<'b, '_>,
+    unit: &'a Unit,
+) {
+    for dep in build_runner.unit_deps(unit) {
+        // Don't include build script out dir in the args to reduce rustc command bloat.
+        if dep.unit.target.is_custom_build() {
+            continue;
+        }
+        if map.contains_key(&dep.unit) {
+            continue;
+        }
+        // TODO: It would be super nice if we could avoid passing the `-L` args for cache deps.
+        //       The issue is that for the first build, the artifacts are not in the yet.
+        //       This can be solved by 1) hardlinking rmeta before calling rmeta_produced, and 2)
+        //       hardlinking rlib before the build unit completes.
+        // if dep.unit.is_cacheable() {
+        //     continue;
+        // }
+        let dep_dir = build_runner.files().deps_dir(&dep.unit);
+        map.insert(&dep.unit, dep_dir);
+
+        // Proc macros are statically linked, so when including a proc-macro dependency we can skip
+        // adding it's dependencies. Note that we still do add them when we are compiling the
+        // proc-macro itself.
+        if dep.unit.target.proc_macro() {
+            continue;
+        }
+        add_dep_arg(map, build_runner, &dep.unit);
+    }
+}
 /// Adds extra rustc flags and environment variables collected from the output
 /// of a build-script to the command to execute, include custom environment
 /// variables and `cfg`.
@@ -1786,21 +1909,30 @@ fn add_custom_flags(
 }
 
 /// Generate a list of `-L` arguments
-#[tracing::instrument(skip_all)]
 pub fn lib_search_paths(
     build_runner: &BuildRunner<'_, '_>,
     unit: &Unit,
 ) -> CargoResult<Vec<OsString>> {
     let mut lib_search_paths = Vec::new();
     if build_runner.bcx.gctx.cli_unstable().build_dir_new_layout {
-        // Add all dependency args to rustc process
-        let paths = dep_paths_for_args(unit, build_runner);
+        let mut map = BTreeMap::new();
+
+        // Recursively add all dependency args to rustc process
+        add_dep_arg(&mut map, build_runner, unit);
+
+        let paths = map.into_iter().map(|(_, path)| path).sorted_unstable();
 
         for path in paths {
             let mut deps = OsString::from("dependency=");
             deps.push(path);
             lib_search_paths.extend(["-L".into(), deps]);
         }
+
+        let layout = build_runner.files().build_cache();
+
+        let mut deps = OsString::from("dependency=");
+        deps.push(layout.content_dir());
+        lib_search_paths.extend(["-L".into(), deps]);
     } else {
         let mut deps = OsString::from("dependency=");
         deps.push(build_runner.files().deps_dir(unit));
@@ -1816,77 +1948,6 @@ pub fn lib_search_paths(
     }
 
     Ok(lib_search_paths)
-}
-
-/// Generate a list of paths for the rustc `-L` args.
-///
-/// To generate the list of paths we walk the dependency graph using DFS with a stack.
-///
-/// We try to avoid bloating the amount of args passed rustc as it can cause issues with OS limits
-/// for large projects. (and generally just makes the rustc command ugly!).
-/// Below are the rules for excluding build units from the args.
-/// 1. Don't include build script out dir in the args to reduce rustc command bloat.
-/// 2. Proc macros are statically linked, so when including a proc-macro dependency we can skip
-///    adding it's dependencies. Note that we still do add them when we are compiling the
-///    proc-macro itself.
-/// 3. Don't include direct dependencies because they are passed with `--extern` and rustc does not
-///    need `-L` if it was already passed as `--extern`
-fn dep_paths_for_args(unit: &Unit, build_runner: &BuildRunner<'_, '_>) -> Vec<PathBuf> {
-    let direct = build_runner.unit_deps(unit);
-    if direct.is_empty() {
-        return Vec::new();
-    }
-    let mut indirect = HashSet::default();
-    let mut visited = HashSet::default();
-    let mut stack: Vec<&Unit> = direct
-        .iter()
-        .filter(|d| !d.unit.target.is_custom_build())
-        .map(|d| &d.unit)
-        .collect();
-    while let Some(u) = stack.pop() {
-        if !visited.insert(u.clone()) {
-            continue;
-        }
-        if u.target.proc_macro() {
-            continue;
-        }
-        for dep in build_runner.unit_deps(u) {
-            let v = &dep.unit;
-            if v.target.is_custom_build() {
-                continue;
-            }
-            indirect.insert(v.clone());
-            if v.target.proc_macro() {
-                continue;
-            }
-            if !visited.contains(v) {
-                stack.push(v);
-            }
-        }
-    }
-
-    let mut paths: Vec<PathBuf> = indirect
-        .into_iter()
-        .map(|u| build_runner.files().deps_dir(&u))
-        .collect();
-
-    // We are in the hot path that needs to always run (even for rebuilds)
-    // There could be a potentially large amount of paths for large workspaces.
-    // We want to sort and dedup the paths but doing so is a bit expsensive when comparing PathBufs
-    // directly. So instead we only sort valid Utf8 paths as &str's which is a bit faster.
-    // We do not allow non utf8 paths when building, so we take advantage of that by treating them
-    // as a single value when sorting/deduplicating.
-    //
-    // For reference this saves about ~30ms on Zed
-    paths.sort_unstable_by(|a, b| match (a.to_str(), b.to_str()) {
-        (Some(a), Some(b)) => a.cmp(b),
-        (Some(_), None) => std::cmp::Ordering::Less,
-        (None, Some(_)) => std::cmp::Ordering::Greater,
-        (None, None) => std::cmp::Ordering::Less,
-    });
-    paths.dedup_by(|a, b| matches!((a.to_str(), b.to_str()), (Some(x), Some(y)) if x == y));
-
-    paths
 }
 
 fn is_public_dependency_enabled(build_runner: &BuildRunner<'_, '_>, unit: &Unit) -> bool {
@@ -1941,33 +2002,79 @@ pub fn extern_args(
         value.push(extern_crate_name.as_str());
         value.push("=");
 
-        let mut pass = |file| {
+        let mut pass = |file: &Path| {
             let mut value = value.clone();
             value.push(file);
             result.push(OsString::from("--extern"));
             result.push(value);
         };
 
-        let outputs = build_runner.outputs(&dep.unit)?;
+        // FIXME: We repeatedly read manifests here that were already read
+        // during fingerprinting
+        let cached_path_for = |output_path: &Path| -> Option<PathBuf> {
+            if !build_runner.files().is_cacheable(&dep.unit) {
+                return None;
+            }
+            let cache = build_runner.files().build_cache();
+            let pkg_dir = build_runner.files().pkg_dir(&dep.unit);
+            let manifest = cache.read_manifest(&pkg_dir).ok()??;
+            let out_dir = build_runner.files().deps_dir(&dep.unit);
+            let rel_key = output_path
+                .strip_prefix(&out_dir)
+                .map(|rel| format!("out/{}", rel.display()))
+                .unwrap_or_else(|_| {
+                    format!(
+                        "out/{}",
+                        output_path
+                            .file_name()
+                            .unwrap_or_default()
+                            .to_string_lossy()
+                    )
+                });
+            let hash = manifest.files.get(&rel_key).or_else(|| {
+                // Fallback for manifests storing the artifact under a
+                // slightly different key: any cached file with the same
+                // extension (e.g. `.rmeta` vs `.rlib` naming drift).
+                let ext = output_path.extension()?.to_str()?;
+                let suffix = format!(".{ext}");
+                manifest
+                    .files
+                    .iter()
+                    .find(|(k, _)| k.ends_with(&suffix))
+                    .map(|(_, h)| h)
+            })?;
+            let content = cache.content_path(hash);
+            content.exists().then_some(content)
+        };
 
+        let outputs = build_runner.outputs(&dep.unit)?;
         if build_runner.only_requires_rmeta(unit, &dep.unit) || dep.unit.mode.is_check() {
             // Example: rlib dependency for an rlib, rmeta is all that is required.
             let output = outputs
                 .iter()
                 .find(|output| output.flavor == FileFlavor::Rmeta)
                 .expect("failed to find rmeta dep for pipelined dep");
-            pass(&output.path);
+            match cached_path_for(&output.path) {
+                Some(cached) => pass(&cached),
+                None => pass(&output.path),
+            }
         } else {
             // Example: a bin needs `rlib` for dependencies, it cannot use rmeta.
             for output in outputs.iter() {
                 if output.flavor == FileFlavor::Linkable {
-                    pass(&output.path);
+                    match cached_path_for(&output.path) {
+                        Some(cached) => pass(&cached),
+                        None => pass(&output.path),
+                    }
                 }
                 // If we use -Zembed-metadata=no, we also need to pass the path to the
                 // corresponding .rmeta file to the linkable artifact, because the
                 // normal dependency (rlib) doesn't contain the full metadata.
                 else if no_embed_metadata && output.flavor == FileFlavor::Rmeta {
-                    pass(&output.path);
+                    match cached_path_for(&output.path) {
+                        Some(cached) => pass(&cached),
+                        None => pass(&output.path),
+                    }
                 }
             }
         }
@@ -2401,7 +2508,8 @@ fn on_stderr_line_inner(
         trace!("found directive from rustc: `{}`", artifact.artifact);
         if artifact.artifact.ends_with(".rmeta") {
             debug!("looks like metadata finished early!");
-            state.rmeta_produced();
+            let path = Path::new(artifact.artifact.as_ref());
+            state.rmeta_produced(path);
         }
         return Ok(false);
     }

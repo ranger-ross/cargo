@@ -165,6 +165,44 @@ impl UnitInner {
         self.pkg.package_id().source_id().is_path() && !self.is_std
     }
 
+    /// Returns whether this unit can use the cross-workspace build cache
+    ///
+    /// Only units with immutable inputs and outputs shared across workspaces
+    /// can be cached:
+    ///
+    /// - Local (path) packages can change between builds, so they are never
+    ///   cached.
+    /// - Packages with build scripts are excluded. Their library is compiled
+    ///   with workspace-local `$OUT_DIR` content and env vars baked in, so a
+    ///   cached artifact would not work in another workspace.
+    /// - Build script units are excluded (they run in the workspace).
+    /// - Bins, tests, benches, and examples are excluded. Bins link against
+    ///   workspace-local state. Test/bench units are rejected by the mode
+    ///   checks below; there is no explicit example-target check, but example
+    ///   units are always workspace-local, so `!is_local()` excludes them.
+    /// - Doc units are excluded because rustdoc writes to the workspace `doc/`
+    ///   directory.
+    /// - Artifact dependencies are excluded because their outputs go through a
+    ///   separate `artifact/<kind>` directory.
+    ///
+    /// This checks only the unit itself. There is one more graph-dependent
+    /// rule in [`crate::compiler::build_runner::compilation_files::
+    /// CompilationFiles::is_cacheable`]: a unit that depends on a path-sourced
+    /// package (often a registry crate with a `[patch]` that points to a local
+    /// path) is also not cacheable. The patched dependency is mutable
+    /// workspace state, so the dependent must use normal mtime-based freshness
+    /// instead of an immutable cache entry.
+    pub fn is_cacheable(&self) -> bool {
+        !self.is_local()
+            && !self.pkg.has_custom_build()
+            && !self.target.is_custom_build()
+            && !self.target.is_bin()
+            && !self.mode.is_doc()
+            && !self.mode.is_doc_scrape()
+            && !self.mode.is_any_test()
+            && !self.artifact.is_true()
+    }
+
     /// Returns whether or not warnings should be displayed for this unit.
     pub fn show_warnings(&self, gctx: &GlobalContext) -> bool {
         self.is_local() || gctx.extra_verbose()

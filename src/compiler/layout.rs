@@ -208,6 +208,7 @@
 //! `target/$TUPLE`.
 
 use crate::compiler::CompileTarget;
+use crate::compiler::cache::BuildCache;
 use crate::util::flock::is_on_nfs_mount;
 use crate::util::{CargoResult, FileLock};
 use crate::workspace::Workspace;
@@ -220,6 +221,12 @@ use std::path::{Path, PathBuf};
 pub struct Layout {
     artifact_dir: Option<ArtifactDirLayout>,
     build_dir: BuildDirLayout,
+    build_cache: BuildCache,
+    /// Whether the build cache can be used for this build. False when
+    /// `$CARGO_HOME/build-cache` cannot be written (for example a read-only
+    /// `CARGO_HOME`). Cacheable units then fall back to the workspace build
+    /// directory.
+    cache_enabled: bool,
     _lock: Option<FileLock>,
 }
 
@@ -316,6 +323,29 @@ impl Layout {
         } else {
             None
         };
+        let build_cache_root = ws.gctx().home().join("build-cache").into_path_unlocked();
+        // Only initialize the shared cache when the new layout is active.
+        // In legacy layout `is_cacheable` is always false, so cache errors
+        // should not fail the build.
+        let cache_enabled = if !is_new_layout {
+            false
+        } else {
+            match paths::create_dir_all(&build_cache_root) {
+                Ok(()) => true,
+                Err(e)
+                    if e.downcast_ref::<std::io::Error>()
+                        .is_some_and(|e| e.kind() == std::io::ErrorKind::PermissionDenied) =>
+                {
+                    tracing::debug!(
+                        "build cache disabled: cannot create {:?}: {e:?}",
+                        build_cache_root
+                    );
+                    false
+                }
+                Err(e) => return Err(e.into()),
+            }
+        };
+        // CAS needs no _staging; content/entries are created lazily in BuildCacheLayout::prepare
         Ok(Layout {
             artifact_dir,
             build_dir: BuildDirLayout {
@@ -330,6 +360,8 @@ impl Layout {
                 _lock: build_dir_lock,
                 is_new_layout,
             },
+            build_cache: BuildCache::new(build_cache_root),
+            cache_enabled,
             _lock: lock,
         })
     }
@@ -340,7 +372,7 @@ impl Layout {
             artifact_dir.prepare()?;
         }
         self.build_dir.prepare()?;
-
+        self.build_cache.prepare()?;
         Ok(())
     }
 
@@ -350,6 +382,16 @@ impl Layout {
 
     pub fn build_dir(&self) -> &BuildDirLayout {
         &self.build_dir
+    }
+
+    pub fn build_cache(&self) -> &BuildCache {
+        &self.build_cache
+    }
+
+    /// Returns whether the cross-workspace build cache can be used for
+    /// this build (whether `$CARGO_HOME/build-cache` is writable).
+    pub fn cache_enabled(&self) -> bool {
+        self.cache_enabled
     }
 }
 
@@ -444,11 +486,7 @@ impl BuildDirLayout {
     ///
     /// New features should consider using this so we can avoid their migrations.
     pub fn out_force_new_layout(&self, pkg_dir: &str) -> PathBuf {
-        let mut build_dir = self.build_unit(pkg_dir);
-        // This function can be somewhat hot for packages with many dependencies, so reuse the
-        // PathBuf allocation here.
-        build_dir.push("out");
-        build_dir
+        self.build_unit(pkg_dir).join("out")
     }
     /// Fetch the deps path. (old layout)
     pub fn legacy_deps(&self) -> &Path {
@@ -513,5 +551,45 @@ impl BuildDirLayout {
     pub fn prepare_tmp(&self) -> CargoResult<&Path> {
         paths::create_dir_all(&self.tmp)?;
         Ok(&self.tmp)
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct BuildCacheLayout {
+    root: PathBuf,
+}
+
+impl BuildCacheLayout {
+    pub fn new(root: PathBuf) -> Self {
+        Self { root }
+    }
+
+    pub fn prepare(&mut self) -> CargoResult<()> {
+        paths::create_dir_all(&self.root)?;
+        // Ensure CAS directories exist.
+        let _ = paths::create_dir_all(self.content_dir());
+        let _ = paths::create_dir_all(self.entries_dir());
+        Ok(())
+    }
+    /// Fetch the build unit path
+    pub fn build_unit(&self, pkg_dir: &str) -> PathBuf {
+        self.root.join(pkg_dir)
+    }
+    /// Directory holding content-addressed blobs:
+    /// `<build-cache>/content/lib<stem>-<fingerprint>[.<ext>]`.
+    pub fn content_dir(&self) -> PathBuf {
+        self.root.join("content")
+    }
+    /// Directory holding manifests: `<build-cache>/entries`.
+    pub fn entries_dir(&self) -> PathBuf {
+        self.root.join("entries")
+    }
+    /// Manifest file for a unit: `entries/<pkg>/<hash>`.
+    pub fn entry_manifest_path(&self, pkg_dir: &str) -> PathBuf {
+        self.entries_dir().join(pkg_dir)
+    }
+    /// Content file path for a stored name (`lib<stem>-<hash>[.<ext>]`).
+    pub fn content_path(&self, hash: &str) -> PathBuf {
+        self.content_dir().join(hash)
     }
 }

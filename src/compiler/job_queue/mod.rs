@@ -141,8 +141,6 @@ use super::timings::Timings;
 use crate::compiler::descriptive_pkg_name;
 use crate::compiler::future_incompat::{self, FutureBreakageItem, FutureIncompatReportPackage};
 use crate::context::WarningHandling;
-use crate::diagnostics::GlobalDiagnosticStats;
-use crate::diagnostics::rules::unused_dependencies;
 use crate::resolver::ResolveBehavior;
 use crate::util::CargoResult;
 use crate::util::diagnostic_server::{self, DiagnosticPrinter};
@@ -597,6 +595,7 @@ impl<'gctx> DrainState<'gctx> {
                 build_runner.bcx.ws.root(),
                 &unit,
                 job.freshness(),
+                &job,
             )?;
             self.run(&unit, job, build_runner, scope);
         }
@@ -841,14 +840,6 @@ impl<'gctx> DrainState<'gctx> {
         }
         self.progress.clear();
 
-        let mut global_stats = GlobalDiagnosticStats::new();
-        drop(unused_dependencies::lint_build_results(
-            build_runner,
-            &mut global_stats,
-        ));
-        errors.count += global_stats.error_count();
-        build_runner.compilation.lint_warning_count += global_stats.lint_warning_count();
-
         let profile_name = build_runner.bcx.build_config.requested_profile;
         // NOTE: this may be a bit inaccurate, since this may not display the
         // profile for what was actually built. Profile overrides can change
@@ -1003,7 +994,11 @@ impl<'gctx> DrainState<'gctx> {
         let rmeta_required = build_runner.rmeta_required(unit);
         let lock_manager = build_runner.lock_manager.clone();
         let warning_handling = build_runner.bcx.gctx.warning_handling().unwrap_or_default();
-
+        let cache = if unit.is_cacheable() {
+            Some(build_runner.files().build_cache().clone())
+        } else {
+            None
+        };
         let doit = move |diag_dedupe| {
             let state = JobState::new(
                 id,
@@ -1012,6 +1007,7 @@ impl<'gctx> DrainState<'gctx> {
                 rmeta_required,
                 lock_manager,
                 warning_handling,
+                cache,
             );
             state.run_to_finish(job);
         };
@@ -1220,6 +1216,7 @@ impl<'gctx> DrainState<'gctx> {
         ws_root: &Path,
         unit: &Unit,
         fresh: &Freshness,
+        job: &Job,
     ) -> CargoResult<()> {
         if (self.compiled.contains(&unit.pkg.package_id())
             && !unit.mode.is_doc()
@@ -1248,6 +1245,13 @@ impl<'gctx> DrainState<'gctx> {
                 } else if unit.mode.is_doc_scrape() {
                     self.scraped.insert(unit.pkg.package_id());
                     gctx.shell().status("Scraping", &unit.pkg)?;
+                } else if job
+                    .cache_hit_probe()
+                    .is_some_and(|probe| probe().unwrap_or(false))
+                {
+                    // A complete build-cache entry will be reused instead of
+                    // compiled; the job reports the hit itself.
+                    self.compiled.insert(unit.pkg.package_id());
                 } else {
                     self.compiled.insert(unit.pkg.package_id());
                     if unit.mode.is_check() {

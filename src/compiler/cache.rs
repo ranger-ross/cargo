@@ -6,6 +6,7 @@
 //! only describes the on-disk paths; this struct operates on them.
 
 use super::layout::BuildCacheLayout;
+use crate::util::data_structures::HashSet;
 use crate::util::CargoResult;
 use anyhow::Context as _;
 use cargo_util::paths;
@@ -261,7 +262,7 @@ impl BuildCache {
             }
         }
         // Collect referenced hashes.
-        let mut referenced = std::collections::HashSet::new();
+        let mut referenced = HashSet::default();
         if entries_root.exists() {
             for pkg_entry in std::fs::read_dir(&entries_root)?.flatten() {
                 let pkg_path = pkg_entry.path();

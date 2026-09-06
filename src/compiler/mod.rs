@@ -251,7 +251,9 @@ fn compile<'gctx>(
                 // date, so there is nothing to compile.
                 if build_runner.files().is_cacheable(unit) {
                     let cache_entry = build_runner.files().cache_build_unit(unit);
-                    println!(
+                    // Intentional stdout: user-facing hit message asserted by build_cache tests.
+                    let _ = writeln!(
+                        std::io::stdout(),
                         "build cache: `{}` {} is fresh (hit {})",
                         unit.pkg.name(),
                         unit.target.name(),
@@ -461,7 +463,9 @@ fn rustc(
             if let Some((completion, path)) = &cache_state {
                 if completion.is_complete(path)? {
                     if let Some((name, target, cache_entry)) = &cache_identity {
-                        println!(
+                        // Intentional stdout: user-facing hit message asserted by build_cache tests.
+                        let _ = writeln!(
+                            std::io::stdout(),
                             "build cache: `{}` {} is fresh (hit {})",
                             name,
                             target,

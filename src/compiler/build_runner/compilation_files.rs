@@ -1,7 +1,6 @@
 //! See [`CompilationFiles`].
 
 use std::cell::OnceCell;
-use std::collections::HashSet;
 use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
@@ -12,7 +11,7 @@ use tracing::debug;
 use super::{BuildContext, BuildRunner, CompileKind, FileFlavor, Layout};
 use crate::compiler::trim_paths;
 use crate::compiler::{CompileMode, CompileTarget, CrateType, FileType, Unit};
-use crate::util::data_structures::HashMap;
+use crate::util::data_structures::{HashMap, HashSet};
 use crate::util::{self, CargoResult, OnceExt, StableHasher};
 use crate::workspace::{Target, TargetKind, Workspace};
 

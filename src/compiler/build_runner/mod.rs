@@ -215,6 +215,11 @@ impl<'a, 'gctx> BuildRunner<'a, 'gctx> {
         // `finalize_cache_entry` finalization as they complete.
         let queue_result = queue.execute(&mut self);
         queue_result?;
+        // All jobs finished, so no rustc can still reference the workspace
+        // copies of uplifted outputs (dependents bake workspace `--extern`
+        // paths at plan time). Drop them; later builds resolve the cache
+        // blobs in place.
+        self.sweep_build_cache_originals();
         // Add `OUT_DIR` to env vars if unit has a build script.
         let units_with_build_script = &self
             .bcx
@@ -538,6 +543,21 @@ impl<'a, 'gctx> BuildRunner<'a, 'gctx> {
     /// Returns the filenames that the given unit will generate.
     pub fn outputs(&self, unit: &Unit) -> CargoResult<Arc<Vec<OutputFile>>> {
         self.files.as_ref().unwrap().outputs(unit, self.bcx)
+    }
+
+    /// Removes workspace build-dir directories of cacheable units already
+    /// owned by the build cache. Runs once, after every job finished.
+    /// Best-effort.
+    fn sweep_build_cache_originals(&self) {
+        for (unit, _) in self.bcx.unit_graph.iter() {
+            if !self.files().is_cacheable(unit) {
+                continue;
+            }
+            self.files().build_cache().sweep_unit_dir(
+                &self.files().pkg_dir(unit),
+                &self.files().build_unit_dir(unit),
+            );
+        }
     }
 
     /// Direct dependencies for the given unit.

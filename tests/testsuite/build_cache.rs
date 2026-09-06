@@ -157,16 +157,16 @@ hello world
 
     // The immutable dependency artifact lives in the build cache (CAS).
     // With the CAS design, the artifact is built in the workspace build-dir
-    // (for pipelining) and hardlinked into `content`; the workspace still
-    // contains the rlib after the first build.
+    // (for pipelining), hardlinked into `content`, and the whole unit dir is
+    // removed after the build; dependents resolve the blob in place.
     assert_eq!(cached_rlibs().len(), 1, "cache should contain the dep rlib");
     let workspace_dep_rlibs = collect_files(&paths::root().join("foo/target"))
         .into_iter()
         .filter(|p| p.extension().is_some_and(|e| e == "rlib"))
         .count();
-    assert!(
-        workspace_dep_rlibs >= 1,
-        "workspace should contain the built rlib (CAS builds in build-dir)"
+    assert_eq!(
+        workspace_dep_rlibs, 0,
+        "uplifted rlibs must not linger in the workspace build-dir"
     );
 
     // A second workspace depending on the same git revision reuses the cached

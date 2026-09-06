@@ -6,8 +6,8 @@
 //! only describes the on-disk paths; this struct operates on them.
 
 use super::layout::BuildCacheLayout;
-use crate::util::data_structures::HashSet;
 use crate::util::CargoResult;
+use crate::util::data_structures::HashSet;
 use anyhow::Context as _;
 use cargo_util::paths;
 use std::path::{Path, PathBuf};
@@ -181,6 +181,10 @@ impl BuildCache {
     /// stem and break the lookup with `E0463`. The fingerprint (which includes
     /// the compile mode) is unique per distinct build, so names never collide
     /// across configurations; identical builds share the name and dedupe.
+    /// The workspace originals are left in place: dependents bake workspace
+    /// `--extern` paths at plan time, before this publish runs. The unit's
+    /// build-dir directory is removed after the build by
+    /// [`BuildCache::sweep_unit_dir`].
     pub fn publish_unit_to_cas(
         &self,
         pkg_dir: &str,
@@ -231,8 +235,25 @@ impl BuildCache {
         }
         self.write_manifest_atomic(pkg_dir, &manifest)
     }
+    /// Remove a unit's workspace build-dir directory once the cache owns it.
+    ///
+    /// Call only after the build's jobs all finished: dependents bake
+    /// workspace `--extern` paths at plan time, so the directory must survive
+    /// until no rustc can still reference it. Planner freshness for cacheable
+    /// units is manifest-driven (see `prepare_target`), so no workspace state
+    /// is needed on later builds. Removal happens only when the manifest
+    /// exists and every content blob is present; anything else is kept as the
+    /// workspace fallback. Best-effort.
+    pub fn sweep_unit_dir(&self, pkg_dir: &str, unit_dir: &Path) {
+        let complete = match self.read_manifest(pkg_dir) {
+            Ok(Some(manifest)) => self.manifest_content_exists(&manifest),
+            _ => false,
+        };
+        if complete {
+            let _ = std::fs::remove_dir_all(unit_dir);
+        }
+    }
 
-    /// GC helper: remove manifests older than `max_age` and then unreferenced content.
     pub fn gc(&self, max_age: std::time::Duration) -> CargoResult<(usize, usize)> {
         let cutoff = std::time::SystemTime::now()
             .checked_sub(max_age)
@@ -338,4 +359,87 @@ pub struct CacheEntryManifest {
     /// stored; fingerprint files and dep-info live in the workspace build-dir
     /// and are not deduplicated into `content`.
     pub files: std::collections::BTreeMap<String, String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_cache() -> (tempfile::TempDir, BuildCache, PathBuf) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut cache = BuildCache::new(dir.path().join("cache"));
+        cache.prepare().unwrap();
+        let src = dir.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        (dir, cache, src)
+    }
+
+    fn write_src(src: &Path, name: &str, bytes: &[u8]) -> PathBuf {
+        let path = src.join(name);
+        std::fs::write(&path, bytes).unwrap();
+        path
+    }
+
+    #[test]
+    fn publish_keeps_build_dir_originals() {
+        let (_dir, cache, src) = test_cache();
+        let pkg = "foo/abc123";
+        let rmeta = write_src(&src, "libfoo.rmeta", b"rmeta-v1");
+        let rlib = write_src(&src, "libfoo.rlib", b"rlib-v1");
+        cache
+            .publish_unit_to_cas(pkg, "fp1", &rmeta, Some(&rlib))
+            .unwrap();
+        // Dependents bake workspace paths at plan time, so publish must not
+        // touch the originals; the sweep below removes them post-build.
+        assert!(rmeta.is_file());
+        assert!(rlib.is_file());
+    }
+
+    #[test]
+    fn sweep_removes_whole_unit_dir() {
+        let (_dir, cache, src) = test_cache();
+        let pkg = "foo/abc123";
+        // Unit dir layout mirrors the workspace build-dir: artifacts plus the
+        // files publish never uploads (fingerprint, dep-info, lock). None of
+        // it is needed: planner freshness is manifest-driven.
+        let unit_dir = src.join("build").join("foo").join("abc123");
+        let out = unit_dir.join("out");
+        let fp = unit_dir.join("fingerprint");
+        std::fs::create_dir_all(&out).unwrap();
+        std::fs::create_dir_all(&fp).unwrap();
+        let rmeta = write_src(&out, "libfoo.rmeta", b"rmeta-v1");
+        let rlib = write_src(&out, "libfoo.rlib", b"rlib-v1");
+        std::fs::write(fp.join("libfoo"), b"fingerprint").unwrap();
+        std::fs::write(fp.join("dep-libfoo"), b"dep-info").unwrap();
+        std::fs::write(unit_dir.join(".lock"), b"lock").unwrap();
+        cache
+            .publish_unit_to_cas(pkg, "fp1", &rmeta, Some(&rlib))
+            .unwrap();
+        cache.sweep_unit_dir(pkg, &unit_dir);
+        assert!(!unit_dir.exists(), "swept unit dir must be gone entirely");
+        assert_eq!(
+            std::fs::read(cache.content_path("libfoo-fp1.rmeta")).unwrap(),
+            b"rmeta-v1"
+        );
+        let manifest = cache.read_manifest(pkg).unwrap().unwrap();
+        assert!(cache.manifest_content_exists(&manifest));
+    }
+
+    #[test]
+    fn sweep_keeps_dir_without_complete_entry() {
+        let (_dir, cache, src) = test_cache();
+        let unit_dir = src.join("build").join("foo").join("abc123");
+        std::fs::create_dir_all(&unit_dir).unwrap();
+        let rmeta = write_src(&unit_dir, "libfoo.rmeta", b"rmeta");
+        // No manifest: keep as the workspace fallback.
+        cache.sweep_unit_dir("foo/abc123", &unit_dir);
+        assert!(rmeta.is_file());
+        // Manifest with missing content: keep too.
+        cache
+            .publish_unit_to_cas("foo/abc123", "fp1", &rmeta, None)
+            .unwrap();
+        std::fs::remove_file(cache.content_path("libfoo-fp1.rmeta")).unwrap();
+        cache.sweep_unit_dir("foo/abc123", &unit_dir);
+        assert!(unit_dir.is_dir());
+    }
 }

@@ -796,9 +796,10 @@ fn link_targets(
     fresh: bool,
 ) -> CargoResult<Work> {
     // CAS cacheable units build directly in the workspace build-dir (like
-    // non-cacheable units); no staging remapping is needed. Fresh hits reuse
-    // the `content` blobs in place (missing build-dir outputs are skipped
-    // below); dependents resolve them via `-L` on the content dir.
+    // non-cacheable units); no staging remapping is needed. After the build
+    // the uplifted originals are swept, so hits reuse the `content` blobs in
+    // place (missing outputs are skipped below); dependents resolve them via
+    // `-L` on the content dir.
     let _ = fresh;
     let outputs = build_runner.outputs(unit)?;
     let bcx = build_runner.bcx;

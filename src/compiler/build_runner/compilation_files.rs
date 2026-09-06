@@ -399,6 +399,12 @@ impl<'a, 'gctx: 'a> CompilationFiles<'a, 'gctx> {
         let unit_dir = self.layout(unit.kind).build_dir().build_unit(&dir);
         unit_dir.join(".lock")
     }
+    /// Workspace build-dir root for a unit (`build/<pkg>/<hash>`), holding
+    /// `out/`, `fingerprint/` and the unit lock.
+    pub fn build_unit_dir(&self, unit: &Unit) -> PathBuf {
+        let dir = self.pkg_dir(unit);
+        self.layout(unit.kind).build_dir().build_unit(&dir)
+    }
 
     /// Directory where incremental output for the given unit should go.
     ///

@@ -492,10 +492,34 @@ pub fn prepare_target(
         Vec::new()
     };
     let mtime_on_use = build_runner.bcx.gctx.cli_unstable().mtime_on_use;
-    let dirty_reason = match compare_old_fingerprint(unit, &loc, &*fingerprint, mtime_on_use, force)
-    {
-        FingerprintComparison::Fresh => None,
-        FingerprintComparison::Dirty { reason } => Some(reason),
+    // A cacheable unit with a complete manifest entry is fresh without
+    // consulting workspace files: the manifest hash covers identity (plus
+    // pinned dependency rmeta checksums) and the content check covers
+    // outputs, both strictly stronger than mtime state. This keeps swept
+    // units planner-fresh instead of dirty-plan-then-hit.
+    let cache_complete = if is_cacheable && !force {
+        let fresh_fp = fingerprint.deep_clone();
+        refresh_cache_dep_checksums(&fresh_fp, &rmeta_checksum_paths)?;
+        let expected = util::to_hex(fresh_fp.hash_u64());
+        let pkg_dir = build_runner.files().pkg_dir(unit);
+        let cache = build_runner.files().build_cache();
+        match cache.read_manifest(&pkg_dir) {
+            Ok(Some(manifest)) => {
+                manifest.fingerprint_hash.trim() == expected.trim()
+                    && cache.manifest_content_exists(&manifest)
+            }
+            _ => false,
+        }
+    } else {
+        false
+    };
+    let dirty_reason = if cache_complete {
+        None
+    } else {
+        match compare_old_fingerprint(unit, &loc, &*fingerprint, mtime_on_use, force) {
+            FingerprintComparison::Fresh => None,
+            FingerprintComparison::Dirty { reason } => Some(reason),
+        }
     };
 
     if let Some(logger) = bcx.logger {

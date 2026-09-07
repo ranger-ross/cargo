@@ -345,7 +345,7 @@ impl Layout {
                 Err(e) => return Err(e.into()),
             }
         };
-        // CAS needs no _staging; content/entries are created lazily in BuildCacheLayout::prepare
+        // content/entries are created lazily in BuildCacheLayout::prepare
         Ok(Layout {
             artifact_dir,
             build_dir: BuildDirLayout {

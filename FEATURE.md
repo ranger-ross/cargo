@@ -19,11 +19,11 @@ $CARGO_HOME/build-cache/
   entries/
     $pkgname/
       $hash           manifest JSON: { fingerprint_hash, files: { "out/foo.rlib": "<sha256>", ... } }
-  # Legacy entries from earlier staging builds (if present) are ignored;
-  # CAS entries are authoritative.
+  # Manifests carry `CACHE_MANIFEST_VERSION`; older schemas are treated as
+  # absent and rebuilt. CAS entries are authoritative.
 ```
 
-Cacheable units are compiled directly in the workspace `build-dir` (e.g. `target/debug/build/$pkg/$hash/{out,fingerprint}`) so that pipelined builds and `rmeta`/`rlib` ordering work naturally. After the unit finishes, `CompilationFiles::publish_to_cas` hashes each output and fingerprint file with SHA-256, hardlinks (or copies on `EXDEV`) them into `content/<sha256>`, and atomically writes a manifest at `entries/$pkg/$hash` containing the expected fingerprint hash and the `rel -> sha256` map. `AlreadyExists` is treated as success (another process published first); empty or incomplete manifests are treated as poisoned and retried. Once every job finished, the build removes each uplifted unit's whole `build-dir` directory: planner freshness for cacheable units is manifest-driven, so no workspace state is needed on later builds. Dependents bake workspace `--extern` paths at plan time, so the directory must survive until no rustc can reference it. No per-unit `_staging/<pid>` directory is used.
+Cacheable units are compiled directly in the workspace `build-dir` (e.g. `target/debug/build/$pkg/$hash/{out,fingerprint}`) so that pipelined builds and `rmeta`/`rlib` ordering work naturally. After the unit finishes, `JobState::finalize_cache_entry` calls `BuildCache::publish_unit_to_cas`, which hashes each output with SHA-256, hardlinks (or copies on `EXDEV`) them into `content/<sha256>`, and atomically writes a manifest at `entries/$pkg/$hash` containing the expected fingerprint hash and the `rel -> sha256` map. `AlreadyExists` is treated as success (another process published first); empty or incomplete manifests are treated as poisoned and retried. Once every job finishes, the build sweeps each cacheable unit's workspace `build-dir` directory when its manifest is complete (all content blobs present); anything else is kept as the workspace fallback. Planner freshness for cacheable units is manifest-driven, so no workspace state is needed on later builds.
 
 On a cache hit nothing is copied or linked out of the cache: the `rustc` invocation is skipped via the `CacheCompletionState::is_complete` probe and dependents read the blobs in place. Stored names keep the `lib<stem>-<fingerprint>.<ext>` shape so direct deps load via explicit `--extern` and transitive deps resolve via `-L dependency=<content-dir>` discovery (which requires an rmeta/rlib pair of one build to share the exact stem).
 
@@ -31,13 +31,13 @@ On a cache hit nothing is copied or linked out of the cache: the `rustc` invocat
 
 Cached units use the normal fingerprint check. The stored fingerprint must match the freshly computed one and the unit's own outputs must exist. The stored fingerprint is normalized so it stays stable after `cargo clean` (see implementation details). An entry is only rebuilt when its identity changes or the entry is incomplete.
 
-For cacheable units the filesystem check does not compare dependency mtimes. Instead it checks that the manifest exists, all `content` blobs exist, and the stored `fingerprint_hash` matches the freshly computed expected hash (with pinned rmeta checksums refreshed). Dependency mtimes are ignored for cacheable units, content matching through pinned rmeta checksums is the check that matters. The stored fingerprint is not truncated when a cacheable unit is planned as dirty, because that file lives inside the CAS manifest's fingerprint set.
+For cacheable units the filesystem check does not compare dependency mtimes. Instead it checks that the manifest exists, all `content` blobs exist, and the stored `fingerprint_hash` matches the freshly computed expected hash (with pinned rmeta checksums refreshed). Dependency mtimes are ignored for cacheable units; content matching through pinned rmeta checksums is the check that matters. Like every other unit, a cacheable unit planned as dirty gets its build-dir fingerprint truncated to guard against corrupt partial outputs.
 
 Because artifacts are content-addressed, absolute output paths do not affect the cache key. `normalize_cache_deps` replaces path-dependent parts of the fingerprint with content-based `rmeta` checksums. `refresh_cache_dep_checksums` runs at publish time (after deps are built) and again lazily when `expected_hash` is checked.
 
 ### Concurrency
 
-The CAS design does not use per-unit locks. Multiple cargo processes may race to build the same unit, each in its own workspace `build-dir`. The first `write_manifest_atomic` to succeed publishes; the others discard their hardlinked content (already deduplicated) and reuse the winner on the next build. Inside a single cargo, dependencies build before dependents, so the fingerprint's `is_complete` probe can see the manifest become complete after dependencies are published. That choice is guarded by `is_cacheable` so non-cacheable path deps do not hit the `debug_assert`.
+The CAS design does not use per-unit locks. Multiple cargo processes may race to build the same unit, each in its own workspace `build-dir`. The first `write_manifest_atomic` to succeed publishes; the others discard their hardlinked content (already deduplicated) and reuse the winner on the next build. Inside a single cargo, dependencies build before dependents, so the fingerprint's `is_complete` probe can see the manifest become complete after dependencies are published.
 
 Pipelined builds (where `rmeta` is available before `rlib`) still work because the whole dependency graph for that cargo lives in the same `build-dir` until publish, and `rmeta` is published as part of the manifest. No cross-process pipelining is needed; a waiter in another process just sees the entry as incomplete until the manifest is written.
 
@@ -45,11 +45,10 @@ Crash recovery is implicit. A builder killed mid-compile never publishes, so no 
 
 ## Modules affected
 
-- `src/compiler/layout.rs`. `BuildCacheLayout` CAS helpers (`content_dir`, `entries_dir`, `entry_manifest_path`, `content_path`, `hash_file`, `insert_into_content`, `write_manifest_atomic`, `read_manifest`, `manifest_content_exists`, `touch_manifest`, `publish_unit_to_cas`, `restore_from_cas`, `gc`).
-- `src/compiler/build_runner/compilation_files.rs`. Always routes cacheable units to the workspace `build-dir`; `is_cacheable` gating and `publish_to_cas` batch.
+- `src/compiler/cache.rs`. `BuildCache` CAS operations (`hash_file`, `insert_into_content`, `write_manifest_atomic`, `read_manifest`, `manifest_content_exists`, `touch_manifest`, `publish_unit_to_cas`, `sweep_unit_dir`, `gc`) over `BuildCacheLayout` paths (`content_dir`, `entries_dir`, `entry_manifest_path`, `content_path`).
+- `src/compiler/build_runner/compilation_files.rs`. Always routes cacheable units to the workspace `build-dir`; `is_cacheable` gating.
 - `src/compiler/fingerprint/mod.rs`. Fingerprint normalization for cacheable units, pinned dependency rmeta checksums, lazy completion hashing, and the CAS manifest+content filesystem check.
-- `src/compiler/mod.rs`. `CacheCompletionState` probe and `build cache: ... is fresh (hit ...)` diagnostics; `link_targets` no longer remaps through staging.
-- `src/compiler/unit.rs`. `Unit::is_cacheable`, the per-unit predicate.
+- `src/compiler/mod.rs`. `CacheCompletionState` probe and `build cache: ... is fresh (hit ...)` diagnostics; `link_targets` needs no remapping because cacheable units already build in the workspace `build-dir`.
 - `src/compiler/job_queue/`. Cache-hit probe so the queue does not print `Compiling` for a unit that will be reused from cache.
 - `tests/testsuite/build_cache.rs`. 14 integration tests covering reuse across workspaces and after `cargo clean`, concurrent builders, git revision bumps, exclusions and output checks; helpers now resolve via `entries`/`content`.
 

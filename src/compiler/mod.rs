@@ -347,8 +347,9 @@ fn make_failed_scrape_diagnostic(
 /// Creates work that runs `rustc` for `unit`.
 ///
 /// `cache_state` is the build-cache completion state for cacheable units.
-/// Staging makes per-unit locking unnecessary; we only need to check if the
-/// cache entry became complete after dependencies were built.
+/// Units build in their own workspace `build-dir`, so no per-unit locking is
+/// needed; we only check if the cache entry became complete after
+/// dependencies were built.
 fn rustc(
     build_runner: &mut BuildRunner<'_, '_>,
     unit: &Unit,
@@ -380,9 +381,6 @@ fn rustc(
     let manifest = ManifestErrorContext::new(build_runner, unit);
     let build_scripts = build_runner.build_scripts.get(unit).cloned();
     let pass_l_flag = unit.target.is_lib() || !unit.pkg.targets().iter().any(|t| t.is_lib());
-    // if !dep_info_loc.exists() {
-    //     paths::create_dir_all(&dep_info_loc.parent().unwrap()).unwrap();
-    // }
 
     let mut output_options = OutputOptions::for_dirty(build_runner, unit);
     let package_id = unit.pkg.package_id();
@@ -795,12 +793,10 @@ fn link_targets(
     unit: &Unit,
     fresh: bool,
 ) -> CargoResult<Work> {
-    // CAS cacheable units build directly in the workspace build-dir (like
-    // non-cacheable units); no staging remapping is needed. After the build
-    // the uplifted originals are swept, so hits reuse the `content` blobs in
-    // place (missing outputs are skipped below); dependents resolve them via
-    // `-L` on the content dir.
-    let _ = fresh;
+    // Cacheable units build directly in the workspace build-dir (like
+    // non-cacheable units). After the build the uplifted originals are
+    // swept, so hits reuse the `content` blobs in place (missing outputs
+    // are skipped below); dependents resolve them via `-L` on the content dir.
     let outputs = build_runner.outputs(unit)?;
     let bcx = build_runner.bcx;
     let export_dir = build_runner.files().export_dir();
@@ -1867,13 +1863,6 @@ fn add_dep_arg<'a, 'b: 'a>(
         if map.contains_key(&dep.unit) {
             continue;
         }
-        // TODO: It would be super nice if we could avoid passing the `-L` args for cache deps.
-        //       The issue is that for the first build, the artifacts are not in the yet.
-        //       This can be solved by 1) hardlinking rmeta before calling rmeta_produced, and 2)
-        //       hardlinking rlib before the build unit completes.
-        // if build_runner.files().is_cacheable(&dep.unit) {
-        //     continue;
-        // }
         let dep_dir = build_runner.files().deps_dir(&dep.unit);
         map.insert(&dep.unit, dep_dir);
 

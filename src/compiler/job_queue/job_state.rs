@@ -57,7 +57,7 @@ pub struct JobState<'a, 'gctx> {
     /// Manages locks for build units when fine grain locking is enabled.
     lock_manager: Arc<LockManager>,
 
-    // None if its not cacheable
+    /// Shared build cache. None for non-cacheable units.
     cache: Option<BuildCache>,
     rmeta_cache_path: RefCell<Option<PathBuf>>,
 

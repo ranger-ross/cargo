@@ -586,10 +586,6 @@ pub fn prepare_target(
     // But the executable is corrupt and needs to be rebuilt. Clearing the
     // fingerprint at step 3 ensures that Cargo never mistakes a partially
     // written output as up-to-date.
-    // Clear out the old fingerprint file if it exists. This protects when
-    // compilation is interrupted leaving a corrupt file. (see long comment above)
-    // For cacheable units the fingerprint lives in the workspace build-dir (not in the
-    // immutable cache), so truncation is safe and mirrors non-cacheable units.
     if loc.exists() {
         // Truncate instead of delete so that compare_old_fingerprint will
         // still log the reason for the fingerprint failure instead of just
@@ -2382,22 +2378,13 @@ fn write_fingerprint(loc: &Path, fingerprint: &Fingerprint) -> CargoResult<()> {
 
 /// Prepare for work when a package starts to build
 pub fn prepare_init(build_runner: &mut BuildRunner<'_, '_>, unit: &Unit) -> CargoResult<()> {
-    // With the CAS design cacheable units build in the workspace `build-dir`
-    // (not staging), so we use the normal fingerprint directory for all units.
+    // Cacheable units build in the workspace `build-dir`, so all units use
+    // the normal fingerprint directory.
     let fingerprint_dir = build_runner.files().fingerprint_dir(unit);
 
     // Doc tests have no output, thus no fingerprint.
     if !fingerprint_dir.exists() && !unit.mode.is_doc_test() {
         paths::create_dir_all(&fingerprint_dir)?;
-    }
-
-    // Ensure the output directory exists for cacheable units so later
-    // `create_dir_all(root)` is cheap. Not required for correctness.
-    if build_runner.files().is_cacheable(unit) {
-        let out = build_runner.files().deps_dir(unit);
-        if !out.exists() {
-            paths::create_dir_all(&out)?;
-        }
     }
 
     Ok(())
@@ -2443,17 +2430,10 @@ impl CacheCompletionState {
     /// For cacheable units, checks manifest `fingerprint_hash` and content existence.
     /// For non-cacheable, checks stored fingerprint file.
     pub(crate) fn is_complete(&self, fingerprint_path: &std::path::Path) -> CargoResult<bool> {
-        // Heuristic: fingerprint_path is under `build-dir` for both, but for cacheable
-        // we must check CAS manifest. We detect CAS by trying to locate manifest via
-        // path's parent? Instead we rely on fs_up_to_date already computed via manifest.
-        // To keep call-site simple, we check both: if manifest says complete, return true.
-        // The caller passes build-dir fingerprint path, but for cacheable the file may not exist (clean).
-        // We compare expected hash against manifest's fingerprint_hash when available.
-        // Fallback to file comparison for non-cacheable.
+        // Cacheable entries live in the CAS manifest, not the build-dir
+        // fingerprint file (absent after a clean), so compare the refreshed
+        // expected hash against the manifest and check content exists.
         if self.manifest_pkg_dir.is_some() {
-            // CAS path: fs_up_to_date already reflects manifest + content existence and hash match is checked there?
-            // Actually we need to check hash equality separately. Caller expects is_complete to compare stored vs expected.
-            // So we re-check manifest's hash vs expected.
             let expected = self.expected_hash()?;
             if let Some(pkg_dir) = &self.manifest_pkg_dir {
                 if let Some(layout) = &self.build_cache_layout {

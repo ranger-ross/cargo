@@ -90,7 +90,7 @@ fn cached_pkgs() -> Vec<String> {
         .expect("cache root should exist")
         .flatten()
         .map(|e| e.file_name().to_string_lossy().to_string())
-        .filter(|name| name != "_staging" && name != "content" && name != "entries")
+        .filter(|name| name != "content" && name != "entries")
         .collect();
     names.sort();
     names
@@ -409,9 +409,9 @@ fn held_locks_summarized_under_build_analysis() {
         .build();
     // Worker threads take the per-unit state locks silently, so the cold
     // build summarizes them at the end under -Zbuild-analysis.
-    // With the staging design, cacheable units are built in
-    // `_staging/<pid>` and published atomically, so no per-unit locks
-    // are held at the end. The build should succeed without `Held`.
+    // Cacheable units build in their own workspace `build-dir` and publish
+    // without holding per-unit locks at the end. The build should succeed
+    // without `Held`.
     ws.cargo("build -Zbuild-analysis")
         .masquerade_as_nightly_cargo(&["build_analysis"])
         .with_stderr_does_not_contain("Held")

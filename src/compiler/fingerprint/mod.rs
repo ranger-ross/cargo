@@ -691,17 +691,6 @@ struct DepFingerprint {
 pub struct Fingerprint {
     /// Hash of the version of `rustc` used.
     rustc: u64,
-    /// The unit's `-C metadata` value (its artifact identity).
-    ///
-    /// The fingerprint must record the exact `-C metadata` used to compile the
-    /// unit. Dependency artifacts embed each other's metadata hashes, so if a
-    /// dependency is rebuilt with different metadata (for example a stale
-    /// workspace artifact from an older Cargo or a divergent unit graph),
-    /// every cached artifact linking it becomes unusable (`E0460`/`E0463`)
-    /// even though source content is unchanged. Without this field the
-    /// freshness check would keep accepting that bad entry.
-    #[serde(default)]
-    metadata: u64,
     /// Sorted list of cfg features enabled.
     features: String,
     /// Sorted list of all the declared cfg features.
@@ -1103,7 +1092,6 @@ impl Fingerprint {
     fn new() -> Fingerprint {
         Fingerprint {
             rustc: 0,
-            metadata: 0,
             target: 0,
             profile: 0,
             path: 0,
@@ -1140,7 +1128,6 @@ impl Fingerprint {
     fn deep_clone(&self) -> Fingerprint {
         Fingerprint {
             rustc: self.rustc,
-            metadata: self.metadata,
             features: self.features.clone(),
             declared_features: self.declared_features.clone(),
             target: self.target,
@@ -1510,7 +1497,6 @@ impl hash::Hash for Fingerprint {
     fn hash<H: Hasher>(&self, h: &mut H) {
         let Fingerprint {
             rustc,
-            metadata,
             ref features,
             ref declared_features,
             target,
@@ -1526,7 +1512,6 @@ impl hash::Hash for Fingerprint {
         let local = local.lock().unwrap();
         (
             rustc,
-            metadata,
             features,
             declared_features,
             target,
@@ -2106,7 +2091,6 @@ fn calculate_normal(
     // differently
     Ok(Fingerprint {
         rustc: util::hash_u64(&build_runner.bcx.rustc().verbose_version),
-        metadata: build_runner.files().metadata(unit).c_metadata().hash(),
         target: util::hash_u64(&unit.target),
         profile: profile_hash,
         // Note that .0 is hashed here, not .1 which is the cwd. That doesn't
@@ -2185,7 +2169,6 @@ See https://doc.rust-lang.org/cargo/reference/build-scripts.html#rerun-if-change
     Ok(Fingerprint {
         local: Mutex::new(local),
         rustc: util::hash_u64(&build_runner.bcx.rustc().verbose_version),
-        metadata: build_runner.files().metadata(unit).c_metadata().hash(),
         deps,
         outputs: if overridden { Vec::new() } else { vec![output] },
         rustflags,

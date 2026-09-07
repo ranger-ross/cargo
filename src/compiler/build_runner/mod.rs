@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::compiler::compilation::{self, UnitOutput};
 use crate::compiler::locking::LockManager;
-use crate::compiler::{self, Unit, UserIntent, artifact};
+use crate::compiler::{self, Unit, UnitIndex, UserIntent, artifact};
 use crate::util::cache_lock::CacheLockMode;
 use crate::util::errors::CargoResult;
 use crate::workspace::PackageId;
@@ -94,6 +94,11 @@ pub struct BuildRunner<'a, 'gctx> {
 
     /// Manages locks for build units when fine grain locking is enabled.
     pub lock_manager: Arc<LockManager>,
+
+    /// Indices of units built in the cross-workspace cache. The mtime
+    /// freshness chain ignores these dependencies (see
+    /// `Fingerprint::check_filesystem`).
+    pub cacheable_unit_indices: HashSet<UnitIndex>,
 }
 
 impl<'a, 'gctx> BuildRunner<'a, 'gctx> {
@@ -135,6 +140,7 @@ impl<'a, 'gctx> BuildRunner<'a, 'gctx> {
             failed_scrape_units: Arc::new(Mutex::new(HashSet::default())),
             unused_dep_state: UnusedDepState::new(bcx),
             lock_manager: Arc::new(LockManager::new()),
+            cacheable_unit_indices: HashSet::default(),
         })
     }
 
@@ -205,8 +211,15 @@ impl<'a, 'gctx> BuildRunner<'a, 'gctx> {
         }
 
         // Now that we've figured out everything that we're going to do, do it!
-        queue.execute(&mut self)?;
-
+        // Cacheable units publish themselves into the CAS from per-unit
+        // `finalize_cache_entry` finalization as they complete.
+        let queue_result = queue.execute(&mut self);
+        queue_result?;
+        // All jobs finished, so no rustc can still reference the workspace
+        // copies of uplifted outputs (dependents bake workspace `--extern`
+        // paths at plan time). Drop them; later builds resolve the cache
+        // blobs in place.
+        self.sweep_build_cache_originals();
         // Add `OUT_DIR` to env vars if unit has a build script.
         let units_with_build_script = &self
             .bcx
@@ -456,6 +469,19 @@ impl<'a, 'gctx> BuildRunner<'a, 'gctx> {
         self.record_units_requiring_metadata();
 
         let files = CompilationFiles::new(self, host_layout, targets);
+        // Indices of units built in the cross-workspace cache. The
+        // freshness mtime chain ignores these dependencies: their cache
+        // artifacts are immutable and normalized fingerprint content is the
+        // authoritative signal. A newer mtime only means the shared entry was
+        // written after this unit last built, not that the dependency changed
+        // (see `Fingerprint::check_filesystem`).
+        self.cacheable_unit_indices = self
+            .bcx
+            .unit_to_index
+            .iter()
+            .filter(|(unit, _)| files.is_cacheable(unit))
+            .map(|(_, &index)| index)
+            .collect();
         self.files = Some(files);
         Ok(())
     }
@@ -517,6 +543,21 @@ impl<'a, 'gctx> BuildRunner<'a, 'gctx> {
     /// Returns the filenames that the given unit will generate.
     pub fn outputs(&self, unit: &Unit) -> CargoResult<Arc<Vec<OutputFile>>> {
         self.files.as_ref().unwrap().outputs(unit, self.bcx)
+    }
+
+    /// Removes workspace build-dir directories of cacheable units already
+    /// owned by the build cache. Runs once, after every job finished.
+    /// Best-effort.
+    fn sweep_build_cache_originals(&self) {
+        for (unit, _) in self.bcx.unit_graph.iter() {
+            if !self.files().is_cacheable(unit) {
+                continue;
+            }
+            self.files().build_cache().sweep_unit_dir(
+                &self.files().pkg_dir(unit),
+                &self.files().build_unit_dir(unit),
+            );
+        }
     }
 
     /// Direct dependencies for the given unit.

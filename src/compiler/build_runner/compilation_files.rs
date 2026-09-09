@@ -1,5 +1,6 @@
 //! See [`CompilationFiles`].
 
+use crate::compiler::layout::BuildCacheLayout;
 use crate::util::data_structures::HashMap;
 use std::cell::OnceCell;
 use std::fmt;
@@ -245,7 +246,7 @@ impl<'a, 'gctx: 'a> CompilationFiles<'a, 'gctx> {
     ///
     /// Note that some units may share the same directory, so care should be
     /// taken in those cases!
-    fn pkg_dir(&self, unit: &Unit) -> String {
+    pub fn pkg_dir(&self, unit: &Unit) -> String {
         let separator = match self.ws.gctx().cli_unstable().build_dir_new_layout {
             true => "/",
             false => "-",
@@ -645,6 +646,10 @@ impl<'a, 'gctx: 'a> CompilationFiles<'a, 'gctx> {
         debug!("Target filenames: {:?}", ret);
 
         Ok(Arc::new(ret))
+    }
+
+    pub fn build_cache_layout(&self) -> BuildCacheLayout {
+        self.layout(CompileKind::Host).build_cache().clone()
     }
 
     /// Append the SBOM suffix to the file name.

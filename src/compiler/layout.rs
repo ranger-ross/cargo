@@ -349,6 +349,7 @@ impl Layout {
             artifact_dir.prepare()?;
         }
         self.build_dir.prepare()?;
+        self.build_cache.prepare()?;
 
         Ok(())
     }
@@ -535,6 +536,14 @@ pub struct BuildCacheLayout {
 }
 
 impl BuildCacheLayout {
+    /// Makes sure all directories stored in the Layout exist on the filesystem.
+    pub fn prepare(&mut self) -> CargoResult<()> {
+        paths::create_dir_all(self.content_dir())?;
+        paths::create_dir_all(self.entries_dir())?;
+
+        Ok(())
+    }
+
     pub fn content_dir(&self) -> PathBuf {
         self.root.join("content")
     }

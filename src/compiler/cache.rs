@@ -28,8 +28,6 @@ impl BuildCache {
         let rlib_hash = Self::hash(rlib)?;
 
         let content = self.layout.content_dir();
-        // TODO: move this out so its only ran once at startup to save IO/syscalls
-        cargo_util::paths::create_dir_all(&content)?;
         let rmeta_path = content.join(rmeta_hash);
         let rlib_path = content.join(rlib_hash);
 

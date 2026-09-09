@@ -220,6 +220,7 @@ use std::path::{Path, PathBuf};
 pub struct Layout {
     artifact_dir: Option<ArtifactDirLayout>,
     build_dir: BuildDirLayout,
+    build_cache: BuildCacheLayout,
     _lock: Option<FileLock>,
 }
 
@@ -330,6 +331,14 @@ impl Layout {
                 _lock: build_dir_lock,
                 is_new_layout,
             },
+            build_cache: BuildCacheLayout {
+                root: ws
+                    .gctx()
+                    .home()
+                    .clone()
+                    .into_path_unlocked()
+                    .join("build-cache"),
+            },
             _lock: lock,
         })
     }
@@ -350,6 +359,10 @@ impl Layout {
 
     pub fn build_dir(&self) -> &BuildDirLayout {
         &self.build_dir
+    }
+
+    pub fn build_cache(&self) -> &BuildCacheLayout {
+        &self.build_cache
     }
 }
 
@@ -513,5 +526,20 @@ impl BuildDirLayout {
     pub fn prepare_tmp(&self) -> CargoResult<&Path> {
         paths::create_dir_all(&self.tmp)?;
         Ok(&self.tmp)
+    }
+}
+
+#[derive(Clone)]
+pub struct BuildCacheLayout {
+    root: PathBuf,
+}
+
+impl BuildCacheLayout {
+    pub fn content_dir(&self) -> PathBuf {
+        self.root.join("content")
+    }
+
+    pub fn entries_dir(&self) -> PathBuf {
+        self.root.join("entries")
     }
 }

@@ -32,6 +32,7 @@ pub mod artifact;
 mod build_config;
 pub(crate) mod build_context;
 pub(crate) mod build_runner;
+mod cache;
 mod compilation;
 mod compile_kind;
 mod crate_type;
@@ -54,6 +55,7 @@ pub mod unit_dependencies;
 pub mod unit_graph;
 pub mod unused_deps;
 
+use crate::compiler::cache::BuildCache;
 use crate::util::data_structures::{HashMap, HashSet};
 use std::borrow::Cow;
 use std::cell::OnceCell;
@@ -219,15 +221,41 @@ fn compile<'gctx>(
     // dependency, skip compiling the unit and jumps to dependencies, which still
     // have chances to be compile time dependencies
     if !unit.skip_non_compile_time_dep {
+        let is_cachable = build_runner.is_cacheable(unit);
+        // TODO: share this
+        let cache = BuildCache::new(build_runner.files().build_cache_layout());
+
         // Build up the work to be done to compile this unit, enqueuing it once
         // we've got everything constructed.
         fingerprint::prepare_init(build_runner, unit)?;
+
+        let pkg_dir = build_runner.files().pkg_dir(unit);
 
         let job = if unit.mode.is_run_custom_build() {
             custom_build::prepare(build_runner, unit)?
         } else if unit.mode.is_doc_test() {
             // We run these targets later, so this is just a no-op for now.
             Job::new_fresh()
+        } else if let Some(entry) = cache.get(&pkg_dir) {
+            let outputs = build_runner.outputs(unit)?;
+            let rmeta_dst = outputs
+                .iter()
+                .find(|o| o.flavor == FileFlavor::Rmeta)
+                .map(|o| o.path.clone());
+            let rlib_dst = outputs
+                .iter()
+                .find(|o| o.flavor == FileFlavor::Linkable)
+                .map(|o| o.path.clone());
+            let mut job = Job::new_fresh();
+            if let (Some(rmeta_dst), Some(rlib_dst)) = (rmeta_dst, rlib_dst) {
+                job.before(Work::new(move |_state| {
+                    paths::create_dir_all(rmeta_dst.parent().unwrap())?;
+                    paths::link_or_copy(&entry.rmeta, &rmeta_dst)?;
+                    paths::link_or_copy(&entry.rlib, &rlib_dst)?;
+                    Ok(())
+                }));
+            }
+            job
         } else {
             let force = exec.force_rebuild(unit) || force_rebuild;
             let mut job = fingerprint::prepare_target(build_runner, unit, force)?;
@@ -251,6 +279,24 @@ fn compile<'gctx>(
                 // Need to link targets on both the dirty and fresh.
                 work.then(link_targets(build_runner, unit, true)?)
             });
+
+            if is_cachable {
+                let outputs = build_runner.outputs(unit)?;
+                let rmeta = outputs
+                    .iter()
+                    .find(|o| o.flavor == FileFlavor::Rmeta)
+                    .map(|o| o.path.clone());
+                let rlib = outputs
+                    .iter()
+                    .find(|o| o.flavor == FileFlavor::Linkable)
+                    .map(|o| o.path.clone());
+
+                if let Some(rmeta) = rmeta
+                    && let Some(rlib) = rlib
+                {
+                    job.after(publish_to_cache(cache, pkg_dir, rmeta, rlib));
+                }
+            }
 
             // If -Zfine-grain-locking is enabled, we wrap the job with an upgrade to exclusive
             // lock before starting, then downgrade to a shared lock after the job is finished.
@@ -663,6 +709,13 @@ fn prebuild_lock_exclusive(lock: LockKey) -> Work {
 fn downgrade_lock_to_shared(lock: LockKey) -> Work {
     Work::new(move |state| {
         state.downgrade_to_shared(&lock)?;
+        Ok(())
+    })
+}
+
+fn publish_to_cache(cache: BuildCache, pkg_dir: String, rmeta: PathBuf, rlib: PathBuf) -> Work {
+    Work::new(move |_state| {
+        cache.publish_entry(&pkg_dir, &rmeta, &rlib)?;
         Ok(())
     })
 }

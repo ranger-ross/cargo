@@ -222,8 +222,7 @@ fn compile<'gctx>(
     // have chances to be compile time dependencies
     if !unit.skip_non_compile_time_dep {
         let is_cachable = build_runner.is_cacheable(unit);
-        // TODO: share this
-        let cache = BuildCache::new(build_runner.files().build_cache_layout());
+        let cache = build_runner.files().build_cache();
 
         // Build up the work to be done to compile this unit, enqueuing it once
         // we've got everything constructed.
@@ -713,7 +712,12 @@ fn downgrade_lock_to_shared(lock: LockKey) -> Work {
     })
 }
 
-fn publish_to_cache(cache: BuildCache, pkg_dir: String, rmeta: PathBuf, rlib: PathBuf) -> Work {
+fn publish_to_cache(
+    cache: Arc<BuildCache>,
+    pkg_dir: String,
+    rmeta: PathBuf,
+    rlib: PathBuf,
+) -> Work {
     Work::new(move |_state| {
         cache.publish_entry(&pkg_dir, &rmeta, &rlib)?;
         Ok(())

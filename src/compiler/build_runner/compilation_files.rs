@@ -1,6 +1,6 @@
 //! See [`CompilationFiles`].
 
-use crate::compiler::layout::BuildCacheLayout;
+use crate::compiler::cache::BuildCache;
 use crate::util::data_structures::HashMap;
 use std::cell::OnceCell;
 use std::fmt;
@@ -137,6 +137,8 @@ pub struct CompilationFiles<'a, 'gctx> {
     metas: HashMap<Unit, Metadata>,
     /// For each Unit, a list all files produced.
     outputs: HashMap<Unit, OnceCell<Arc<Vec<OutputFile>>>>,
+    /// The shared build cache
+    build_cache: Arc<BuildCache>,
 }
 
 /// Info about a single file emitted by the compiler.
@@ -178,6 +180,7 @@ impl<'a, 'gctx: 'a> CompilationFiles<'a, 'gctx> {
             .cloned()
             .map(|unit| (unit, OnceCell::new()))
             .collect();
+        let build_cache = Arc::new(BuildCache::new(host.build_cache().clone()));
         CompilationFiles {
             ws: build_runner.bcx.ws,
             host,
@@ -186,6 +189,7 @@ impl<'a, 'gctx: 'a> CompilationFiles<'a, 'gctx> {
             roots: build_runner.bcx.roots.clone(),
             metas,
             outputs,
+            build_cache,
         }
     }
 
@@ -648,8 +652,8 @@ impl<'a, 'gctx: 'a> CompilationFiles<'a, 'gctx> {
         Ok(Arc::new(ret))
     }
 
-    pub fn build_cache_layout(&self) -> BuildCacheLayout {
-        self.layout(CompileKind::Host).build_cache().clone()
+    pub fn build_cache(&self) -> Arc<BuildCache> {
+        self.build_cache.clone()
     }
 
     /// Append the SBOM suffix to the file name.

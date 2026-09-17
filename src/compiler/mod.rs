@@ -29,6 +29,7 @@
 //! [`ops::cargo_compile::compile`]: crate::ops::compile
 
 pub mod artifact;
+mod blob_storage;
 mod build_config;
 pub(crate) mod build_context;
 pub(crate) mod build_runner;
@@ -54,6 +55,7 @@ pub mod unit_dependencies;
 pub mod unit_graph;
 pub mod unused_deps;
 
+use crate::compiler::blob_storage::BlobStorage;
 use crate::util::data_structures::{HashMap, HashSet};
 use std::borrow::Cow;
 use std::cell::OnceCell;
@@ -251,6 +253,14 @@ fn compile<'gctx>(
                 // Need to link targets on both the dirty and fresh.
                 work.then(link_targets(build_runner, unit, true)?)
             });
+
+            if job.freshness().is_dirty() && should_dedup_out_dir(build_runner, unit) {
+                let out_dir = build_runner.files().out_dir_new_layout(unit);
+                let blob_storage = build_runner.files().blob_storage();
+                job.after(Work::new(move |_state| {
+                    deduplicate_out_dir(&out_dir, &blob_storage)
+                }));
+            }
 
             // If -Zfine-grain-locking is enabled, we wrap the job with an upgrade to exclusive
             // lock before starting, then downgrade to a shared lock after the job is finished.
@@ -665,6 +675,24 @@ fn downgrade_lock_to_shared(lock: LockKey) -> Work {
         state.downgrade_to_shared(&lock)?;
         Ok(())
     })
+}
+
+fn should_dedup_out_dir(build_runner: &BuildRunner<'_, '_>, unit: &Unit) -> bool {
+    build_runner.bcx.gctx.cli_unstable().build_dir_new_layout
+        && !unit.is_local()
+        && !unit.mode.is_run_custom_build()
+}
+
+fn deduplicate_out_dir(out_dir: &Path, blob_storage: &BlobStorage) -> CargoResult<()> {
+    let walker = walkdir::WalkDir::new(out_dir)
+        .into_iter()
+        .filter_map(|e| e.ok());
+    for entry in walker {
+        if entry.file_type().is_file() {
+            blob_storage.insert_or_dedup(entry.path())?;
+        }
+    }
+    Ok(())
 }
 
 /// Link the compiled target (often of form `foo-{metadata_hash}`) to the

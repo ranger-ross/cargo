@@ -314,6 +314,39 @@ impl<'a, 'gctx> BuildRunner<'a, 'gctx> {
         Ok(self.compilation)
     }
 
+    /// TODO: We should probably compute this upfront in unit_dependencies.rs
+    ///       I wanted to include it on Unit but couldn't easily as the graph creation is topdown
+    ///       but is_cachable is bottom up. Since units are intern, we can't easily edit them.
+    ///       We can probably create a seperate "cachability map" for easy lookups
+    pub fn is_cacheable(&self, unit: &Unit) -> bool {
+        let mut visited = HashSet::default();
+        self.is_cacheable_recursive(unit, &mut visited)
+    }
+
+    fn is_cacheable_recursive(&self, unit: &Unit, visited: &mut HashSet<Unit>) -> bool {
+        if !visited.insert(unit.clone()) {
+            return true;
+        }
+        if !self.is_unit_cacheable(unit) {
+            return false;
+        }
+        self.unit_deps(unit)
+            .iter()
+            .all(|dep| self.is_cacheable_recursive(&dep.unit, visited))
+    }
+
+    fn is_unit_cacheable(&self, unit: &Unit) -> bool {
+        self.bcx.gctx.cli_unstable().build_dir_new_layout
+            && !unit.is_local()
+            && !unit.pkg.has_custom_build()
+            && !unit.target.is_custom_build()
+            && !unit.target.is_bin()
+            && !unit.mode.is_doc()
+            && !unit.mode.is_doc_scrape()
+            && !unit.mode.is_any_test()
+            && !unit.artifact.is_true()
+    }
+
     fn collect_tests_and_executables(&mut self, unit: &Unit) -> CargoResult<()> {
         for output in self.outputs(unit)?.iter() {
             if matches!(

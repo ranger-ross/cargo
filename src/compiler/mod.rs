@@ -236,24 +236,12 @@ fn compile<'gctx>(
             // We run these targets later, so this is just a no-op for now.
             Job::new_fresh()
         } else if let Some(entry) = cache.get(&pkg_dir) {
-            let outputs = build_runner.outputs(unit)?;
-            let rmeta_dst = outputs
-                .iter()
-                .find(|o| o.flavor == FileFlavor::Rmeta)
-                .map(|o| o.path.clone());
-            let rlib_dst = outputs
-                .iter()
-                .find(|o| o.flavor == FileFlavor::Linkable)
-                .map(|o| o.path.clone());
             let mut job = Job::new_fresh();
-            if let (Some(rmeta_dst), Some(rlib_dst)) = (rmeta_dst, rlib_dst) {
-                job.before(Work::new(move |_state| {
-                    paths::create_dir_all(rmeta_dst.parent().unwrap())?;
-                    paths::link_or_copy(&entry.rmeta, &rmeta_dst)?;
-                    paths::link_or_copy(&entry.rlib, &rlib_dst)?;
-                    Ok(())
-                }));
-            }
+            let out_dir = build_runner.files().out_dir_new_layout(unit);
+            job.before(Work::new(move |_state| {
+                cache.restore_from_cache(entry, &out_dir)?;
+                Ok(())
+            }));
             job
         } else {
             let force = exec.force_rebuild(unit) || force_rebuild;
@@ -280,21 +268,8 @@ fn compile<'gctx>(
             });
 
             if is_cachable {
-                let outputs = build_runner.outputs(unit)?;
-                let rmeta = outputs
-                    .iter()
-                    .find(|o| o.flavor == FileFlavor::Rmeta)
-                    .map(|o| o.path.clone());
-                let rlib = outputs
-                    .iter()
-                    .find(|o| o.flavor == FileFlavor::Linkable)
-                    .map(|o| o.path.clone());
-
-                if let Some(rmeta) = rmeta
-                    && let Some(rlib) = rlib
-                {
-                    job.after(publish_to_cache(cache, pkg_dir, rmeta, rlib));
-                }
+                let out_dir = build_runner.files().out_dir_new_layout(&unit);
+                job.after(publish_to_cache(cache, pkg_dir, out_dir));
             }
 
             // If -Zfine-grain-locking is enabled, we wrap the job with an upgrade to exclusive
@@ -712,14 +687,9 @@ fn downgrade_lock_to_shared(lock: LockKey) -> Work {
     })
 }
 
-fn publish_to_cache(
-    cache: Arc<BuildCache>,
-    pkg_dir: String,
-    rmeta: PathBuf,
-    rlib: PathBuf,
-) -> Work {
+fn publish_to_cache(cache: Arc<BuildCache>, pkg_dir: String, out_dir: PathBuf) -> Work {
     Work::new(move |_state| {
-        cache.publish_entry(&pkg_dir, &rmeta, &rlib)?;
+        cache.publish_entry(&pkg_dir, &out_dir)?;
         Ok(())
     })
 }

@@ -1,8 +1,11 @@
-use std::path::{Path, PathBuf};
+use std::{
+    collections::BTreeMap,
+    path::{Path, PathBuf},
+};
 
 use anyhow::Context;
-use cargo_util::Sha256;
 use cargo_util::paths::link_or_copy;
+use cargo_util::{Sha256, paths};
 use serde::{Deserialize, Serialize};
 
 use crate::{CargoResult, compiler::layout::BuildCacheLayout};
@@ -23,27 +26,54 @@ impl BuildCache {
         Some(entry)
     }
 
-    pub fn publish_entry(&self, pkg_dir: &str, rmeta: &Path, rlib: &Path) -> CargoResult<()> {
-        let rmeta_hash = Self::hash(rmeta)?;
-        let rlib_hash = Self::hash(rlib)?;
-
+    pub fn publish_entry(&self, pkg_dir: &str, out_dir: &Path) -> CargoResult<()> {
         let content = self.layout.content_dir();
-        let rmeta_path = content.join(rmeta_hash);
-        let rlib_path = content.join(rlib_hash);
 
-        link_or_copy(rmeta, &rmeta_path)?;
-        link_or_copy(rlib, &rlib_path)?;
+        let mut files = BTreeMap::new();
+        for entry in walkdir::WalkDir::new(out_dir) {
+            let entry = entry?;
+            let src = entry.path();
+            if !src.is_file() {
+                continue;
+            }
+            let rel = src.strip_prefix(out_dir).expect("walked path under out dir");
+            if rel.as_os_str().is_empty() {
+                continue;
+            }
+            let hash = Self::hash(src)?;
+            let dest = content.join(&hash);
 
-        let entry = CacheEntry {
-            rmeta: rmeta_path,
-            rlib: rlib_path,
-        };
+            link_or_copy(src, &dest)?;
+
+            files.insert(rel.to_path_buf(), hash);
+        }
+
+        let entry = CacheEntry { files };
 
         let json = serde_json::to_string(&entry)?;
         let entry_path = self.layout.entries_dir().join(pkg_dir);
         cargo_util::paths::create_dir_all(entry_path.parent().unwrap())?;
 
         cargo_util::paths::write_atomic(&entry_path, &json).context("writing cache entry")?;
+
+        Ok(())
+    }
+
+    pub fn restore_from_cache(&self, entry: CacheEntry, out_dir: &Path) -> CargoResult<()> {
+        paths::create_dir_all(out_dir)?;
+
+        let content_dir = self.layout.content_dir();
+        for (path_in_out_dir, hash) in entry.files {
+            if path_in_out_dir.as_os_str().is_empty() {
+                continue;
+            }
+            let dest = out_dir.join(&path_in_out_dir);
+            if let Some(parent) = dest.parent() {
+                paths::create_dir_all(parent)?;
+            }
+            let file_in_cache = content_dir.join(hash);
+            paths::link_or_copy(&file_in_cache, &dest)?;
+        }
 
         Ok(())
     }
@@ -57,6 +87,6 @@ impl BuildCache {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CacheEntry {
-    pub rlib: PathBuf,
-    pub rmeta: PathBuf,
+    // A map of paths relative to the OUT_DIR and their hashes.
+    pub files: BTreeMap<PathBuf, String>,
 }

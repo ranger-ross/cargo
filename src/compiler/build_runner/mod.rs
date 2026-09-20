@@ -336,15 +336,14 @@ impl<'a, 'gctx> BuildRunner<'a, 'gctx> {
     }
 
     fn is_unit_cacheable(&self, unit: &Unit) -> bool {
-        self.bcx.gctx.cli_unstable().build_dir_new_layout
-            && !unit.is_local()
-            && !unit.pkg.has_custom_build()
-            && !unit.target.is_custom_build()
-            && !unit.target.is_bin()
-            && !unit.mode.is_doc()
-            && !unit.mode.is_doc_scrape()
-            && !unit.mode.is_any_test()
-            && !unit.artifact.is_true()
+        self.bcx.gctx.cli_unstable().build_dir_new_layout && !unit.is_local()
+        // && !unit.pkg.has_custom_build()
+        // && !unit.target.is_custom_build()
+        // && !unit.target.is_bin()
+        // && !unit.mode.is_doc()
+        // && !unit.mode.is_doc_scrape()
+        // && !unit.mode.is_any_test()
+        // && !unit.artifact.is_true()
     }
 
     fn collect_tests_and_executables(&mut self, unit: &Unit) -> CargoResult<()> {

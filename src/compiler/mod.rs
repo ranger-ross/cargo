@@ -32,7 +32,7 @@ pub mod artifact;
 mod build_config;
 pub(crate) mod build_context;
 pub(crate) mod build_runner;
-mod cache;
+pub(crate) mod cache;
 mod compilation;
 mod compile_kind;
 mod crate_type;
@@ -231,7 +231,7 @@ fn compile<'gctx>(
         let pkg_dir = build_runner.files().pkg_dir(unit);
 
         let job = if unit.mode.is_run_custom_build() {
-            custom_build::prepare(build_runner, unit)?
+            custom_build::prepare(build_runner, unit, is_cachable.then(|| cache.clone()))?
         } else if unit.mode.is_doc_test() {
             // We run these targets later, so this is just a no-op for now.
             Job::new_fresh()

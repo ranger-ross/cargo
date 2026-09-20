@@ -80,26 +80,6 @@ impl BuildCache {
         Ok(())
     }
 
-    fn dedup_dir(&self, dir: &Path) -> CargoResult<BTreeMap<PathBuf, String>> {
-        let content = self.layout.content_dir();
-        let mut files = BTreeMap::new();
-        for entry in walkdir::WalkDir::new(dir) {
-            let entry = entry?;
-            let src = entry.path();
-            if !src.is_file() {
-                continue;
-            }
-            let rel = src.strip_prefix(dir).expect("walked path under cached dir");
-            if rel.as_os_str().is_empty() {
-                continue;
-            }
-            let hash = Self::hash(src)?;
-            link_or_copy(src, &content.join(&hash))?;
-            files.insert(rel.to_path_buf(), hash);
-        }
-        Ok(files)
-    }
-
     fn restore_files(&self, files: BTreeMap<PathBuf, String>, dest_root: &Path) -> CargoResult<()> {
         paths::create_dir_all(dest_root)?;
         let content_dir = self.layout.content_dir();
@@ -122,13 +102,7 @@ impl BuildCache {
         Ok(())
     }
 
-    /// Publishes a build script execution: its `out` dir, run files, and parsed output.
-    ///
-    /// `run_root` is the script's unit dir (`build/<pkg>/run` in the new layout).
-    /// `script_out_dir` and the run files root live underneath it, so all stored
-    /// paths are relative to `run_root`. That keeps one stable prefix instead of
-    /// three, and restore joins them back onto the current `run_root`.
-    pub fn publish_script(
+    pub fn publish_build_script(
         &self,
         pkg_dir: &str,
         run_root: &Path,
@@ -146,8 +120,7 @@ impl BuildCache {
         Ok(())
     }
 
-    /// Restores a build script execution and returns its parsed output.
-    pub fn restore_script(
+    pub fn restore_build_script(
         &self,
         pkg_dir: &str,
         run_root: &Path,
@@ -157,6 +130,26 @@ impl BuildCache {
         let entry: ScriptEntry = serde_json::from_str(&content).ok()?;
         self.restore_files(entry.files, run_root).ok()?;
         Some(entry.output)
+    }
+
+    fn dedup_dir(&self, dir: &Path) -> CargoResult<BTreeMap<PathBuf, String>> {
+        let content = self.layout.content_dir();
+        let mut files = BTreeMap::new();
+        for entry in walkdir::WalkDir::new(dir) {
+            let entry = entry?;
+            let src = entry.path();
+            if !src.is_file() {
+                continue;
+            }
+            let rel = src.strip_prefix(dir).expect("walked path under cached dir");
+            if rel.as_os_str().is_empty() {
+                continue;
+            }
+            let hash = Self::hash(src)?;
+            link_or_copy(src, &content.join(&hash))?;
+            files.insert(rel.to_path_buf(), hash);
+        }
+        Ok(files)
     }
 
     fn hash(path: &Path) -> CargoResult<String> {

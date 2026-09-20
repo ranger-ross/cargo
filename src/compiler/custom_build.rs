@@ -31,6 +31,7 @@
 //! [`CompileMode::RunCustomBuild`]: crate::compiler::CompileMode::RunCustomBuild
 //! [instructions]: https://doc.rust-lang.org/cargo/reference/build-scripts.html#outputs-of-the-build-script
 
+use super::cache::BuildCache;
 use super::{BuildRunner, Job, Unit, Work, fingerprint, get_dynamic_search_path};
 use crate::compiler::CompileMode;
 use crate::compiler::artifact;
@@ -46,6 +47,7 @@ use anyhow::{Context as _, bail};
 use cargo_platform::Cfg;
 use cargo_util::paths;
 use cargo_util_schemas::manifest::RustVersion;
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::collections::hash_map::Entry;
 use std::path::{Path, PathBuf};
@@ -68,9 +70,7 @@ const OLD_CARGO_WARNING_SYNTAX: &str = "cargo:warning=";
 /// [the doc]: https://doc.rust-lang.org/nightly/cargo/reference/build-scripts.html#cargo-warning
 const NEW_CARGO_WARNING_SYNTAX: &str = "cargo::warning=";
 
-#[derive(
-    Clone, Debug, Hash, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
-)]
+#[derive(Clone, Debug, Hash, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum Severity {
     Error,
     Warning,
@@ -108,9 +108,7 @@ pub type LogMessage = (Severity, String);
 /// BuildOutput requires it but that ordering is different from the one for the linker search path,
 /// at least today. It may be worth reconsidering & perhaps it's ok if BuildOutput doesn't have
 /// a lexicographic ordering for the library_paths? I'm not sure the consequence of that.
-#[derive(
-    Clone, Debug, Hash, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
-)]
+#[derive(Clone, Debug, Hash, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum LibraryPath {
     /// The path is pointing within the output folder of the crate and takes priority over
     /// external paths when passed to the linker.
@@ -146,18 +144,7 @@ impl AsRef<PathBuf> for LibraryPath {
 }
 
 /// Contains the parsed output of a custom build script.
-#[derive(
-    Clone,
-    Debug,
-    Hash,
-    Default,
-    PartialEq,
-    Eq,
-    PartialOrd,
-    Ord,
-    serde::Serialize,
-    serde::Deserialize,
-)]
+#[derive(Clone, Debug, Hash, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct BuildOutput {
     /// Paths to pass to rustc with the `-L` flag.
     pub library_paths: Vec<LibraryPath>,
@@ -258,9 +245,7 @@ pub struct BuildDeps {
 /// See the [build script documentation][1] for more.
 ///
 /// [1]: https://doc.rust-lang.org/nightly/cargo/reference/build-scripts.html#cargorustc-link-argflag
-#[derive(
-    Clone, Hash, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
-)]
+#[derive(Clone, Hash, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum LinkArgTarget {
     /// Represents `cargo::rustc-link-arg=FLAG`.
     All,
@@ -299,7 +284,7 @@ impl LinkArgTarget {
 pub fn prepare(
     build_runner: &mut BuildRunner<'_, '_>,
     unit: &Unit,
-    cache: Option<std::sync::Arc<super::cache::BuildCache>>,
+    cache: Option<Arc<BuildCache>>,
 ) -> CargoResult<Job> {
     let metadata = build_runner.get_run_build_script_metadata(unit);
     if build_runner
@@ -353,7 +338,7 @@ fn emit_build_output(
 fn build_work(
     build_runner: &mut BuildRunner<'_, '_>,
     unit: &Unit,
-    cache: Option<std::sync::Arc<super::cache::BuildCache>>,
+    cache: Option<Arc<BuildCache>>,
 ) -> CargoResult<Job> {
     assert!(unit.mode.is_run_custom_build());
     let bcx = &build_runner.bcx;
@@ -571,8 +556,6 @@ fn build_work(
     //
     // Note that this has to do some extra work just before running the command
     // to determine extra environment variables and such.
-    // Clone for the dirty closure, which moves its captures. The restore probe
-    // below uses the original.
     let cache_for_publish = cache.clone();
     let dirty = Work::new(move |state| {
         // Make sure that OUT_DIR exists.
@@ -734,9 +717,8 @@ fn build_work(
             .lock()
             .unwrap()
             .insert(id, metadata_hash, parsed_output.clone());
-        if let Some(cache) = cache_for_publish.clone() {
-            // Best effort: a failed publish must not fail the build.
-            let _ = cache.publish_script(&script_pkg_dir, &script_run_root, &parsed_output);
+        if let Some(cache) = &cache_for_publish {
+            let _ = cache.publish_build_script(&script_pkg_dir, &script_run_root, &parsed_output);
         }
         Ok(())
     });
@@ -773,13 +755,10 @@ fn build_work(
 
     let mut job = fingerprint::prepare_target(build_runner, unit, false)?;
     if job.freshness().is_dirty() {
-        // Dirty by fingerprint, but a cache entry may still satisfy the run.
-        // Restored outputs must land before dependents read them, so probe here
-        // at plan time and enqueue a restore job instead of executing.
         if let Some(cache) = cache.clone() {
             let pkg_dir = build_runner.files().pkg_dir(unit);
             let run_root = BuildScriptRunFiles::for_unit(build_runner, unit).root;
-            if let Some(output) = cache.restore_script(&pkg_dir, &run_root) {
+            if let Some(output) = cache.restore_build_script(&pkg_dir, &run_root) {
                 let mut job = Job::new_fresh();
                 let build_script_outputs = Arc::clone(&build_runner.build_script_outputs);
                 let id = unit.pkg.package_id();

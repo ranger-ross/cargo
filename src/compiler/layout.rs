@@ -332,7 +332,7 @@ impl Layout {
                 is_new_layout,
             },
             blob_storage: BlobStorageLayout {
-                root: ws.gctx().home().clone().into_path_unlocked().join("blobs"),
+                root: ws.gctx().blob_storage_path().into_path_unlocked(),
             },
             _lock: lock,
         })

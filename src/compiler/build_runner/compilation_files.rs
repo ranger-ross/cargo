@@ -656,6 +656,11 @@ impl<'a, 'gctx: 'a> CompilationFiles<'a, 'gctx> {
         self.blob_storage.clone()
     }
 
+    /// Root of the shared blob storage.
+    pub fn blob_storage_root(&self) -> PathBuf {
+        self.blob_storage.root().to_path_buf()
+    }
+
     /// Append the SBOM suffix to the file name.
     fn append_sbom_suffix(link: &PathBuf) -> PathBuf {
         const SBOM_FILE_EXTENSION: &str = ".cargo-sbom.json";

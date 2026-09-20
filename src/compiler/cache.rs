@@ -4,8 +4,8 @@ use std::{
 };
 
 use anyhow::Context;
+use cargo_util::paths;
 use cargo_util::paths::link_or_copy;
-use cargo_util::{Sha256, paths};
 use serde::{Deserialize, Serialize};
 
 use crate::{CargoResult, compiler::layout::BuildCacheLayout};
@@ -153,9 +153,10 @@ impl BuildCache {
     }
 
     fn hash(path: &Path) -> CargoResult<String> {
-        let mut hasher = Sha256::new();
-        hasher.update_path(path)?;
-        Ok(hasher.finish_hex())
+        let mut hasher = blake3::Hasher::new();
+        let mut file = std::fs::File::open(path)?;
+        std::io::copy(&mut file, &mut hasher)?;
+        Ok(hasher.finalize().to_hex().to_string())
     }
 }
 

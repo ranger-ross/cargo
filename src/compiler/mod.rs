@@ -236,13 +236,15 @@ fn compile<'gctx>(
             // We run these targets later, so this is just a no-op for now.
             Job::new_fresh()
         } else if let Some(entry) = cache.get(&pkg_dir) {
-            let mut job = Job::new_fresh();
             let out_dir = build_runner.files().out_dir_new_layout(unit);
-            job.before(Work::new(move |_state| {
-                cache.restore_from_cache(entry, &out_dir)?;
-                Ok(())
-            }));
-            job
+            // FIXME: There is a certainly a better way to do this.
+            if entry.files.keys().any(|path| !out_dir.join(path).exists()) {
+                Job::new_cached(Work::new(move |_state| {
+                    cache.restore_from_cache(entry, &out_dir)
+                }))
+            } else {
+                Job::new_fresh()
+            }
         } else {
             let force = exec.force_rebuild(unit) || force_rebuild;
             let mut job = fingerprint::prepare_target(build_runner, unit, force)?;

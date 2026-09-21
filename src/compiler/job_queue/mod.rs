@@ -127,7 +127,7 @@ use jobserver::{Acquired, HelperThread};
 use semver::Version;
 use tracing::{debug, trace};
 
-pub use self::job::Freshness::{self, Dirty, Fresh};
+pub use self::job::Freshness::{self, Cached, Dirty, Fresh};
 pub use self::job::{Job, Work};
 pub use self::job_state::JobState;
 use super::BuildContext;
@@ -1256,6 +1256,20 @@ impl<'gctx> DrainState<'gctx> {
                         gctx.shell().status("Compiling", &unit.pkg)?;
                     }
                 }
+            }
+            Cached => {
+                if unit.mode.is_doc() {
+                    self.documented.insert(unit.pkg.package_id());
+                } else if unit.mode.is_doc_scrape() {
+                    self.scraped.insert(unit.pkg.package_id());
+                } else {
+                    self.compiled.insert(unit.pkg.package_id());
+                }
+                gctx.shell().status_with_color(
+                    "Cached",
+                    &unit.pkg,
+                    &cargo_util_terminal::style::CACHE,
+                )?;
             }
             Fresh => {
                 // If doc test are last, only print "Fresh" if nothing has been printed.

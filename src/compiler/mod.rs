@@ -32,6 +32,7 @@ pub mod artifact;
 mod build_config;
 pub(crate) mod build_context;
 pub(crate) mod build_runner;
+pub(crate) mod cache;
 mod compilation;
 mod compile_kind;
 mod crate_type;
@@ -54,6 +55,7 @@ pub mod unit_dependencies;
 pub mod unit_graph;
 pub mod unused_deps;
 
+use crate::compiler::cache::BuildCache;
 use crate::util::data_structures::{HashMap, HashSet};
 use std::borrow::Cow;
 use std::cell::OnceCell;
@@ -219,15 +221,30 @@ fn compile<'gctx>(
     // dependency, skip compiling the unit and jumps to dependencies, which still
     // have chances to be compile time dependencies
     if !unit.skip_non_compile_time_dep {
+        let is_cachable = build_runner.is_cacheable(unit);
+        let cache = build_runner.files().build_cache();
+
         // Build up the work to be done to compile this unit, enqueuing it once
         // we've got everything constructed.
         fingerprint::prepare_init(build_runner, unit)?;
 
+        let pkg_dir = build_runner.files().pkg_dir(unit);
+
         let job = if unit.mode.is_run_custom_build() {
-            custom_build::prepare(build_runner, unit)?
+            custom_build::prepare(build_runner, unit, is_cachable.then(|| cache.clone()))?
         } else if unit.mode.is_doc_test() {
             // We run these targets later, so this is just a no-op for now.
             Job::new_fresh()
+        } else if let Some(entry) = cache.get(&pkg_dir) {
+            let out_dir = build_runner.files().out_dir_new_layout(unit);
+            // FIXME: There is a certainly a better way to do this.
+            if entry.files.keys().any(|path| !out_dir.join(path).exists()) {
+                Job::new_cached(Work::new(move |_state| {
+                    cache.restore_from_cache(entry, &out_dir)
+                }))
+            } else {
+                Job::new_fresh()
+            }
         } else {
             let force = exec.force_rebuild(unit) || force_rebuild;
             let mut job = fingerprint::prepare_target(build_runner, unit, force)?;
@@ -251,6 +268,11 @@ fn compile<'gctx>(
                 // Need to link targets on both the dirty and fresh.
                 work.then(link_targets(build_runner, unit, true)?)
             });
+
+            if is_cachable {
+                let out_dir = build_runner.files().out_dir_new_layout(&unit);
+                job.after(publish_to_cache(cache, pkg_dir, out_dir));
+            }
 
             // If -Zfine-grain-locking is enabled, we wrap the job with an upgrade to exclusive
             // lock before starting, then downgrade to a shared lock after the job is finished.
@@ -663,6 +685,13 @@ fn prebuild_lock_exclusive(lock: LockKey) -> Work {
 fn downgrade_lock_to_shared(lock: LockKey) -> Work {
     Work::new(move |state| {
         state.downgrade_to_shared(&lock)?;
+        Ok(())
+    })
+}
+
+fn publish_to_cache(cache: Arc<BuildCache>, pkg_dir: String, out_dir: PathBuf) -> Work {
+    Work::new(move |_state| {
+        cache.publish_entry(&pkg_dir, &out_dir)?;
         Ok(())
     })
 }

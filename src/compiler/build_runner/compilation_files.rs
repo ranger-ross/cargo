@@ -1,5 +1,6 @@
 //! See [`CompilationFiles`].
 
+use crate::compiler::cache::BuildCache;
 use crate::util::data_structures::HashMap;
 use std::cell::OnceCell;
 use std::fmt;
@@ -136,6 +137,8 @@ pub struct CompilationFiles<'a, 'gctx> {
     metas: HashMap<Unit, Metadata>,
     /// For each Unit, a list all files produced.
     outputs: HashMap<Unit, OnceCell<Arc<Vec<OutputFile>>>>,
+    /// The shared build cache
+    build_cache: Arc<BuildCache>,
 }
 
 /// Info about a single file emitted by the compiler.
@@ -177,6 +180,7 @@ impl<'a, 'gctx: 'a> CompilationFiles<'a, 'gctx> {
             .cloned()
             .map(|unit| (unit, OnceCell::new()))
             .collect();
+        let build_cache = Arc::new(BuildCache::new(host.build_cache().clone()));
         CompilationFiles {
             ws: build_runner.bcx.ws,
             host,
@@ -185,6 +189,7 @@ impl<'a, 'gctx: 'a> CompilationFiles<'a, 'gctx> {
             roots: build_runner.bcx.roots.clone(),
             metas,
             outputs,
+            build_cache,
         }
     }
 
@@ -245,7 +250,7 @@ impl<'a, 'gctx: 'a> CompilationFiles<'a, 'gctx> {
     ///
     /// Note that some units may share the same directory, so care should be
     /// taken in those cases!
-    fn pkg_dir(&self, unit: &Unit) -> String {
+    pub fn pkg_dir(&self, unit: &Unit) -> String {
         let separator = match self.ws.gctx().cli_unstable().build_dir_new_layout {
             true => "/",
             false => "-",
@@ -645,6 +650,10 @@ impl<'a, 'gctx: 'a> CompilationFiles<'a, 'gctx> {
         debug!("Target filenames: {:?}", ret);
 
         Ok(Arc::new(ret))
+    }
+
+    pub fn build_cache(&self) -> Arc<BuildCache> {
+        self.build_cache.clone()
     }
 
     /// Append the SBOM suffix to the file name.

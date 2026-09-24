@@ -61,6 +61,8 @@ pub struct GlobalCleanConfig {
     pub max_git_co_age: Option<String>,
     /// Any git clone older than this duration will be deleted from the git cache.
     pub max_git_db_age: Option<String>,
+    /// Anything older than this duration will be deleted from the blob storage.
+    pub max_blob_age: Option<String>,
 }
 
 #[derive(Deserialize)]

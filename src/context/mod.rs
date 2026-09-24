@@ -483,6 +483,11 @@ impl GlobalContext {
         self.registry_base_path().join("src")
     }
 
+    /// Gets the Cargo blob storage directory (`<cargo_home>/blobs`).
+    pub fn blob_storage_path(&self) -> Filesystem {
+        self.home_path.join("blobs")
+    }
+
     /// Gets the default Cargo registry.
     pub fn default_registry(&self) -> CargoResult<Option<String>> {
         Ok(self

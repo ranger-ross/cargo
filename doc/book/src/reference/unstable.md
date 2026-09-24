@@ -1674,6 +1674,8 @@ max-index-age = "3 months"
 max-git-co-age = "1 month"
 # Any git clone older than this duration will be deleted from the git cache.
 max-git-db-age = "3 months"
+# Anything older than this duration will be deleted from the blob storage.
+max-blob-age = "1 month"
 ```
 
 Note that the [`cache.auto-clean-frequency`] option was stabilized in Rust 1.88.
@@ -1690,6 +1692,8 @@ Deletion of cache contents can be performed by passing one of the cache options:
 - `--max-index-age=DURATION` --- Deletes registry indexes that have not been used since then given age (including their `.crate` and `src` files).
 - `--max-git-co-age=DURATION` --- Deletes git dependency checkouts that have not been used since then given age.
 - `--max-git-db-age=DURATION` --- Deletes git dependency clones that have not been used since then given age.
+- `--max-blob-age=DURATION` --- Deletes blob storage files that have not been used since the given age.
+- `--max-blob-size=SIZE` --- Deletes the oldest blob storage files until the cache is under the given size.
 - `--max-download-age=DURATION` --- Deletes any downloaded cache data that has not been used since then given age.
 - `--max-src-size=SIZE` --- Deletes the oldest source cache files until the cache is under the given size.
 - `--max-crate-size=SIZE` --- Deletes the oldest crate cache files until the cache is under the given size.

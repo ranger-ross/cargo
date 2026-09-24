@@ -130,6 +130,24 @@ pub fn cli() -> Command {
                     )
                     .value_name("SIZE")
                     .value_parser(parse_human_size),
+                )
+                .arg(
+                    opt(
+                        "max-blob-age",
+                        "Deletes blob storage files that have not been used \
+                        since the given age (unstable)",
+                    )
+                    .value_name("DURATION")
+                    .value_parser(parse_time_span),
+                )
+                .arg(
+                    opt(
+                        "max-blob-size",
+                        "Deletes blob storage files until the cache is under the \
+                        given size (unstable)",
+                    )
+                    .value_name("SIZE")
+                    .value_parser(parse_human_size),
                 ),
         )
         .after_help(color_print::cstr!(
@@ -189,9 +207,11 @@ fn gc(gctx: &GlobalContext, args: &ArgMatches) -> CliResult {
         max_index_age: duration_opt("max-index-age"),
         max_git_co_age: duration_opt("max-git-co-age"),
         max_git_db_age: duration_opt("max-git-db-age"),
+        max_blob_age: duration_opt("max-blob-age"),
         max_src_size: size_opt("max-src-size"),
         max_crate_size: size_opt("max-crate-size"),
         max_git_size: size_opt("max-git-size"),
+        max_blob_size: size_opt("max-blob-size"),
         max_download_size: size_opt("max-download-size"),
     };
     if let Some(age) = duration_opt("max-download-age") {
@@ -199,7 +219,7 @@ fn gc(gctx: &GlobalContext, args: &ArgMatches) -> CliResult {
     }
     // If the user sets any options, then only perform the options requested.
     // If no options are set, do the default behavior.
-    if !gc_opts.is_download_cache_opt_set() {
+    if !gc_opts.is_download_cache_opt_set() && !gc_opts.is_blob_cache_opt_set() {
         gc_opts.update_for_auto_gc(gctx)?;
     }
 

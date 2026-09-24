@@ -29,6 +29,7 @@
 //! [`ops::cargo_compile::compile`]: crate::ops::compile
 
 pub mod artifact;
+mod blob_storage;
 mod build_config;
 pub(crate) mod build_context;
 pub(crate) mod build_runner;
@@ -54,6 +55,7 @@ pub mod unit_dependencies;
 pub mod unit_graph;
 pub mod unused_deps;
 
+use crate::compiler::blob_storage::BlobStorage;
 use crate::util::data_structures::{HashMap, HashSet};
 use std::borrow::Cow;
 use std::cell::OnceCell;
@@ -251,6 +253,20 @@ fn compile<'gctx>(
                 // Need to link targets on both the dirty and fresh.
                 work.then(link_targets(build_runner, unit, true)?)
             });
+
+            if should_dedup_out_dir(build_runner, unit) {
+                let out_dir = build_runner.files().out_dir_new_layout(unit);
+                let blob_storage = build_runner.files().blob_storage();
+                if job.freshness().is_dirty() {
+                    job.after(Work::new(move |_state| {
+                        deduplicate_out_dir(&out_dir, &blob_storage)
+                    }));
+                } else {
+                    job.after(Work::new(move |_state| {
+                        mark_out_dir_used(&out_dir, &blob_storage)
+                    }));
+                }
+            }
 
             // If -Zfine-grain-locking is enabled, we wrap the job with an upgrade to exclusive
             // lock before starting, then downgrade to a shared lock after the job is finished.
@@ -665,6 +681,73 @@ fn downgrade_lock_to_shared(lock: LockKey) -> Work {
         state.downgrade_to_shared(&lock)?;
         Ok(())
     })
+}
+
+fn should_dedup_out_dir(build_runner: &BuildRunner<'_, '_>, unit: &Unit) -> bool {
+    build_runner.bcx.gctx.cli_unstable().build_dir_new_layout
+        && !unit.is_local()
+        && !unit.mode.is_run_custom_build()
+}
+
+#[tracing::instrument(skip_all)]
+fn deduplicate_out_dir(out_dir: &Path, blob_storage: &BlobStorage) -> CargoResult<()> {
+    let walker = walkdir::WalkDir::new(out_dir)
+        .into_iter()
+        .filter_map(|e| e.ok());
+    let mut mappings = String::new();
+    for entry in walker {
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let path = entry.path();
+        if path.file_name().is_some_and(|n| n == "blob-mappings.txt") {
+            continue;
+        }
+        let Some(hash) = blob_storage.dedup_file(path)? else {
+            continue;
+        };
+        let rel = path.strip_prefix(out_dir).unwrap_or(path);
+        mappings.push_str(&hash);
+        mappings.push(' ');
+        mappings.push_str(&rel.display().to_string());
+        mappings.push('\n');
+    }
+    // Best effort: a missing mapping file just means fresh units rehash.
+    // Written next to out/ so future walks never see it as input.
+    // Skipped when empty so local units leave no trace.
+    if !mappings.is_empty() {
+        if let Some(unit_root) = out_dir.parent() {
+            let _ = std::fs::write(unit_root.join("blob-mappings.txt"), mappings);
+        }
+    }
+    Ok(())
+}
+
+/// Marks blobs for a fresh unit without rehashing.
+///
+/// Reads hashes from `blob-mappings.txt` written at dedup time. Any file
+/// missing from the mapping falls back to a full dedup.
+#[tracing::instrument(skip_all)]
+fn mark_out_dir_used(out_dir: &Path, blob_storage: &BlobStorage) -> CargoResult<()> {
+    let mapping = out_dir
+        .parent()
+        .map(|unit_root| unit_root.join("blob-mappings.txt"));
+    let Some(mapping) = mapping else {
+        return deduplicate_out_dir(out_dir, blob_storage);
+    };
+    let Ok(contents) = std::fs::read_to_string(&mapping) else {
+        return deduplicate_out_dir(out_dir, blob_storage);
+    };
+    for line in contents.lines() {
+        let Some((hash, file)) = line.split_once(' ') else {
+            continue;
+        };
+        if file == "blob-mappings.txt" {
+            continue;
+        }
+        blob_storage.mark_hash_used_path(&out_dir.join(file), hash);
+    }
+    Ok(())
 }
 
 /// Link the compiled target (often of form `foo-{metadata_hash}`) to the

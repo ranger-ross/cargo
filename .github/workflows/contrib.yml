@@ -44,6 +44,7 @@ jobs:
 
   deploy:
     needs: build
+    if: github.repository_owner == 'rust-lang'
 
     permissions:
       pages: write # to deploy to Pages

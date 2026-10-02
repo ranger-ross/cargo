@@ -59,6 +59,14 @@ impl Job {
         }
     }
 
+    /// Creates a new job that restores an artifact from the build cache.
+    pub fn new_cached(work: Work) -> Job {
+        Job {
+            work,
+            fresh: Freshness::Cached,
+        }
+    }
+
     /// Creates a new job representing a unit of work.
     pub fn new_dirty(work: Work, dirty_reason: DirtyReason) -> Job {
         Job {
@@ -106,6 +114,7 @@ impl fmt::Debug for Job {
 #[derive(Debug, Clone)]
 pub enum Freshness {
     Fresh,
+    Cached,
     Dirty(DirtyReason),
 }
 
@@ -115,6 +124,6 @@ impl Freshness {
     }
 
     pub fn is_fresh(&self) -> bool {
-        matches!(self, Freshness::Fresh)
+        matches!(self, Freshness::Fresh | Freshness::Cached)
     }
 }

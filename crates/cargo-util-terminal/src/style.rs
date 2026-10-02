@@ -2,6 +2,7 @@ use anstyle::*;
 
 pub const NOP: Style = Style::new();
 pub const HEADER: Style = AnsiColor::BrightGreen.on_default().effects(Effects::BOLD);
+pub const CACHE: Style = AnsiColor::BrightMagenta.on_default().effects(Effects::BOLD);
 pub const USAGE: Style = AnsiColor::BrightGreen.on_default().effects(Effects::BOLD);
 pub const LITERAL: Style = AnsiColor::BrightCyan.on_default().effects(Effects::BOLD);
 pub const PLACEHOLDER: Style = AnsiColor::Cyan.on_default();

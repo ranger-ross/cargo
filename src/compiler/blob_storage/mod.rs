@@ -1,13 +1,13 @@
+mod format;
 mod snapshots;
 
 use std::fs::File;
-use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::bail;
 use cargo_util::paths::create_dir_all;
 use filetime::FileTime;
+use format::{Digest, Output, StoredUnit, UnitResult, encode_output_path};
 use parking_lot::Mutex;
 use tracing::instrument;
 
@@ -16,7 +16,7 @@ use crate::ops::CleanContext;
 use crate::util::cache_lock::CacheLockMode;
 use crate::util::data_structures::{HashMap, HashSet};
 use crate::{CargoResult, GlobalContext};
-use snapshots::{Digest, Output, SnapshotIndex, StoredUnit, UnitResult};
+use snapshots::SnapshotStore;
 
 pub struct BlobStorage {
     root: PathBuf,
@@ -37,16 +37,12 @@ impl BlobStorage {
     pub fn new(root: PathBuf, build_dir: &Path, gctx: &GlobalContext) -> CargoResult<Self> {
         create_dir_all(&root)?;
 
-        if !is_same_filesystem(&root, build_dir).unwrap_or(false) {
-            bail!("blob storage and build-dir are on different file systems")
-        }
-
         let build_dir_id = std::fs::canonicalize(build_dir)?
             .as_os_str()
             .as_encoded_bytes()
             .to_vec();
         let _lock = gctx.acquire_package_cache_lock(CacheLockMode::DownloadExclusive)?;
-        let known = SnapshotIndex::open(&root)?.load_units(&build_dir_id)?;
+        let known = SnapshotStore::new(&root).load_units(&build_dir_id)?;
         Ok(Self {
             root,
             build_dir: build_dir.to_path_buf(),
@@ -99,15 +95,11 @@ impl BlobStorage {
             let storage_path = self
                 .root
                 .join(blake3::Hash::from_bytes(hash).to_hex().as_str());
-            if !self.insert(path, &storage_path)? {
-                self.dedup(path, &storage_path)?;
+            if !self.insert(path, &storage_path, false)? {
+                self.dedup(path, &storage_path, &hash)?;
             }
             outputs.push(Output {
-                path: path
-                    .strip_prefix(unit_dir)?
-                    .as_os_str()
-                    .as_encoded_bytes()
-                    .to_vec(),
+                path: encode_output_path(path.strip_prefix(unit_dir)?)?,
                 hash,
                 size,
             });
@@ -147,7 +139,7 @@ impl BlobStorage {
                 .collect::<Vec<_>>()
         });
         let _lock = gctx.acquire_package_cache_lock(CacheLockMode::DownloadExclusive)?;
-        SnapshotIndex::open(&self.root)?.save(
+        SnapshotStore::new(&self.root).save(
             &self.build_dir_id,
             &tracking.invalidated,
             &tracking.updates,
@@ -165,63 +157,76 @@ impl BlobStorage {
         if !root.try_exists()? {
             return Ok(());
         }
-        SnapshotIndex::open_for_clean(root, clean_ctx.dry_run)?.clean(
-            root,
-            clean_ctx,
-            max_size,
-            now(),
-        )
+        SnapshotStore::new(root).clean(clean_ctx, max_size, now())
     }
 
-    fn insert(&self, artifact_path: &Path, storage_path: &Path) -> CargoResult<bool> {
-        if storage_path.try_exists()? {
+    fn insert(
+        &self,
+        artifact_path: &Path,
+        storage_path: &Path,
+        replace_corrupt: bool,
+    ) -> CargoResult<bool> {
+        if !replace_corrupt && storage_path.try_exists()? {
             return Ok(false);
         }
 
-        // This logic is a bit subtle.
-        // Reflinking is not atomic so we create a temp dir to create that file falling back to
-        // hardlinking. Then regardless of whether we reflinked or hardlinked, we hard link that
-        // file into the blob storage so the insert is always atomic.
-        //
-        // Importantly, we do not use `std::fs::rename` to move the file in to the blob storage as
-        // that would overwrite the existing file if there was another process inserted before us.
+        // Publish complete bytes atomically. A concurrent producer of the same
+        // digest has identical contents, so replacing its name is harmless.
         let staging_dir = tempfile::Builder::new()
             .prefix(".blob")
             .tempdir_in(&self.root)?;
         let staged = staging_dir.path().join("artifact");
-        if reflink_copy::reflink(artifact_path, &staged).is_err() {
-            std::fs::hard_link(artifact_path, &staged)?;
+        if reflink_copy::reflink(artifact_path, &staged).is_err()
+            && std::fs::hard_link(artifact_path, &staged).is_err()
+        {
+            std::fs::copy(artifact_path, &staged)?;
         }
         #[cfg(target_os = "linux")]
         ensure_no_writers(&staged)?;
-
-        match std::fs::hard_link(&staged, storage_path) {
-            Ok(()) => Ok(true),
-            Err(err) if err.kind() == ErrorKind::AlreadyExists => Ok(false),
-            Err(err) => Err(err.into()),
-        }
+        std::fs::rename(&staged, storage_path)?;
+        Ok(true)
     }
 
-    fn dedup(&self, path: &Path, storage_path: &Path) -> CargoResult<()> {
+    fn dedup(&self, path: &Path, storage_path: &Path, expected: &Digest) -> CargoResult<()> {
         let metadata = path.metadata()?;
+        let stored = std::fs::symlink_metadata(storage_path)?;
+        if !stored.is_file() || stored.len() != metadata.len() {
+            self.insert(path, storage_path, true)?;
+            return Ok(());
+        }
         let staging_dir = tempfile::Builder::new()
             .prefix(".blob")
             .tempdir_in(path.parent().unwrap())?;
         let replacement = staging_dir.path().join("artifact");
-        if reflink_copy::reflink(storage_path, &replacement).is_ok() {
-            // Reflink creates a different inode so things like mtimes are not preserved
-            // automatically, which causes issues with rebuild detection.
+        let private_copy = if reflink_copy::reflink(storage_path, &replacement).is_ok() {
+            true
+        } else {
+            let compatible = stored.permissions() == metadata.permissions()
+                && FileTime::from_last_modification_time(&stored)
+                    == FileTime::from_last_modification_time(&metadata);
+            if compatible && std::fs::hard_link(storage_path, &replacement).is_ok() {
+                false
+            } else {
+                std::fs::copy(storage_path, &replacement)?;
+                true
+            }
+        };
+        if private_copy {
             std::fs::set_permissions(&replacement, metadata.permissions())?;
             filetime::set_file_times(
                 &replacement,
                 FileTime::from_last_access_time(&metadata),
                 FileTime::from_last_modification_time(&metadata),
             )?;
-        } else {
-            std::fs::hard_link(storage_path, &replacement)?;
         }
         #[cfg(target_os = "linux")]
         ensure_no_writers(&replacement)?;
+        // Restored cache objects must not replace good compiler outputs with
+        // bytes that do not match their content-addressed name.
+        if &Self::hash(&replacement)? != expected {
+            self.insert(path, storage_path, true)?;
+            return Ok(());
+        }
         std::fs::rename(&replacement, path)?;
 
         Ok(())
@@ -264,38 +269,73 @@ fn ensure_no_writers(path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-fn is_same_filesystem(dir1: &Path, dir2: &Path) -> std::io::Result<bool> {
-    cfg_select! {
-        unix => {
-            use std::os::unix::fs::MetadataExt;
-            let meta1 = std::fs::metadata(dir1)?;
-            let meta2 = std::fs::metadata(dir2)?;
-            Ok(meta1.dev() == meta2.dev())
-        }
-        windows => {
-            use std::fs::OpenOptions;
-            use std::os::windows::fs::OpenOptionsExt;
-            use std::os::windows::io::AsRawHandle;
-            use windows_sys::Win32::Storage::FileSystem::{
-                BY_HANDLE_FILE_INFORMATION, FILE_FLAG_BACKUP_SEMANTICS,
-                GetFileInformationByHandle,
-            };
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
 
-            // FIXME: Ideally we use std if/when https://github.com/rust-lang/rust/issues/63010 is
-            // stabilized
-            fn volume_serial_number(path: &Path) -> std::io::Result<u32> {
-                let file = OpenOptions::new()
-                    .access_mode(0)
-                    .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
-                    .open(path)?;
-                let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
-                if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) } == 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(info.dwVolumeSerialNumber)
-            }
+    #[test]
+    fn restored_blob_preserves_executability_and_mtime() {
+        let root = tempfile::tempdir().unwrap();
+        let build_dir = tempfile::tempdir().unwrap();
+        let storage = BlobStorage {
+            root: root.path().to_path_buf(),
+            build_dir: build_dir.path().to_path_buf(),
+            build_dir_id: Vec::new(),
+            tracking: Mutex::default(),
+        };
+        let contents = b"#!/bin/sh\nprintf 'cache-ok\\n'\n";
+        let hash = *blake3::hash(contents).as_bytes();
+        let blob = root
+            .path()
+            .join(blake3::Hash::from_bytes(hash).to_hex().as_str());
+        let artifact = build_dir.path().join("program");
+        std::fs::write(&blob, contents).unwrap();
+        std::fs::write(&artifact, contents).unwrap();
+        std::fs::set_permissions(&blob, std::fs::Permissions::from_mode(0o444)).unwrap();
+        std::fs::set_permissions(&artifact, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let downloaded = FileTime::from_unix_time(1_600_000_000, 0);
+        let compiled = FileTime::from_unix_time(1_600_000_100, 0);
+        filetime::set_file_mtime(&blob, downloaded).unwrap();
+        filetime::set_file_mtime(&artifact, compiled).unwrap();
 
-            Ok(volume_serial_number(dir1)? == volume_serial_number(dir2)?)
-        }
+        storage.dedup(&artifact, &blob, &hash).unwrap();
+
+        let metadata = artifact.metadata().unwrap();
+        assert_eq!(FileTime::from_last_modification_time(&metadata), compiled);
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o755);
+        let output = std::process::Command::new(&artifact).output().unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"cache-ok\n");
+        let metadata = blob.metadata().unwrap();
+        assert_eq!(FileTime::from_last_modification_time(&metadata), downloaded);
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o444);
+    }
+
+    #[test]
+    fn restored_blob_symlink_cannot_redirect_compiler_output() {
+        let root = tempfile::tempdir().unwrap();
+        let build_dir = tempfile::tempdir().unwrap();
+        let storage = BlobStorage {
+            root: root.path().to_path_buf(),
+            build_dir: build_dir.path().to_path_buf(),
+            build_dir_id: Vec::new(),
+            tracking: Mutex::default(),
+        };
+        let contents = b"compiled output";
+        let hash = *blake3::hash(contents).as_bytes();
+        let blob = root
+            .path()
+            .join(blake3::Hash::from_bytes(hash).to_hex().as_str());
+        let artifact = build_dir.path().join("artifact");
+        std::fs::write(&artifact, contents).unwrap();
+        std::os::unix::fs::symlink(&artifact, &blob).unwrap();
+
+        storage.dedup(&artifact, &blob, &hash).unwrap();
+
+        assert!(std::fs::symlink_metadata(&artifact).unwrap().is_file());
+        assert!(std::fs::symlink_metadata(&blob).unwrap().is_file());
+        assert_eq!(std::fs::read(&artifact).unwrap(), contents);
+        assert_eq!(std::fs::read(&blob).unwrap(), contents);
     }
 }

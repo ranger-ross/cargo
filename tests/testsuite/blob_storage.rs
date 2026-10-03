@@ -1,6 +1,6 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::prelude::*;
@@ -148,57 +148,176 @@ fn build_snapshot(p: &Project, feature: &str) {
         .run();
 }
 
-fn snapshot_db() -> rusqlite::Connection {
-    t!(rusqlite::Connection::open(
-        paths::cargo_home().join("blobs/index.sqlite")
-    ))
+type Digest = [u8; 32];
+
+const SNAPSHOT_MAGIC: &[u8] = b"cargo-shared-blob-snapshot-v1\0";
+const UNIT_MAGIC: &[u8] = b"cargo-shared-blob-unit-result-v2\0";
+const STATE_MAGIC: &[u8] = b"cargo-shared-blob-state-v1\0";
+
+fn blob_root() -> PathBuf {
+    paths::cargo_home().join("blobs")
 }
 
-fn snapshot_ids() -> BTreeSet<Vec<u8>> {
-    let db = snapshot_db();
-    let mut stmt = t!(db.prepare("SELECT id FROM snapshot"));
-    t!(t!(stmt.query_map([], |row| row.get(0))).collect())
+fn object_path(root: &Path, kind: &str, id: &Digest) -> PathBuf {
+    root.join(kind)
+        .join(blake3::Hash::from(*id).to_hex().as_str())
 }
 
-fn snapshot_blobs(id: &[u8]) -> BTreeSet<PathBuf> {
-    let db = snapshot_db();
-    let mut stmt = t!(db.prepare(
-        "SELECT DISTINCT unit_output.blob_hash FROM snapshot_member
-         JOIN unit_output ON unit_output.result_id = snapshot_member.result_id
-         WHERE snapshot_member.snapshot_id = ?1"
-    ));
-    let hashes = t!(stmt.query_map([id], |row| row.get::<_, Vec<u8>>(0)));
-    hashes
-        .map(|hash| {
-            let digest: [u8; 32] = t!(t!(hash).as_slice().try_into());
-            paths::cargo_home()
-                .join("blobs")
-                .join(blake3::Hash::from(digest).to_hex().as_str())
+fn object_bytes(root: &Path, kind: &str, id: &Digest) -> Vec<u8> {
+    let bytes = t!(fs::read(object_path(root, kind, id)));
+    assert_eq!(blake3::hash(&bytes).as_bytes(), id);
+    bytes
+}
+
+fn snapshot_ids_at(root: &Path) -> BTreeSet<Digest> {
+    let dir = root.join("snapshots-v1");
+    if !dir.exists() {
+        return BTreeSet::new();
+    }
+    t!(fs::read_dir(dir))
+        .map(|entry| {
+            let entry = t!(entry);
+            let bytes = t!(fs::read(entry.path()));
+            let hash = blake3::hash(&bytes);
+            assert_eq!(entry.file_name().to_str().unwrap(), hash.to_hex().as_str());
+            *hash.as_bytes()
         })
         .collect()
 }
 
-fn usage_time(id: &[u8]) -> u64 {
-    t!(snapshot_db().query_row(
-        "SELECT last_used FROM snapshot_usage WHERE snapshot_id = ?1",
-        [id],
-        |row| row.get(0)
-    ))
+fn snapshot_ids() -> BTreeSet<Digest> {
+    snapshot_ids_at(&blob_root())
 }
 
-fn backdate_snapshot(id: &[u8], timestamp: u64) {
-    assert_eq!(
-        t!(snapshot_db().execute(
-            "UPDATE snapshot_usage SET last_used = ?1 WHERE snapshot_id = ?2",
-            rusqlite::params![timestamp, id],
-        )),
-        1
-    );
+fn take_u64(bytes: &mut &[u8]) -> u64 {
+    let (value, rest) = bytes.split_at(8);
+    *bytes = rest;
+    u64::from_le_bytes(value.try_into().unwrap())
+}
+
+fn take_digest(bytes: &mut &[u8]) -> Digest {
+    let (value, rest) = bytes.split_at(32);
+    *bytes = rest;
+    value.try_into().unwrap()
+}
+
+fn snapshot_units(root: &Path, id: &Digest) -> BTreeSet<Digest> {
+    let data = object_bytes(root, "snapshots-v1", id);
+    let mut bytes = data.strip_prefix(SNAPSHOT_MAGIC).unwrap();
+    let count = take_u64(&mut bytes);
+    let units = (0..count).map(|_| take_digest(&mut bytes)).collect();
+    assert!(bytes.is_empty());
+    units
+}
+
+fn snapshot_blobs(id: &Digest) -> BTreeSet<PathBuf> {
+    let root = blob_root();
+    let mut blobs = BTreeSet::new();
+    for unit in snapshot_units(&root, id) {
+        let data = object_bytes(&root, "units-v1", &unit);
+        let mut bytes = data.strip_prefix(UNIT_MAGIC).unwrap();
+        assert!(matches!(bytes[0], 1..=3));
+        bytes = &bytes[1..];
+        for _ in 0..take_u64(&mut bytes) {
+            let path_len = take_u64(&mut bytes) as usize;
+            bytes = &bytes[path_len..];
+            let hash = take_digest(&mut bytes);
+            let size = take_u64(&mut bytes);
+            let path = object_path(&root, "", &hash);
+            let contents = t!(fs::read(&path));
+            assert_eq!(contents.len() as u64, size);
+            assert_eq!(blake3::hash(&contents).as_bytes(), &hash);
+            blobs.insert(path);
+        }
+        assert!(bytes.is_empty());
+    }
+    blobs
+}
+
+// Return byte offsets only: tests age local receipts without rewriting immutable
+// manifests or maintaining their own implementation of the storage backend.
+fn usage_offsets(data: &[u8]) -> Vec<(Digest, usize)> {
+    let mut bytes = data.strip_prefix(STATE_MAGIC).unwrap();
+    for _ in 0..take_u64(&mut bytes) {
+        let path_len = take_u64(&mut bytes) as usize;
+        bytes = &bytes[path_len + 64..];
+    }
+    let mut offsets = Vec::new();
+    for _ in 0..take_u64(&mut bytes) {
+        let id = take_digest(&mut bytes);
+        offsets.push((id, data.len() - bytes.len()));
+        take_u64(&mut bytes);
+    }
+    assert!(bytes.is_empty());
+    offsets
+}
+
+fn receipts(root: &Path) -> Vec<PathBuf> {
+    t!(fs::read_dir(root.join("local-v1")))
+        .map(|entry| t!(entry).path())
+        .collect()
+}
+
+fn receipt_usage(path: &Path, id: &Digest) -> u64 {
+    let data = t!(fs::read(path));
+    let offset = usage_offsets(&data)
+        .into_iter()
+        .find(|(snapshot, _)| snapshot == id)
+        .unwrap()
+        .1;
+    u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap())
+}
+
+fn usage_time(id: &Digest) -> u64 {
+    let receipts = receipts(&blob_root());
+    assert_eq!(receipts.len(), 1);
+    receipt_usage(&receipts[0], id)
+}
+
+fn backdate_receipt(path: &Path, id: &Digest, timestamp: u64) {
+    let mut data = t!(fs::read(path));
+    let offset = usage_offsets(&data)
+        .into_iter()
+        .find(|(snapshot, _)| snapshot == id)
+        .unwrap()
+        .1;
+    data[offset..offset + 8].copy_from_slice(&timestamp.to_le_bytes());
+    t!(fs::write(path, data));
+}
+
+fn backdate_snapshot(id: &Digest, timestamp: u64) {
+    let receipts = receipts(&blob_root());
+    assert_eq!(receipts.len(), 1);
+    backdate_receipt(&receipts[0], id, timestamp);
+}
+
+fn cache_files(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+    fn collect(root: &Path, dir: &Path, files: &mut BTreeMap<PathBuf, Vec<u8>>) {
+        for entry in t!(fs::read_dir(dir)) {
+            let path = t!(entry).path();
+            if path.is_dir() {
+                collect(root, &path, files);
+            } else {
+                files.insert(
+                    t!(path.strip_prefix(root)).to_path_buf(),
+                    t!(fs::read(path)),
+                );
+            }
+        }
+    }
+    let mut files = BTreeMap::new();
+    collect(root, root, &mut files);
+    files
 }
 
 fn clean_blobs(p: &Project, max_size: &str, dry_run: bool) {
+    clean_blobs_in(p, &paths::cargo_home(), max_size, dry_run);
+}
+
+fn clean_blobs_in(p: &Project, cargo_home: &Path, max_size: &str, dry_run: bool) {
     let mut cmd = p.cargo("clean gc");
-    cmd.args(&["--max-blob-size", max_size, "-Zgc", "-Zshared-blob-storage"])
+    cmd.env("CARGO_HOME", cargo_home)
+        .args(&["--max-blob-size", max_size, "-Zgc", "-Zshared-blob-storage"])
         .masquerade_as_nightly_cargo(&["gc", "shared-blob-storage"]);
     if dry_run {
         cmd.arg("--dry-run");
@@ -221,10 +340,12 @@ fn identical_graph_reuses_snapshot_and_throttles_usage() {
     // timestamp, even when it falls in a different wall-clock second.
     let recent = now - 60 * 60;
     backdate_snapshot(id, recent);
+    let before = cache_files(&blob_root());
     for _ in 0..3 {
         build_snapshot(&p, "foo");
         assert_eq!(snapshot_ids(), ids);
         assert_eq!(usage_time(id), recent);
+        assert_eq!(cache_files(&blob_root()), before);
     }
 
     backdate_snapshot(id, now - 5 * 60 * 60);
@@ -312,11 +433,10 @@ fn pressure_gc_preserves_build_outputs_and_dry_run_preserves_cache() {
         .collect();
     assert!(!artifacts.is_empty());
     let executable = t!(fs::read(p.bin("app")));
-    let index = paths::cargo_home().join("blobs/index.sqlite");
-    let before = t!(fs::read(&index));
+    let before = cache_files(&blob_root());
 
     clean_blobs(&p, "0", true);
-    assert_eq!(t!(fs::read(&index)), before);
+    assert_eq!(cache_files(&blob_root()), before);
     for (path, contents) in &blobs {
         assert_eq!(t!(fs::read(path)), *contents);
     }
@@ -331,7 +451,7 @@ fn pressure_gc_preserves_build_outputs_and_dry_run_preserves_cache() {
     assert_eq!(t!(fs::read(p.bin("app"))), executable);
     p.process(&p.bin("app")).with_stdout_data("11\n").run();
     // Existing build-dir outputs must remain usable by Cargo too, including
-    // recovery of the index mapping removed by pressure GC.
+    // recovery of the local lookup mapping removed by pressure GC.
     p.cargo("run --features foo -Zshared-blob-storage")
         .masquerade_as_nightly_cargo(&["shared-blob-storage"])
         .with_stdout_data("11\n")
@@ -378,7 +498,7 @@ fn fresh_build_recaptures_outputs_replaced_without_blob_storage() {
         .unwrap();
     let original = t!(fs::read(&artifact));
 
-    // Rebuild the same unit slot while index tracking is disabled. env! embeds
+    // Rebuild the same unit slot while snapshot tracking is disabled. env! embeds
     // different bytes and changes the fingerprint without changing the unit's
     // output path, unlike toggling a feature or changing RUSTFLAGS.
     p.cargo("clean -p changing").run();
@@ -418,4 +538,204 @@ fn fresh_build_recaptures_outputs_replaced_without_blob_storage() {
         .with_stdout_data("replacement\n")
         .run();
     assert_eq!(snapshot_ids(), ids);
+}
+
+#[cargo_test]
+fn archive_restore_without_local_receipts_gets_one_expiring_lease() {
+    let p = snapshot_project();
+    build_snapshot(&p, "foo");
+    let ids = snapshot_ids();
+    let id = ids.first().unwrap();
+    let blobs = snapshot_blobs(id);
+    let source = blob_root();
+    let restored_home = p.root().join("restored-cargo-home");
+    let restored = restored_home.join("blobs");
+    // Model an archive extraction: new files containing only immutable bytes,
+    // with no hardlinks, preserved mtimes, or workspace-local receipts.
+    for (path, contents) in cache_files(&source) {
+        if path.starts_with("local-v1") {
+            continue;
+        }
+        let destination = restored.join(path);
+        t!(fs::create_dir_all(destination.parent().unwrap()));
+        t!(fs::write(destination, contents));
+    }
+    t!(fs::remove_dir_all(&source));
+    assert!(!restored.join("local-v1").exists());
+    assert_eq!(snapshot_ids_at(&restored), ids);
+    let immutable = cache_files(&restored);
+
+    clean_blobs_in(&p, &restored_home, "1GiB", true);
+    assert_eq!(cache_files(&restored), immutable);
+    assert!(!restored.join("local-v1").exists());
+
+    clean_blobs_in(&p, &restored_home, "1GiB", false);
+    let imports = restored.join("local-v1/imports");
+    assert!(receipt_usage(&imports, id) > 1);
+    for blob in &blobs {
+        let path = restored.join(blob.file_name().unwrap());
+        let bytes = t!(fs::read(&path));
+        assert_eq!(
+            path.file_name().unwrap().to_str().unwrap(),
+            blake3::hash(&bytes).to_hex().as_str()
+        );
+    }
+    let recent = t!(SystemTime::now().duration_since(UNIX_EPOCH)).as_secs() - 3600;
+    backdate_receipt(&imports, id, recent);
+    clean_blobs_in(&p, &restored_home, "1GiB", false);
+    assert_eq!(receipt_usage(&imports, id), recent);
+    assert_eq!(snapshot_ids_at(&restored), ids);
+
+    backdate_receipt(&imports, id, 1);
+    clean_blobs_in(&p, &restored_home, "1GiB", false);
+    assert!(snapshot_ids_at(&restored).is_empty());
+    for blob in &blobs {
+        assert!(!restored.join(blob.file_name().unwrap()).exists());
+    }
+    // An expired import must not be rediscovered and granted a second lease.
+    clean_blobs_in(&p, &restored_home, "1GiB", false);
+    assert!(snapshot_ids_at(&restored).is_empty());
+    p.process(&p.bin("app")).with_stdout_data("11\n").run();
+}
+
+#[cargo_test]
+fn multiple_build_directories_retain_shared_blobs_until_last_usage_expires() {
+    let p = snapshot_project();
+    build_snapshot(&p, "foo");
+    let ids = snapshot_ids();
+    let id = ids.first().unwrap();
+    let blobs = snapshot_blobs(id);
+    let first_receipt = receipts(&blob_root()).pop().unwrap();
+    backdate_receipt(&first_receipt, id, 1);
+
+    p.cargo("build")
+        .args(&[
+            "--features",
+            "foo",
+            "--target-dir",
+            "other-target",
+            "--config",
+            "build.build-dir=\"other-build\"",
+            "-Zshared-blob-storage",
+        ])
+        .masquerade_as_nightly_cargo(&["shared-blob-storage"])
+        .run();
+    let local = receipts(&blob_root());
+    assert_eq!(local.len(), 2);
+    let second_receipt = local.iter().find(|path| **path != first_receipt).unwrap();
+    assert_eq!(receipt_usage(&first_receipt, id), 1);
+    let second_usage = usage_offsets(&t!(fs::read(second_receipt)));
+    assert_eq!(second_usage.len(), 1);
+    let second_id = second_usage[0].0;
+    assert!(receipt_usage(second_receipt, &second_id) > 1);
+    let second_blobs = snapshot_blobs(&second_id);
+    assert!(
+        blobs.intersection(&second_blobs).next().is_some(),
+        "independent build directories must share dependency blobs"
+    );
+
+    clean_blobs(&p, "1GiB", false);
+    assert_eq!(snapshot_ids(), BTreeSet::from([second_id]));
+    assert_eq!(snapshot_blobs(&second_id), second_blobs);
+    for blob in blobs.difference(&second_blobs) {
+        assert!(!blob.exists(), "expired build directory retained {blob:?}");
+    }
+    backdate_receipt(second_receipt, &second_id, 1);
+    clean_blobs(&p, "1GiB", false);
+    assert!(snapshot_ids().is_empty());
+    for blob in blobs.union(&second_blobs) {
+        assert!(
+            !blob.exists(),
+            "last usage expired but blob remains: {blob:?}"
+        );
+    }
+}
+
+fn incomplete_graph_preserves_other_snapshot(damage: &str) {
+    let p = snapshot_project();
+    build_snapshot(&p, "foo");
+    let foo_id = snapshot_ids().pop_first().unwrap();
+    let foo_blobs = snapshot_blobs(&foo_id);
+    let foo_units = snapshot_units(&blob_root(), &foo_id);
+    build_snapshot(&p, "bar");
+    let bar_id = *snapshot_ids().iter().find(|id| **id != foo_id).unwrap();
+    let bar_blobs = snapshot_blobs(&bar_id);
+    let bar_units = snapshot_units(&blob_root(), &bar_id);
+    assert!(foo_blobs.intersection(&bar_blobs).next().is_some());
+    let broken_unit = foo_units.difference(&bar_units).next().unwrap();
+    let path = object_path(&blob_root(), "units-v1", broken_unit);
+    match damage {
+        "missing" => t!(fs::remove_file(&path)),
+        "truncated" => {
+            let bytes = t!(fs::read(&path));
+            t!(fs::write(&path, &bytes[..bytes.len() / 2]));
+        }
+        "wrong-hash" => {
+            let mut bytes = t!(fs::read(&path));
+            // Keep framing and every blob reference intact. Only digest
+            // verification can distinguish this from a complete live graph.
+            let encoding = bytes[UNIT_MAGIC.len()];
+            let mut outputs = &bytes[UNIT_MAGIC.len() + 1..];
+            assert!(take_u64(&mut outputs) > 0);
+            let path_len = take_u64(&mut outputs) as usize;
+            let last_character =
+                bytes.len() - outputs.len() + path_len - if encoding == 2 { 2 } else { 1 };
+            bytes[last_character] ^= 1;
+            t!(fs::write(&path, bytes));
+        }
+        _ => unreachable!(),
+    }
+    clean_blobs(&p, "1GiB", false);
+    assert_eq!(snapshot_ids(), BTreeSet::from([bar_id]));
+    assert_eq!(snapshot_blobs(&bar_id), bar_blobs);
+    for blob in foo_blobs.difference(&bar_blobs) {
+        assert!(!blob.exists(), "incomplete graph retained blob: {blob:?}");
+    }
+    p.cargo("run --features bar -Zshared-blob-storage")
+        .masquerade_as_nightly_cargo(&["shared-blob-storage"])
+        .with_stdout_data("12\n")
+        .run();
+}
+
+#[cargo_test]
+fn missing_manifest_does_not_collect_blobs_shared_with_complete_graph() {
+    incomplete_graph_preserves_other_snapshot("missing");
+}
+
+#[cargo_test]
+fn truncated_manifest_does_not_collect_blobs_shared_with_complete_graph() {
+    incomplete_graph_preserves_other_snapshot("truncated");
+}
+
+#[cargo_test]
+fn manifest_hash_mismatch_does_not_collect_blobs_shared_with_complete_graph() {
+    incomplete_graph_preserves_other_snapshot("wrong-hash");
+}
+
+#[cargo_test]
+fn corrupt_restored_blob_is_repaired_without_replacing_good_build_output() {
+    let p = snapshot_project();
+    build_snapshot(&p, "foo");
+    let artifact = p
+        .glob("target/debug/build/common/*/out/libcommon-*.rlib")
+        .next()
+        .unwrap()
+        .unwrap();
+    let original = t!(fs::read(&artifact));
+    let blob = blob_root().join(blake3::hash(&original).to_hex().as_str());
+    assert_eq!(t!(fs::read(&blob)), original);
+    let mut wrong = original.clone();
+    wrong[0] ^= 1;
+    // Never modify a potentially hardlinked compiler output in place.
+    let replacement = blob_root().join("corrupt-replacement");
+    t!(fs::write(&replacement, &wrong));
+    t!(fs::rename(replacement, &blob));
+    assert_eq!(t!(fs::read(&artifact)), original);
+    assert_eq!(t!(fs::read(&blob)), wrong);
+    t!(fs::remove_dir_all(blob_root().join("local-v1")));
+
+    build_snapshot(&p, "foo");
+    assert_eq!(t!(fs::read(&artifact)), original);
+    assert_eq!(t!(fs::read(&blob)), original);
+    p.process(&p.bin("app")).with_stdout_data("11\n").run();
 }

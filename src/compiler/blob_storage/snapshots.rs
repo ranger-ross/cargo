@@ -1,502 +1,742 @@
-//! Local graph inventories for shared blob storage. The caller holds the package
-//! cache lock for every database operation, and the mutation lock while cleaning.
+//! Portable immutable graph inventories with local usage receipts.
+//!
+//! The caller holds the package-cache lock during publication and collection.
+//! Receipts are replaced last when publishing, and first when collecting.
 
-use std::path::Path;
+use std::fs;
+use std::io::{ErrorKind, Write};
+use std::path::{Path, PathBuf};
 
-use rusqlite::{Connection, OpenFlags, Row, Transaction, params};
+use anyhow::{Context, ensure};
 
+use super::format::{
+    Digest, Receipt, StoredUnit, UnitResult, decode_snapshot, decode_unit, digest_filename,
+    encode_snapshot, snapshot_id,
+};
 use crate::CargoResult;
 use crate::ops::CleanContext;
 use crate::util::data_structures::{HashMap, HashSet};
-use crate::util::sqlite::{Migration, basic_migration, migrate};
-
-pub(super) type Digest = [u8; 32];
 
 const USAGE_UPDATE_INTERVAL: u64 = 4 * 60 * 60;
 const RETENTION: u64 = 30 * 24 * 60 * 60;
+const UNITS: &str = "units-v1";
+const SNAPSHOTS: &str = "snapshots-v1";
+const LOCAL: &str = "local-v1";
 
-#[derive(Debug)]
-pub(super) struct Output {
-    pub path: Vec<u8>,
-    pub hash: Digest,
-    pub size: u64,
+pub(super) struct SnapshotStore<'a> {
+    root: &'a Path,
 }
 
-#[derive(Debug)]
-pub(super) struct UnitResult {
-    pub id: Digest,
-    /// Build-dir freshness token, deliberately excluded from the result ID.
-    pub generation: Digest,
-    pub outputs: Vec<Output>,
-}
-
-impl UnitResult {
-    pub fn new(mut outputs: Vec<Output>) -> Self {
-        outputs.sort_unstable_by(|a, b| {
-            a.path
-                .cmp(&b.path)
-                .then_with(|| a.hash.cmp(&b.hash))
-                .then_with(|| a.size.cmp(&b.size))
-        });
-        let mut hasher = blake3::Hasher::new();
-        hasher.update(b"cargo-shared-blob-unit-result-v1\0");
-        hasher.update(&(outputs.len() as u64).to_le_bytes());
-        for output in &outputs {
-            hasher.update(&(output.path.len() as u64).to_le_bytes());
-            hasher.update(&output.path);
-            hasher.update(&output.hash);
-            hasher.update(&output.size.to_le_bytes());
-        }
-        Self {
-            id: *hasher.finalize().as_bytes(),
-            generation: [0; 32],
-            outputs,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug)]
-pub(super) struct StoredUnit {
-    pub result: Digest,
-    pub generation: Digest,
-}
-
-pub(super) struct SnapshotIndex {
-    conn: Connection,
-}
-
-impl SnapshotIndex {
-    pub fn open(root: &Path) -> CargoResult<Self> {
-        cargo_util::paths::create_dir_all(root)?;
-        let mut conn = Connection::open(root.join("index.sqlite"))?;
-        conn.pragma_update(None, "foreign_keys", true)?;
-        migrate(&mut conn, &migrations())?;
-        Ok(Self { conn })
-    }
-
-    /// A legacy cache can be inspected without creating an index. Existing
-    /// indexes are not migrated during dry-run; all cleanup writes roll back.
-    pub fn open_for_clean(root: &Path, dry_run: bool) -> CargoResult<Self> {
-        if !dry_run {
-            return Self::open(root);
-        }
-        let path = root.join("index.sqlite");
-        let conn = if path.try_exists()? {
-            Connection::open_with_flags(
-                path,
-                OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-            )?
-        } else {
-            let mut conn = Connection::open_in_memory()?;
-            migrate(&mut conn, &migrations())?;
-            conn
-        };
-        conn.pragma_update(None, "foreign_keys", true)?;
-        Ok(Self { conn })
+impl<'a> SnapshotStore<'a> {
+    pub fn new(root: &'a Path) -> Self {
+        Self { root }
     }
 
     pub fn load_units(&self, build_dir: &[u8]) -> CargoResult<HashMap<Vec<u8>, StoredUnit>> {
-        let mut statement = self.conn.prepare(
-            "SELECT unit_path, result_id, generation FROM build_unit WHERE build_dir = ?1",
-        )?;
-        let units = statement.query_map([build_dir], |row| {
-            Ok((
-                row.get(0)?,
-                StoredUnit {
-                    result: read_digest(row, 1)?,
-                    generation: read_digest(row, 2)?,
-                },
-            ))
-        })?;
-        Ok(units.collect::<rusqlite::Result<_>>()?)
+        self.check_directories()?;
+        Ok(read_receipt(&self.receipt_path(build_dir))?.units)
     }
 
-    /// Persist completed work even on failure, but only publish a graph when the
-    /// entire build succeeded. Unit slots are lookup hints, not retention roots.
+    /// Completed units survive a failed build, but slots are never GC roots.
+    /// Reload the receipt under the caller's exclusive lock to merge changes.
     pub fn save(
-        &mut self,
+        &self,
         build_dir: &[u8],
         invalidated: &HashSet<Vec<u8>>,
         updates: &HashMap<Vec<u8>, UnitResult>,
         snapshot: Option<Vec<Digest>>,
         now: u64,
     ) -> CargoResult<()> {
-        let tx = self.conn.transaction()?;
-        if !invalidated.is_empty() || !updates.is_empty() {
-            let mut invalidate = tx
-                .prepare_cached("DELETE FROM build_unit WHERE build_dir = ?1 AND unit_path = ?2")?;
-            for path in invalidated {
-                invalidate.execute(params![build_dir, path])?;
-            }
-            let mut insert_result =
-                tx.prepare_cached("INSERT OR IGNORE INTO unit_result (id) VALUES (?1)")?;
-            let mut insert_blob =
-                tx.prepare_cached("INSERT OR IGNORE INTO blob (hash, size) VALUES (?1, ?2)")?;
-            let mut insert_output = tx.prepare_cached(
-                "INSERT INTO unit_output (result_id, path, blob_hash, size)
-                 VALUES (?1, ?2, ?3, ?4)",
-            )?;
-            let mut update_slot = tx.prepare_cached(
-                "INSERT INTO build_unit (build_dir, unit_path, result_id, generation)
-                 VALUES (?1, ?2, ?3, ?4)
-                 ON CONFLICT (build_dir, unit_path) DO UPDATE
-                 SET result_id = excluded.result_id, generation = excluded.generation
-                 WHERE build_unit.result_id != excluded.result_id
-                    OR build_unit.generation != excluded.generation",
-            )?;
-            for (path, result) in updates {
-                if insert_result.execute([result.id.as_slice()])? != 0 {
-                    for output in &result.outputs {
-                        insert_blob.execute(params![output.hash.as_slice(), output.size])?;
-                        insert_output.execute(params![
-                            result.id.as_slice(),
-                            output.path,
-                            output.hash.as_slice(),
-                            output.size,
-                        ])?;
-                    }
-                }
-                update_slot.execute(params![
-                    build_dir,
-                    path,
-                    result.id.as_slice(),
-                    result.generation.as_slice(),
-                ])?;
+        self.check_directories()?;
+        let path = self.receipt_path(build_dir);
+        let mut receipt = read_receipt(&path)?;
+        let mut changed = false;
+        for unit_path in invalidated {
+            changed |= receipt.units.remove(unit_path).is_some();
+        }
+        for (unit_path, result) in updates {
+            publish_object(&self.root.join(UNITS).join(hex(&result.id)), &result.bytes)?;
+            let stored = StoredUnit {
+                result: result.id,
+                generation: result.generation,
+            };
+            if receipt.units.get(unit_path) != Some(&stored) {
+                receipt.units.insert(unit_path.clone(), stored);
+                changed = true;
             }
         }
         if let Some(mut results) = snapshot {
             let id = snapshot_id(&mut results);
-            if tx.execute(
-                "INSERT OR IGNORE INTO snapshot (id) VALUES (?1)",
-                [id.as_slice()],
-            )? != 0
-            {
-                let mut insert_member = tx.prepare_cached(
-                    "INSERT INTO snapshot_member (snapshot_id, result_id) VALUES (?1, ?2)",
-                )?;
-                for result in results {
-                    insert_member.execute(params![id.as_slice(), result.as_slice()])?;
-                }
+            let manifest = self.root.join(SNAPSHOTS).join(hex(&id));
+            // Verify existing bytes before trusting the object. On a hit, no
+            // serialized graph is allocated and no file is touched for writing.
+            let valid = read_regular(&manifest)?.is_some_and(|bytes| {
+                // `id` was computed from the canonical graph above, so matching
+                // its digest also verifies framing without allocating members.
+                blake3::hash(&bytes).as_bytes() == &id
+            });
+            if !valid {
+                atomic_replace(&manifest, &encode_snapshot(&results))?;
             }
-            tx.execute(
-                "INSERT INTO snapshot_usage (build_dir, snapshot_id, last_used) VALUES (?1, ?2, ?3)
-                 ON CONFLICT (build_dir, snapshot_id) DO UPDATE
-                 SET last_used = MAX(snapshot_usage.last_used, excluded.last_used)
-                 WHERE excluded.last_used - snapshot_usage.last_used >= ?4",
-                params![build_dir, id.as_slice(), now, USAGE_UPDATE_INTERVAL],
-            )?;
+            match receipt.usage.get_mut(&id) {
+                Some(last_used) if now.saturating_sub(*last_used) >= USAGE_UPDATE_INTERVAL => {
+                    *last_used = now;
+                    changed = true;
+                }
+                None => {
+                    receipt.usage.insert(id, now);
+                    changed = true;
+                }
+                _ => {}
+            }
         }
-        tx.commit()?;
+        if changed {
+            atomic_replace(&path, &receipt.encode())?;
+        }
         Ok(())
     }
 
     pub fn clean(
-        &mut self,
-        root: &Path,
+        &self,
         clean_ctx: &mut CleanContext<'_>,
         max_size: Option<u64>,
         now: u64,
     ) -> CargoResult<()> {
-        // Inventory only regular CAS files. In particular, do not follow a
-        // digest-named symlink or recurse into a digest-named directory.
-        let mut files = HashMap::default();
-        let mut legacy_timestamps = Vec::new();
-        for entry in std::fs::read_dir(root)? {
-            let entry = entry?;
+        let plan = self.plan_collection(max_size, now)?;
+        // Publish every lookup invalidation before removing immutable objects.
+        // If one replacement fails, leave all cache data intact.
+        if !clean_ctx.dry_run {
+            for (path, bytes) in plan.receipts {
+                atomic_replace(&path, &bytes)?;
+            }
+        }
+        for path in plan.forgotten {
+            clean_ctx.rm_rf(&path)?;
+        }
+        // Remove snapshot manifests before their unit manifests and blobs.
+        for path in plan.removals {
+            clean_ctx.rm_rf(&path)?;
+        }
+        Ok(())
+    }
+
+    fn receipt_path(&self, build_dir: &[u8]) -> PathBuf {
+        self.root
+            .join(LOCAL)
+            .join(blake3::hash(build_dir).to_hex().as_str())
+    }
+
+    fn check_directories(&self) -> CargoResult<()> {
+        check_directory(self.root)?;
+        for directory in [UNITS, SNAPSHOTS, LOCAL] {
+            check_directory(&self.root.join(directory))?;
+        }
+        Ok(())
+    }
+
+    /// Decode and plan everything before performing any mutation. Invalid
+    /// manifests are disposable; an unreadable receipt may hide a live root,
+    /// and is therefore a hard error rather than an empty receipt.
+    fn plan_collection(&self, max_size: Option<u64>, now: u64) -> CargoResult<Collection> {
+        self.check_directories()?;
+        let mut blobs = HashMap::default();
+        let mut legacy = Vec::new();
+        for entry in entries(self.root)? {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
             if !entry.file_type()?.is_file() {
                 continue;
             }
-            let name = entry.file_name();
-            let Some(name) = name.to_str() else {
-                continue;
-            };
-            if let Some(hash) = digest_filename(name) {
-                files.insert(hash, (entry.path(), entry.metadata()?.len()));
+            if let Some(id) = digest_filename(name) {
+                blobs.insert(id, (entry.path(), entry.metadata()?.len()));
             } else if name
                 .strip_suffix(".timestamp")
                 .and_then(digest_filename)
                 .is_some()
+                || matches!(
+                    name,
+                    "index.sqlite"
+                        | "index.sqlite-journal"
+                        | "index.sqlite-wal"
+                        | "index.sqlite-shm"
+                )
             {
-                legacy_timestamps.push(entry.path());
+                legacy.push(entry.path());
             }
         }
 
-        let tx = self.conn.transaction()?;
-        // A missing output makes a result incomplete. Drop affected snapshots
-        // instead of changing their content-addressed membership in place.
-        let missing = {
-            let mut statement = tx.prepare("SELECT hash, size FROM blob")?;
-            let blobs =
-                statement.query_map([], |row| Ok((read_digest(row, 0)?, row.get::<_, u64>(1)?)))?;
-            let mut missing = Vec::new();
-            for blob in blobs {
-                let (hash, size) = blob?;
-                if !files.get(&hash).is_some_and(|(_, actual)| *actual == size) {
-                    missing.push(hash);
+        let unit_files = object_files(&self.root.join(UNITS))?;
+        let snapshot_files = object_files(&self.root.join(SNAPSHOTS))?;
+        let mut units = HashMap::default();
+        for (id, path) in &unit_files {
+            let bytes = read_regular(path)?
+                .with_context(|| format!("unit manifest disappeared: {}", path.display()))?;
+            let Ok(outputs) = decode_unit(&bytes, id) else {
+                continue;
+            };
+            if outputs.iter().all(|output| {
+                blobs
+                    .get(&output.hash)
+                    .is_some_and(|(_, size)| *size == output.size)
+            }) {
+                let mut references: Vec<_> =
+                    outputs.into_iter().map(|output| output.hash).collect();
+                references.sort_unstable();
+                references.dedup();
+                units.insert(*id, references);
+            }
+        }
+        let mut snapshots = HashMap::default();
+        for (id, path) in &snapshot_files {
+            let bytes = read_regular(path)?
+                .with_context(|| format!("snapshot manifest disappeared: {}", path.display()))?;
+            let Ok(results) = decode_snapshot(&bytes, id) else {
+                continue;
+            };
+            if results.iter().all(|result| units.contains_key(result)) {
+                snapshots.insert(*id, results);
+            }
+        }
+
+        let imports_path = self.root.join(LOCAL).join("imports");
+        let mut receipts = Vec::new();
+        let mut known = HashSet::default();
+        let mut recency = HashMap::<Digest, u64>::default();
+        let cutoff = now.saturating_sub(RETENTION);
+        for entry in entries(&self.root.join(LOCAL))? {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            if name != "imports" && digest_filename(name).is_none() {
+                continue;
+            }
+            let path = entry.path();
+            let receipt = read_receipt(&path)?;
+            ensure!(
+                name != "imports" || receipt.units.is_empty(),
+                "import receipt contains local unit slots"
+            );
+            for (id, last_used) in &receipt.usage {
+                // Expired usage still prevents granting a second import lease.
+                known.insert(*id);
+                if *last_used >= cutoff && snapshots.contains_key(id) {
+                    recency
+                        .entry(*id)
+                        .and_modify(|time| *time = (*time).max(*last_used))
+                        .or_insert(*last_used);
                 }
             }
-            missing
-        };
-        {
-            let mut remove_snapshots = tx.prepare_cached(
-                "DELETE FROM snapshot WHERE id IN (
-                     SELECT snapshot_id FROM snapshot_member
-                     JOIN unit_output ON unit_output.result_id = snapshot_member.result_id
-                     WHERE blob_hash = ?1
-                 )",
-            )?;
-            let mut remove_results = tx.prepare_cached(
-                "DELETE FROM unit_result WHERE id IN (
-                     SELECT result_id FROM unit_output WHERE blob_hash = ?1
-                 )",
-            )?;
-            for hash in missing {
-                remove_snapshots.execute([hash.as_slice()])?;
-                remove_results.execute([hash.as_slice()])?;
+            receipts.push((path, receipt));
+        }
+        let mut adopted = Vec::new();
+        for id in snapshots.keys() {
+            if !known.contains(id) {
+                recency.insert(*id, now);
+                adopted.push(*id);
             }
         }
-        tx.execute(
-            "DELETE FROM snapshot_usage WHERE last_used < ?1",
-            [now.saturating_sub(RETENTION)],
-        )?;
-        tx.execute(
-            "DELETE FROM snapshot WHERE NOT EXISTS (
-                 SELECT 1 FROM snapshot_usage WHERE snapshot_id = snapshot.id
-             )",
-            [],
-        )?;
-        prune_results(&tx)?;
-
-        if let Some(max_size) = max_size {
-            evict_to_size(&tx, max_size)?;
-            prune_results(&tx)?;
-        }
-
-        let retained = {
-            let mut statement = tx.prepare("SELECT hash FROM blob")?;
-            let rows = statement.query_map([], |row| read_digest(row, 0))?;
-            rows.collect::<rusqlite::Result<HashSet<_>>>()?
-        };
-        // Remove names, never the build-dir links. If removal fails, rolling back
-        // the index is conservative; a subsequent clean repairs missing files.
-        for (hash, (path, _)) in files {
-            if !retained.contains(&hash) {
-                clean_ctx.rm_rf(&path)?;
+        if !adopted.is_empty() {
+            let index =
+                if let Some(index) = receipts.iter().position(|(path, _)| *path == imports_path) {
+                    index
+                } else {
+                    receipts.push((imports_path, Receipt::default()));
+                    receipts.len() - 1
+                };
+            for id in &adopted {
+                receipts[index].1.usage.insert(*id, now);
             }
         }
-        for path in legacy_timestamps {
-            clean_ctx.rm_rf(&path)?;
+
+        // Count each blob once across all retaining units. Eviction traverses
+        // each disappearing unit once, not the entire graph for every victim.
+        let mut unit_refs = HashMap::<Digest, usize>::default();
+        let mut blob_refs = HashMap::<Digest, usize>::default();
+        let mut size = 0_u128;
+        for id in recency.keys() {
+            for unit in &snapshots[id] {
+                let references = unit_refs.entry(*unit).or_default();
+                *references += 1;
+                if *references == 1 {
+                    for blob in &units[unit] {
+                        let references = blob_refs.entry(*blob).or_default();
+                        *references += 1;
+                        if *references == 1 {
+                            size += u128::from(blobs[blob].1);
+                        }
+                    }
+                }
+            }
         }
-        if clean_ctx.dry_run {
-            tx.rollback()?;
-        } else {
-            tx.commit()?;
+        if let Some(limit) = max_size {
+            let mut oldest: Vec<_> = recency.iter().map(|(id, time)| (*time, *id)).collect();
+            oldest.sort_unstable();
+            for (_, id) in oldest {
+                if size <= u128::from(limit) {
+                    break;
+                }
+                recency.remove(&id);
+                for unit in &snapshots[&id] {
+                    let references = unit_refs.get_mut(unit).unwrap();
+                    *references -= 1;
+                    if *references == 0 {
+                        for blob in &units[unit] {
+                            let references = blob_refs.get_mut(blob).unwrap();
+                            *references -= 1;
+                            if *references == 0 {
+                                size -= u128::from(blobs[blob].1);
+                            }
+                        }
+                    }
+                }
+            }
         }
-        Ok(())
+
+        let mut plan = Collection::default();
+        for (path, mut receipt) in receipts {
+            let previous_units = receipt.units.len();
+            let previous_usage = receipt.usage.len();
+            receipt
+                .units
+                .retain(|_, unit| unit_refs.get(&unit.result).is_some_and(|count| *count > 0));
+            receipt
+                .usage
+                .retain(|id, time| *time >= cutoff && recency.contains_key(id));
+            if receipt.units.is_empty() && receipt.usage.is_empty() {
+                if path.try_exists()? {
+                    plan.forgotten.push(path);
+                }
+                continue;
+            }
+            // Newly adopted leases were inserted before counting usage.
+            let imports_changed = path.file_name().is_some_and(|name| name == "imports")
+                && adopted.iter().any(|id| receipt.usage.contains_key(id));
+            if previous_units != receipt.units.len()
+                || previous_usage != receipt.usage.len()
+                || imports_changed
+            {
+                plan.receipts.push((path, receipt.encode()));
+            }
+        }
+        for (id, path) in snapshot_files {
+            if !recency.contains_key(&id) {
+                plan.removals.push(path);
+            }
+        }
+        for (id, path) in unit_files {
+            if !unit_refs.get(&id).is_some_and(|count| *count > 0) {
+                plan.removals.push(path);
+            }
+        }
+        for (id, (path, _)) in blobs {
+            if !blob_refs.get(&id).is_some_and(|count| *count > 0) {
+                plan.removals.push(path);
+            }
+        }
+        plan.removals.extend(legacy);
+        Ok(plan)
     }
 }
 
-fn snapshot_id(results: &mut Vec<Digest>) -> Digest {
-    results.sort_unstable();
-    results.dedup();
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(b"cargo-shared-blob-snapshot-v1\0");
-    hasher.update(&(results.len() as u64).to_le_bytes());
-    for result in results.iter() {
-        hasher.update(result);
-    }
-    *hasher.finalize().as_bytes()
+#[derive(Default)]
+struct Collection {
+    receipts: Vec<(PathBuf, Vec<u8>)>,
+    forgotten: Vec<PathBuf>,
+    removals: Vec<PathBuf>,
 }
 
-fn prune_results(tx: &Transaction<'_>) -> CargoResult<()> {
-    tx.execute(
-        "DELETE FROM unit_result WHERE NOT EXISTS (
-             SELECT 1 FROM snapshot_member WHERE result_id = unit_result.id
-         )",
-        [],
-    )?;
-    tx.execute(
-        "DELETE FROM blob WHERE NOT EXISTS (
-             SELECT 1 FROM unit_output WHERE blob_hash = blob.hash
-         )",
-        [],
-    )?;
+fn hex(id: &Digest) -> String {
+    blake3::Hash::from_bytes(*id).to_hex().to_string()
+}
+
+fn entries(path: &Path) -> CargoResult<Vec<fs::DirEntry>> {
+    match fs::read_dir(path) {
+        Ok(entries) => Ok(entries.collect::<Result<_, _>>()?),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(Vec::new()),
+        Err(error) => Err(error).with_context(|| format!("failed to inventory {}", path.display())),
+    }
+}
+
+fn object_files(path: &Path) -> CargoResult<HashMap<Digest, PathBuf>> {
+    let mut files = HashMap::default();
+    for entry in entries(path)? {
+        let name = entry.file_name();
+        let Some(id) = name.to_str().and_then(digest_filename) else {
+            continue;
+        };
+        ensure!(
+            entry.file_type()?.is_file(),
+            "shared blob object is not a regular file: {}",
+            entry.path().display()
+        );
+        files.insert(id, entry.path());
+    }
+    Ok(files)
+}
+
+fn check_directory(path: &Path) -> CargoResult<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => ensure!(
+            metadata.is_dir(),
+            "shared blob metadata directory is not a directory: {}",
+            path.display()
+        ),
+        Err(error) if error.kind() == ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
     Ok(())
 }
 
-fn evict_to_size(tx: &Transaction<'_>, max_size: u64) -> CargoResult<()> {
-    let mut size: u64 = tx.query_row("SELECT COALESCE(SUM(size), 0) FROM blob", [], |row| {
-        row.get(0)
-    })?;
-    if size <= max_size {
+fn read_regular(path: &Path) -> CargoResult<Option<Vec<u8>>> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => ensure!(
+            metadata.is_file(),
+            "shared blob metadata is not a regular file: {}",
+            path.display()
+        ),
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    }
+    Ok(Some(fs::read(path).with_context(|| {
+        format!("failed to read {}", path.display())
+    })?))
+}
+
+fn read_receipt(path: &Path) -> CargoResult<Receipt> {
+    match read_regular(path)? {
+        Some(bytes) => Receipt::decode(&bytes)
+            .with_context(|| format!("invalid shared blob receipt {}", path.display())),
+        None => Ok(Receipt::default()),
+    }
+}
+
+fn publish_object(path: &Path, bytes: &[u8]) -> CargoResult<()> {
+    if read_regular(path)?.is_some_and(|existing| existing == bytes) {
         return Ok(());
     }
-    let oldest = {
-        let mut statement = tx.prepare(
-            "SELECT snapshot.id FROM snapshot
-             JOIN snapshot_usage ON snapshot_usage.snapshot_id = snapshot.id
-             GROUP BY snapshot.id ORDER BY MAX(last_used), snapshot.id",
-        )?;
-        statement
-            .query_map([], |row| read_digest(row, 0))?
-            .collect::<rusqlite::Result<Vec<_>>>()?
-    };
-    let mut exclusive_size = tx.prepare_cached(
-        "SELECT COALESCE(SUM(size), 0) FROM blob WHERE hash IN (
-             SELECT blob_hash FROM unit_output
-             JOIN snapshot_member ON snapshot_member.result_id = unit_output.result_id
-             WHERE snapshot_id = ?1
-         ) AND NOT EXISTS (
-             SELECT 1 FROM unit_output
-             JOIN snapshot_member ON snapshot_member.result_id = unit_output.result_id
-             WHERE blob_hash = blob.hash AND snapshot_id != ?1
-         )",
-    )?;
-    let mut remove = tx.prepare_cached("DELETE FROM snapshot WHERE id = ?1")?;
-    for id in oldest {
-        let reclaimed: u64 = exclusive_size.query_row([id.as_slice()], |row| row.get(0))?;
-        remove.execute([id.as_slice()])?;
-        size = size.saturating_sub(reclaimed);
-        if size <= max_size {
-            break;
-        }
+    // Replace damaged content rather than letting an existing filename stand
+    // in for a successfully published object.
+    atomic_replace(path, bytes)
+}
+
+fn atomic_replace(path: &Path, bytes: &[u8]) -> CargoResult<()> {
+    let parent = path.parent().expect("metadata file has a parent");
+    check_directory(parent)?;
+    // The store root is checked by the public entrypoint before this helper.
+    fs::create_dir_all(parent)?;
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => ensure!(
+            metadata.is_file(),
+            "refusing to replace non-regular shared blob metadata: {}",
+            path.display()
+        ),
+        Err(error) if error.kind() == ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
     }
+    let mut staged = tempfile::NamedTempFile::new_in(parent)?;
+    staged.write_all(bytes)?;
+    staged
+        .persist(path)
+        .with_context(|| format!("failed to publish {}", path.display()))?;
     Ok(())
-}
-
-fn read_digest(row: &Row<'_>, column: usize) -> rusqlite::Result<Digest> {
-    let value = row.get_ref(column)?;
-    match value {
-        rusqlite::types::ValueRef::Blob(bytes) => bytes.try_into().map_err(|err| {
-            rusqlite::Error::FromSqlConversionFailure(
-                column,
-                rusqlite::types::Type::Blob,
-                Box::new(err),
-            )
-        }),
-        _ => Err(rusqlite::Error::InvalidColumnType(
-            column,
-            column.to_string(),
-            value.data_type(),
-        )),
-    }
-}
-
-fn digest_filename(name: &str) -> Option<Digest> {
-    let bytes = name.as_bytes();
-    if bytes.len() != 64 {
-        return None;
-    }
-    fn nibble(byte: u8) -> Option<u8> {
-        match byte {
-            b'0'..=b'9' => Some(byte - b'0'),
-            b'a'..=b'f' => Some(byte - b'a' + 10),
-            _ => None,
-        }
-    }
-    let mut digest = [0; 32];
-    for (dest, pair) in digest.iter_mut().zip(bytes.chunks_exact(2)) {
-        *dest = nibble(pair[0])? << 4 | nibble(pair[1])?;
-    }
-    Some(digest)
-}
-
-/// Append migrations; their positions are the persistent schema version.
-fn migrations() -> Vec<Migration> {
-    vec![
-        basic_migration(
-            "CREATE TABLE blob (
-                 hash BLOB PRIMARY KEY NOT NULL CHECK(length(hash) = 32),
-                 size INTEGER NOT NULL CHECK(size >= 0)
-             ) WITHOUT ROWID",
-        ),
-        basic_migration(
-            "CREATE TABLE unit_result (
-                 id BLOB PRIMARY KEY NOT NULL CHECK(length(id) = 32)
-             ) WITHOUT ROWID",
-        ),
-        basic_migration(
-            "CREATE TABLE unit_output (
-                 result_id BLOB NOT NULL REFERENCES unit_result(id) ON DELETE CASCADE,
-                 path BLOB NOT NULL,
-                 blob_hash BLOB NOT NULL REFERENCES blob(hash),
-                 size INTEGER NOT NULL CHECK(size >= 0),
-                 PRIMARY KEY (result_id, path)
-             ) WITHOUT ROWID",
-        ),
-        basic_migration(
-            "CREATE TABLE build_unit (
-                 build_dir BLOB NOT NULL,
-                 unit_path BLOB NOT NULL,
-                 result_id BLOB NOT NULL REFERENCES unit_result(id) ON DELETE CASCADE,
-                 generation BLOB NOT NULL CHECK(length(generation) = 32),
-                 PRIMARY KEY (build_dir, unit_path)
-             ) WITHOUT ROWID",
-        ),
-        basic_migration(
-            "CREATE TABLE snapshot (
-                 id BLOB PRIMARY KEY NOT NULL CHECK(length(id) = 32)
-             ) WITHOUT ROWID",
-        ),
-        basic_migration(
-            "CREATE TABLE snapshot_member (
-                 snapshot_id BLOB NOT NULL REFERENCES snapshot(id) ON DELETE CASCADE,
-                 result_id BLOB NOT NULL REFERENCES unit_result(id) ON DELETE CASCADE,
-                 PRIMARY KEY (snapshot_id, result_id)
-             ) WITHOUT ROWID",
-        ),
-        basic_migration(
-            "CREATE TABLE snapshot_usage (
-                 build_dir BLOB NOT NULL,
-                 snapshot_id BLOB NOT NULL REFERENCES snapshot(id) ON DELETE CASCADE,
-                 last_used INTEGER NOT NULL CHECK(last_used >= 0),
-                 PRIMARY KEY (build_dir, snapshot_id)
-             ) WITHOUT ROWID",
-        ),
-        basic_migration("CREATE INDEX unit_output_blob ON unit_output(blob_hash)"),
-        basic_migration("CREATE INDEX build_unit_result ON build_unit(result_id)"),
-        basic_migration("CREATE INDEX snapshot_member_result ON snapshot_member(result_id)"),
-        basic_migration("CREATE INDEX snapshot_usage_snapshot ON snapshot_usage(snapshot_id)"),
-    ]
 }
 
 #[cfg(test)]
 mod tests {
+    use super::super::format::{Output, encode_output_path};
     use super::*;
 
-    fn output(path: &[u8], byte: u8) -> Output {
-        Output {
-            path: path.to_vec(),
-            hash: [byte; 32],
-            size: 1,
-        }
+    fn result(root: &Path, contents: &[u8]) -> UnitResult {
+        let hash = *blake3::hash(contents).as_bytes();
+        fs::write(root.join(hex(&hash)), contents).unwrap();
+        UnitResult::new(vec![Output {
+            path: encode_output_path(Path::new("artifact")).unwrap(),
+            hash,
+            size: contents.len() as u64,
+        }])
+    }
+
+    fn save(store: &SnapshotStore<'_>, build_dir: &[u8], result: UnitResult, now: u64) -> Digest {
+        let id = result.id;
+        store
+            .save(
+                build_dir,
+                &HashSet::default(),
+                &[(b"unit".to_vec(), result)].into_iter().collect(),
+                Some(vec![id]),
+                now,
+            )
+            .unwrap();
+        id
     }
 
     #[test]
-    fn inventory_identity_uses_paths_and_contents_not_order() {
-        let first = UnitResult::new(vec![output(b"a", 1), output(b"\xff", 2)]);
-        let reordered = UnitResult::new(vec![output(b"\xff", 2), output(b"a", 1)]);
-        assert_eq!(first.id, reordered.id);
-        assert_ne!(
-            first.id,
-            UnitResult::new(vec![output(b"b", 1), output(b"\xff", 2)]).id
-        );
-        assert_ne!(
-            first.id,
-            UnitResult::new(vec![output(b"a", 3), output(b"\xff", 2)]).id
-        );
-    }
-
-    #[test]
-    fn graph_identity_is_a_set_of_results() {
+    fn fresh_snapshot_throttles_receipt_replacement() {
+        let root = tempfile::tempdir().unwrap();
+        let store = SnapshotStore::new(root.path());
+        let id = save(&store, b"build", result(root.path(), b"live"), 1);
+        let path = store.receipt_path(b"build");
+        let before = fs::read(&path).unwrap();
+        let metadata = fs::metadata(&path).unwrap();
+        store
+            .save(
+                b"build",
+                &HashSet::default(),
+                &HashMap::default(),
+                Some(vec![id]),
+                USAGE_UPDATE_INTERVAL,
+            )
+            .unwrap();
+        assert_eq!(fs::read(&path).unwrap(), before);
         assert_eq!(
-            snapshot_id(&mut vec![[1; 32], [2; 32]]),
-            snapshot_id(&mut vec![[2; 32], [1; 32], [1; 32]])
+            fs::metadata(&path).unwrap().modified().unwrap(),
+            metadata.modified().unwrap()
         );
-        assert_ne!(
-            snapshot_id(&mut vec![[1; 32]]),
-            snapshot_id(&mut vec![[2; 32]])
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            assert_eq!(fs::metadata(&path).unwrap().ino(), metadata.ino());
+        }
+        store
+            .save(
+                b"build",
+                &HashSet::default(),
+                &HashMap::default(),
+                Some(vec![id]),
+                USAGE_UPDATE_INTERVAL + 1,
+            )
+            .unwrap();
+        let receipt = read_receipt(&path).unwrap();
+        assert_eq!(
+            receipt.usage[&snapshot_id(&mut vec![id])],
+            USAGE_UPDATE_INTERVAL + 1
         );
-        assert_ne!(UnitResult::new(Vec::new()).id, snapshot_id(&mut Vec::new()));
+    }
+
+    #[test]
+    fn failed_build_slots_do_not_retain_orphan_objects() {
+        let root = tempfile::tempdir().unwrap();
+        let store = SnapshotStore::new(root.path());
+        let result = result(root.path(), b"failed build output");
+        store
+            .save(
+                b"build",
+                &HashSet::default(),
+                &[(b"unit".to_vec(), result)].into_iter().collect(),
+                None,
+                1,
+            )
+            .unwrap();
+        let plan = store.plan_collection(None, 1).unwrap();
+        assert_eq!(plan.forgotten, vec![store.receipt_path(b"build")]);
+        assert_eq!(plan.removals.len(), 2);
+        assert_eq!(store.load_units(b"build").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn corrupt_receipt_stops_collection_before_mutation() {
+        let root = tempfile::tempdir().unwrap();
+        let store = SnapshotStore::new(root.path());
+        save(&store, b"build", result(root.path(), b"live"), 1);
+        let receipt = store.receipt_path(b"build");
+        fs::write(&receipt, b"truncated").unwrap();
+        assert!(store.plan_collection(Some(0), RETENTION + 2).is_err());
+        assert_eq!(fs::read(&receipt).unwrap(), b"truncated");
+        assert_eq!(object_files(&root.path().join(SNAPSHOTS)).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn existing_corrupt_objects_are_repaired_before_receipt_publication() {
+        let root = tempfile::tempdir().unwrap();
+        let store = SnapshotStore::new(root.path());
+        let result = result(root.path(), b"live");
+        let id = result.id;
+        let snapshot = snapshot_id(&mut vec![id]);
+        fs::create_dir(root.path().join(UNITS)).unwrap();
+        fs::create_dir(root.path().join(SNAPSHOTS)).unwrap();
+        fs::write(root.path().join(UNITS).join(hex(&id)), b"broken").unwrap();
+        fs::write(root.path().join(SNAPSHOTS).join(hex(&snapshot)), b"broken").unwrap();
+        save(&store, b"build", result, 1);
+        let bytes = fs::read(root.path().join(UNITS).join(hex(&id))).unwrap();
+        assert!(decode_unit(&bytes, &id).is_ok());
+        assert!(store.plan_collection(None, 1).unwrap().removals.is_empty());
+    }
+
+    #[test]
+    fn expired_import_lease_is_not_renewed() {
+        let root = tempfile::tempdir().unwrap();
+        let store = SnapshotStore::new(root.path());
+        save(&store, b"build", result(root.path(), b"imported"), 1);
+        fs::remove_dir_all(root.path().join(LOCAL)).unwrap();
+        let plan = store.plan_collection(None, 2).unwrap();
+        assert!(plan.removals.is_empty());
+        assert!(!root.path().join(LOCAL).exists());
+        for (path, bytes) in plan.receipts {
+            atomic_replace(&path, &bytes).unwrap();
+        }
+        let expired = store.plan_collection(None, RETENTION + 3).unwrap();
+        assert_eq!(expired.removals.len(), 3);
+        assert_eq!(
+            expired.forgotten,
+            vec![root.path().join(LOCAL).join("imports")]
+        );
+    }
+
+    #[test]
+    fn pressure_preserves_shared_blobs_until_last_retaining_unit() {
+        let root = tempfile::tempdir().unwrap();
+        let store = SnapshotStore::new(root.path());
+        let shared = result(root.path(), b"shared");
+        let first_id = shared.id;
+        save(&store, b"first", shared, 1);
+        let second_id = save(&store, b"second", result(root.path(), b"other"), 2);
+        store
+            .save(
+                b"second",
+                &HashSet::default(),
+                &HashMap::default(),
+                Some(vec![first_id, second_id]),
+                3,
+            )
+            .unwrap();
+        let plan = store.plan_collection(Some(6), 3).unwrap();
+        // The newest graph owns both outputs; no partial graph fits in six
+        // bytes, even after dropping both older snapshots.
+        assert!(
+            plan.removals
+                .contains(&root.path().join(hex(blake3::hash(b"shared").as_bytes())))
+        );
+        assert!(
+            plan.removals
+                .contains(&root.path().join(hex(blake3::hash(b"other").as_bytes())))
+        );
+        assert!(plan.forgotten.contains(&store.receipt_path(b"first")));
+        assert!(plan.forgotten.contains(&store.receipt_path(b"second")));
+    }
+
+    #[test]
+    fn pressure_keeps_shared_bytes_in_the_newer_snapshot() {
+        let root = tempfile::tempdir().unwrap();
+        let store = SnapshotStore::new(root.path());
+        let shared = result(root.path(), b"shared");
+        let old = result(root.path(), b"old");
+        let shared_id = shared.id;
+        let old_id = old.id;
+        let first = [(b"shared".to_vec(), shared), (b"old".to_vec(), old)]
+            .into_iter()
+            .collect();
+        store
+            .save(
+                b"first",
+                &HashSet::default(),
+                &first,
+                Some(vec![shared_id, old_id]),
+                1,
+            )
+            .unwrap();
+        let new = result(root.path(), b"new");
+        let new_id = new.id;
+        let second = [(b"new".to_vec(), new)].into_iter().collect();
+        store
+            .save(
+                b"second",
+                &HashSet::default(),
+                &second,
+                Some(vec![shared_id, new_id]),
+                2,
+            )
+            .unwrap();
+
+        let plan = store.plan_collection(Some(9), 2).unwrap();
+        assert!(
+            plan.removals
+                .contains(&root.path().join(hex(blake3::hash(b"old").as_bytes())))
+        );
+        assert!(
+            !plan
+                .removals
+                .contains(&root.path().join(hex(blake3::hash(b"shared").as_bytes())))
+        );
+        assert!(
+            !plan
+                .removals
+                .contains(&root.path().join(hex(blake3::hash(b"new").as_bytes())))
+        );
+        let kept = snapshot_id(&mut vec![shared_id, new_id]);
+        assert!(
+            !plan
+                .removals
+                .contains(&root.path().join(SNAPSHOTS).join(hex(&kept)))
+        );
+    }
+
+    #[test]
+    fn one_snapshot_is_pinned_by_both_build_directory_receipts() {
+        let root = tempfile::tempdir().unwrap();
+        let store = SnapshotStore::new(root.path());
+        let id = save(&store, b"first", result(root.path(), b"shared"), 1);
+        save(&store, b"second", result(root.path(), b"shared"), RETENTION);
+        let manifest = root
+            .path()
+            .join(SNAPSHOTS)
+            .join(hex(&snapshot_id(&mut vec![id])));
+        let first_expired = store.plan_collection(None, RETENTION + 100).unwrap();
+        assert!(first_expired.removals.is_empty());
+        assert_eq!(first_expired.receipts.len(), 1);
+        assert_eq!(first_expired.receipts[0].0, store.receipt_path(b"first"));
+        let receipt = Receipt::decode(&first_expired.receipts[0].1).unwrap();
+        assert!(receipt.usage.is_empty());
+        assert_eq!(receipt.units[b"unit".as_slice()].result, id);
+        for (path, bytes) in first_expired.receipts {
+            atomic_replace(&path, &bytes).unwrap();
+        }
+        let both_expired = store.plan_collection(None, RETENTION * 2 + 1).unwrap();
+        assert!(both_expired.removals.contains(&manifest));
+        assert!(
+            both_expired
+                .removals
+                .contains(&root.path().join(hex(blake3::hash(b"shared").as_bytes())))
+        );
+        assert!(
+            both_expired
+                .forgotten
+                .contains(&store.receipt_path(b"first"))
+        );
+        assert!(
+            both_expired
+                .forgotten
+                .contains(&store.receipt_path(b"second"))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn publication_failure_preserves_previous_receipt() {
+        use std::os::unix::fs::symlink;
+        let root = tempfile::tempdir().unwrap();
+        let store = SnapshotStore::new(root.path());
+        let first = save(&store, b"build", result(root.path(), b"old"), 1);
+        let before = fs::read(store.receipt_path(b"build")).unwrap();
+        let next = result(root.path(), b"new");
+        let next_result = next.id;
+        let id = snapshot_id(&mut vec![next_result]);
+        symlink(
+            root.path()
+                .join(SNAPSHOTS)
+                .join(hex(&snapshot_id(&mut vec![first]))),
+            root.path().join(SNAPSHOTS).join(hex(&id)),
+        )
+        .unwrap();
+        assert!(
+            store
+                .save(
+                    b"build",
+                    &HashSet::default(),
+                    &[(b"unit".to_vec(), next)].into_iter().collect(),
+                    Some(vec![next_result]),
+                    2
+                )
+                .is_err()
+        );
+        assert_eq!(fs::read(store.receipt_path(b"build")).unwrap(), before);
     }
 }

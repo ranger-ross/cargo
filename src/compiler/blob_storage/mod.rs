@@ -1,86 +1,179 @@
+mod snapshots;
+
 use std::fs::File;
-use std::io::{ErrorKind, Read as _, Write as _};
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::bail;
 use cargo_util::paths::create_dir_all;
 use filetime::FileTime;
-use tracing::{debug, instrument};
+use parking_lot::Mutex;
+use tracing::instrument;
 
-use crate::CargoResult;
-use crate::util::flock::{lock_exclusive, lock_shared};
-
-const USAGE_UPDATE_INTERVAL: Duration = Duration::from_secs(4 * 60 * 60);
+use crate::compiler::fingerprint::Fingerprint;
+use crate::ops::CleanContext;
+use crate::util::cache_lock::CacheLockMode;
+use crate::util::data_structures::{HashMap, HashSet};
+use crate::{CargoResult, GlobalContext};
+use snapshots::{Digest, Output, SnapshotIndex, StoredUnit, UnitResult};
 
 pub struct BlobStorage {
     root: PathBuf,
+    build_dir: PathBuf,
+    build_dir_id: Vec<u8>,
+    tracking: Mutex<Tracking>,
+}
+
+#[derive(Default)]
+struct Tracking {
+    known: HashMap<Vec<u8>, StoredUnit>,
+    used: HashSet<Vec<u8>>,
+    invalidated: HashSet<Vec<u8>>,
+    updates: HashMap<Vec<u8>, UnitResult>,
 }
 
 impl BlobStorage {
-    pub fn new(root: PathBuf, build_dir: &Path) -> CargoResult<Self> {
+    pub fn new(root: PathBuf, build_dir: &Path, gctx: &GlobalContext) -> CargoResult<Self> {
         create_dir_all(&root)?;
 
         if !is_same_filesystem(&root, build_dir).unwrap_or(false) {
             bail!("blob storage and build-dir are on different file systems")
         }
 
-        Ok(Self { root })
+        let build_dir_id = std::fs::canonicalize(build_dir)?
+            .as_os_str()
+            .as_encoded_bytes()
+            .to_vec();
+        let _lock = gctx.acquire_package_cache_lock(CacheLockMode::DownloadExclusive)?;
+        let known = SnapshotIndex::open(&root)?.load_units(&build_dir_id)?;
+        Ok(Self {
+            root,
+            build_dir: build_dir.to_path_buf(),
+            build_dir_id,
+            tracking: Mutex::new(Tracking {
+                known,
+                ..Tracking::default()
+            }),
+        })
     }
 
-    /// Inserts or deduplicates a file already in blob storage.
+    /// Records membership without opening the unit's output files.
     ///
-    /// This function will prefer reflink if available on the current filesystem but fallback to
-    /// hardlinking.
-    pub fn insert_or_dedup(
-        &self,
-        artifact_path: &Path,
-        timestamp_path: &Path,
-    ) -> CargoResult<String> {
-        let hash = Self::hash(artifact_path)?;
-        let storage_path = self.root.join(&hash);
-
-        if !self.insert(artifact_path, timestamp_path, &storage_path)? {
-            self.dedup(artifact_path, timestamp_path, &storage_path)?;
+    /// Returns whether the completed output set needs to be captured.
+    pub fn prepare_unit(&self, unit_dir: &Path, generation: Option<Digest>) -> CargoResult<bool> {
+        let key = unit_dir
+            .strip_prefix(&self.build_dir)?
+            .as_os_str()
+            .as_encoded_bytes();
+        let mut tracking = self.tracking.lock();
+        let capture = !tracking
+            .known
+            .get(key)
+            .is_some_and(|unit| Some(unit.generation) == generation);
+        if capture {
+            tracking.known.remove(key);
+            tracking.invalidated.insert(key.to_vec());
         }
-
-        Ok(hash)
+        tracking.used.insert(key.to_vec());
+        Ok(capture)
     }
 
+    /// Captures a newly completed unit or adopts previously untracked outputs.
     #[instrument(skip_all)]
-    pub fn mark_timestamps_used(timestamps_dir: &Path, now: SystemTime) -> CargoResult<()> {
-        let now_secs = unix_timestamp(now);
-        for entry in std::fs::read_dir(timestamps_dir)? {
-            let Ok(entry) = entry else {
+    pub fn capture_unit(
+        &self,
+        unit_dir: &Path,
+        out_dir: &Path,
+        fingerprint: &Fingerprint,
+    ) -> CargoResult<()> {
+        let mut outputs = Vec::new();
+        for entry in walkdir::WalkDir::new(out_dir) {
+            let entry = entry?;
+            if !entry.file_type().is_file() {
                 continue;
-            };
-            let update = || -> CargoResult<()> {
-                let file_type = entry.file_type()?;
-                if file_type.is_dir() {
-                    return Self::mark_timestamps_used(&entry.path(), now);
-                }
-                if !file_type.is_file() {
-                    return Ok(());
-                }
-                let path = entry.path();
-                if is_timestamp_stale(&path, now_secs) {
-                    write_used_timestamp(&path, now_secs)?;
-                }
-                Ok(())
-            };
-            if let Err(err) = update() {
-                debug!(path = ?entry.path(), ?err, "failed to update blob usage");
             }
+            let path = entry.path();
+            let size = entry.metadata()?.len();
+            let hash = Self::hash(path)?;
+            let storage_path = self
+                .root
+                .join(blake3::Hash::from_bytes(hash).to_hex().as_str());
+            if !self.insert(path, &storage_path)? {
+                self.dedup(path, &storage_path)?;
+            }
+            outputs.push(Output {
+                path: path
+                    .strip_prefix(unit_dir)?
+                    .as_os_str()
+                    .as_encoded_bytes()
+                    .to_vec(),
+                hash,
+                size,
+            });
         }
+        let mut result = UnitResult::new(outputs);
+        result.generation = fingerprint.capture_blob_generation()?;
+        let key = unit_dir
+            .strip_prefix(&self.build_dir)?
+            .as_os_str()
+            .as_encoded_bytes()
+            .to_vec();
+        let mut tracking = self.tracking.lock();
+        tracking.known.insert(
+            key.clone(),
+            StoredUnit {
+                result: result.id,
+                generation: result.generation,
+            },
+        );
+        tracking.updates.insert(key, result);
         Ok(())
     }
 
-    fn insert(
-        &self,
-        artifact_path: &Path,
-        timestamp_path: &Path,
-        storage_path: &Path,
-    ) -> CargoResult<bool> {
+    /// Saves completed units even when another unit failed.
+    ///
+    /// Only successful builds publish a graph snapshot.
+    pub fn finish(&self, gctx: &GlobalContext, successful: bool) -> CargoResult<()> {
+        let tracking = self.tracking.lock();
+        if tracking.used.is_empty() {
+            return Ok(());
+        }
+        let results = successful.then(|| {
+            tracking
+                .used
+                .iter()
+                .filter_map(|key| tracking.known.get(key).map(|unit| unit.result))
+                .collect::<Vec<_>>()
+        });
+        let _lock = gctx.acquire_package_cache_lock(CacheLockMode::DownloadExclusive)?;
+        SnapshotIndex::open(&self.root)?.save(
+            &self.build_dir_id,
+            &tracking.invalidated,
+            &tracking.updates,
+            results,
+            now(),
+        )
+    }
+
+    /// Collects expired snapshots under the package-cache mutation lock.
+    pub fn clean(
+        root: &Path,
+        clean_ctx: &mut CleanContext<'_>,
+        max_size: Option<u64>,
+    ) -> CargoResult<()> {
+        if !root.try_exists()? {
+            return Ok(());
+        }
+        SnapshotIndex::open_for_clean(root, clean_ctx.dry_run)?.clean(
+            root,
+            clean_ctx,
+            max_size,
+            now(),
+        )
+    }
+
+    fn insert(&self, artifact_path: &Path, storage_path: &Path) -> CargoResult<bool> {
         if storage_path.try_exists()? {
             return Ok(false);
         }
@@ -103,17 +196,13 @@ impl BlobStorage {
         ensure_no_writers(&staged)?;
 
         match std::fs::hard_link(&staged, storage_path) {
-            Ok(()) => {
-                Self::create_timestamp_file(timestamp_path, storage_path)?;
-
-                Ok(true)
-            }
+            Ok(()) => Ok(true),
             Err(err) if err.kind() == ErrorKind::AlreadyExists => Ok(false),
             Err(err) => Err(err.into()),
         }
     }
 
-    fn dedup(&self, path: &Path, timestamp_path: &Path, storage_path: &Path) -> CargoResult<()> {
+    fn dedup(&self, path: &Path, storage_path: &Path) -> CargoResult<()> {
         let metadata = path.metadata()?;
         let staging_dir = tempfile::Builder::new()
             .prefix(".blob")
@@ -135,58 +224,21 @@ impl BlobStorage {
         ensure_no_writers(&replacement)?;
         std::fs::rename(&replacement, path)?;
 
-        Self::create_timestamp_file(timestamp_path, storage_path)?;
-
-        Ok(())
-    }
-
-    fn create_timestamp_file(timestamp_path: &Path, storage_path: &Path) -> CargoResult<()> {
-        let timestamp = storage_path.with_added_extension("timestamp");
-        write_used_timestamp(&timestamp, now())?;
-        create_dir_all(timestamp_path.parent().unwrap())?;
-        std::fs::hard_link(&timestamp, &timestamp_path)?;
         Ok(())
     }
 
     #[instrument]
-    fn hash(path: &Path) -> CargoResult<String> {
+    fn hash(path: &Path) -> CargoResult<Digest> {
         let mut hasher = blake3::Hasher::new();
         let file = File::open(path)?;
         hasher.update_reader(file)?;
-        Ok(hasher.finalize().to_hex().to_string())
+        Ok(*hasher.finalize().as_bytes())
     }
-}
-
-fn is_timestamp_stale(path: &Path, now_secs: u64) -> bool {
-    match read_timestamp_file(path) {
-        Some(stored) => now_secs.saturating_sub(stored) >= USAGE_UPDATE_INTERVAL.as_secs(),
-        None => true,
-    }
-}
-
-pub fn read_timestamp_file(path: &Path) -> Option<u64> {
-    let mut contents = String::new();
-    let file = File::open(path).ok()?;
-    lock_shared(&file).ok()?;
-    file.take(32).read_to_string(&mut contents).ok()?;
-    contents.trim().parse().ok()
-}
-
-/// Writes unix seconds to a timestamp file, creating it if needed.
-/// This truncates and rewrites so the hardlink is preserved.
-fn write_used_timestamp(path: &Path, now_secs: u64) -> std::io::Result<()> {
-    let mut file = File::create(path)?;
-    lock_exclusive(&file)?;
-    write!(file, "{now_secs}")?;
-    Ok(())
 }
 
 fn now() -> u64 {
-    unix_timestamp(SystemTime::now())
-}
-
-fn unix_timestamp(time: SystemTime) -> u64 {
-    time.duration_since(UNIX_EPOCH)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or_default()
 }

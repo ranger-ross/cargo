@@ -185,9 +185,13 @@ impl<'a, 'gctx: 'a> CompilationFiles<'a, 'gctx> {
             .gctx
             .blob_storage_dir()
             .and_then(|shared| {
-                BlobStorage::new(shared, build_runner.bcx.ws.build_dir().as_path_unlocked())
-                    .inspect_err(|err| warn!(?err, "Could not initialize blob storage, disabling"))
-                    .ok()
+                BlobStorage::new(
+                    shared,
+                    build_runner.bcx.ws.build_dir().as_path_unlocked(),
+                    build_runner.bcx.gctx,
+                )
+                .inspect_err(|err| warn!(?err, "Could not initialize blob storage, disabling"))
+                .ok()
             })
             .map(Arc::new);
         Ok(CompilationFiles {
@@ -321,11 +325,6 @@ impl<'a, 'gctx: 'a> CompilationFiles<'a, 'gctx> {
     pub fn build_unit_dir(&self, unit: &Unit) -> PathBuf {
         let dir = self.pkg_dir(unit);
         self.layout(unit.kind).build_dir().build_unit(&dir)
-    }
-
-    /// Directory where the timestamps for the given unit should go.
-    pub fn timestamps_dir(&self, unit: &Unit) -> PathBuf {
-        self.build_unit_dir(unit).join(".timestamps")
     }
 
     /// Directory where the fingerprint for the given unit should go.

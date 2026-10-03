@@ -234,6 +234,7 @@ unicode-ident.workspace = true
 url.workspace = true
 walkdir.workspace = true
 winnow.workspace = true
+parking_lot = "0.12.5"
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true

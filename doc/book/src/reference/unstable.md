@@ -2093,6 +2093,30 @@ option:
 shared-blob-storage = true
 ```
 
+Cargo records completed unit outputs and build-graph snapshots in
+`$CARGO_HOME/blobs/index.sqlite`. Snapshots refer to content hashes rather than
+hardlinked timestamp files. Repeating the same graph reuses its snapshot.
+Different feature combinations can retain separate snapshots, with usage tracked
+independently for each build directory.
+
+Usage timestamps are stored in the database and updated at most once every four
+hours for each build-directory/snapshot pair. Fresh builds reuse a consolidated
+unit index instead of walking and hashing every output. Enabling this feature on
+an existing build directory captures its previously untracked outputs once.
+
+Automatic garbage collection expires snapshot usage after 30 days. Blobs shared
+by retained snapshots remain in the cache. To also enforce a logical blob-size
+limit, evicting the oldest snapshots first, run:
+
+```console
+cargo clean gc -Zgc -Zshared-blob-storage --max-blob-size 10GiB
+```
+
+`--dry-run` leaves both the index and blobs unchanged. Collection removes only
+cache entries, not files in build directories. Removing a shared blob may not
+free its data blocks while build-directory links still exist. Ordinary
+`cargo clean` removes build-directory outputs but does not clear the shared cache.
+
 ## builtin-dependencies
 * Tracking Issue: [rust-lang/cargo#16960](https://github.com/rust-lang/cargo/issues/16960)
 - RFC: [rust-lang/rfcs#3875](https://rust-lang.github.io/rfcs/3875-build-std-explicit-dependencies.html)

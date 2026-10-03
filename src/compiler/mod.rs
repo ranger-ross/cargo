@@ -29,6 +29,7 @@
 //! [`ops::cargo_compile::compile`]: crate::ops::compile
 
 pub mod artifact;
+pub mod blob_storage;
 mod build_config;
 pub(crate) mod build_context;
 pub(crate) mod build_runner;
@@ -257,6 +258,36 @@ fn compile<'gctx>(
                 // Need to link targets on both the dirty and fresh.
                 work.then(link_targets(build_runner, unit, true)?)
             });
+
+            if should_dedup_out_dir(build_runner, unit)
+                && let Some(blob_storage) = build_runner.files().blob_storage()
+            {
+                let unit_dir = build_runner.files().build_unit_dir(unit);
+                let fingerprint = &build_runner.fingerprints[unit];
+                let generation = if job.freshness().is_dirty() {
+                    None
+                } else {
+                    fingerprint.cached_blob_generation()
+                };
+                match blob_storage.prepare_unit(&unit_dir, generation) {
+                    Ok(true) => {
+                        let out_dir = build_runner.files().out_dir_new_layout(unit);
+                        let fingerprint = Arc::clone(fingerprint);
+                        job.after(Work::new(move |_state| {
+                            if let Err(err) =
+                                blob_storage.capture_unit(&unit_dir, &out_dir, &fingerprint)
+                            {
+                                debug!(?unit_dir, ?err, "failed to capture blob outputs");
+                            }
+                            Ok(())
+                        }));
+                    }
+                    Ok(false) => {}
+                    Err(err) => {
+                        debug!(?unit_dir, ?err, "failed to track blob outputs");
+                    }
+                }
+            }
 
             // If -Zfine-grain-locking is enabled, we wrap the job with an upgrade to exclusive
             // lock before starting, then downgrade to a shared lock after the job is finished.
@@ -677,6 +708,12 @@ fn downgrade_lock_to_shared(lock: LockKey) -> Work {
         state.downgrade_to_shared(&lock)?;
         Ok(())
     })
+}
+
+fn should_dedup_out_dir(build_runner: &BuildRunner<'_, '_>, unit: &Unit) -> bool {
+    build_runner.bcx.gctx.cli_unstable().build_dir_new_layout
+        && build_runner.bcx.gctx.cli_unstable().shared_blob_storage
+        && !unit.is_local()
 }
 
 /// Link the compiled target (often of form `foo-{metadata_hash}`) to the

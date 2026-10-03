@@ -205,7 +205,13 @@ impl<'a, 'gctx> BuildRunner<'a, 'gctx> {
         }
 
         // Now that we've figured out everything that we're going to do, do it!
-        queue.execute(&mut self)?;
+        let result = queue.execute(&mut self);
+        if let Some(blob_storage) = self.files().blob_storage()
+            && let Err(err) = blob_storage.finish(self.bcx.gctx, result.is_ok())
+        {
+            tracing::warn!(?err, "failed to save blob snapshot");
+        }
+        result?;
 
         // Add `OUT_DIR` to env vars if unit has a build script.
         let units_with_build_script = &self
@@ -455,7 +461,7 @@ impl<'a, 'gctx> BuildRunner<'a, 'gctx> {
 
         self.record_units_requiring_metadata();
 
-        let files = CompilationFiles::new(self, host_layout, targets);
+        let files = CompilationFiles::new(self, host_layout, targets)?;
         self.files = Some(files);
         Ok(())
     }

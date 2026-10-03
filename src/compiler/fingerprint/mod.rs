@@ -1067,6 +1067,35 @@ impl Fingerprint {
         *self.memoized_hash.lock().unwrap() = None;
     }
 
+    /// Identifies the output generation without another filesystem lookup.
+    ///
+    /// This only invalidates blob bookkeeping. It is not a content hash.
+    pub(super) fn cached_blob_generation(&self) -> Option<[u8; 32]> {
+        let FsStatus::UpToDate { mtimes } = &self.fs_status else {
+            return None;
+        };
+        let mut hasher = blake3::Hasher::new_derive_key("cargo blob output generation v1");
+        hasher.update(&self.hash_u64().to_le_bytes());
+        for output in &self.outputs {
+            let mtime = mtimes[output];
+            hasher.update(&mtime.unix_seconds().to_le_bytes());
+            hasher.update(&mtime.nanoseconds().to_le_bytes());
+        }
+        Some(*hasher.finalize().as_bytes())
+    }
+
+    /// Reads the generation after output publication has finished.
+    pub(super) fn capture_blob_generation(&self) -> CargoResult<[u8; 32]> {
+        let mut hasher = blake3::Hasher::new_derive_key("cargo blob output generation v1");
+        hasher.update(&self.hash_u64().to_le_bytes());
+        for output in &self.outputs {
+            let mtime = paths::mtime(output)?;
+            hasher.update(&mtime.unix_seconds().to_le_bytes());
+            hasher.update(&mtime.nanoseconds().to_le_bytes());
+        }
+        Ok(*hasher.finalize().as_bytes())
+    }
+
     fn hash_u64(&self) -> u64 {
         if let Some(s) = *self.memoized_hash.lock().unwrap() {
             return s;

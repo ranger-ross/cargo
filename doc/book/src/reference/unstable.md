@@ -101,6 +101,7 @@ Each new feature described below should explain how to use it.
     * [json-target-spec](#json-target-spec) --- Allows the use of `.json` custom target specs.
     * [hint-msrv](#hint-msrv) --- Allows Cargo to set `-Zhint-msrv`
     * [mem-stats](#mem-stats) --- Reports peak memory usage per build unit in `--timings`.
+    * [shared-blob-storage](#shared-blob-storage) --- Deduplicates build artifacts between workspaces
 * rustdoc
     * [rustdoc-map](#rustdoc-map) --- Provides mappings for documentation to link to external sites like [docs.rs](https://docs.rs/).
     * [scrape-examples](#scrape-examples) --- Shows examples within documentation.
@@ -2076,6 +2077,108 @@ option:
 [unstable]
 hint-msrv = true
 ```
+
+## shared-blob-storage
+* Tracking Issue: [rust-lang/cargo#17453](https://github.com/rust-lang/cargo/issues/17453)
+
+Enables Cargo to deduplicate output files across build units and workspaces using a
+shared content-addressable store at `$CARGO_HOME/blobs` (normally `~/.cargo/blobs`).
+Cargo prefers reflinks, uses hardlinks when artifact metadata is compatible, and
+otherwise copies. Copies also support build directories on another filesystem.
+Reusing a blob preserves the compiler output's permissions and modification time.
+
+You can set this via your global `~/.cargo/config.toml`, and nightly Cargo will
+automatically use it, while stable Cargo will silently ignore the unstable
+option:
+
+```toml
+[unstable]
+shared-blob-storage = true
+```
+
+Completed unit outputs and successful build graphs are recorded as immutable
+binary manifests. A unit inventory lists relative output paths, blob hashes, and
+sizes. A snapshot contains a sorted, deduplicated set of unit-result hashes.
+Repeating the same output graph reuses its snapshot. Different feature
+combinations can retain separate snapshots.
+
+The shared blob store does not use SQLite:
+
+```text
+$CARGO_HOME/blobs/
+  <blob hash>                         File contents
+  units-v1/<unit-result hash>          Immutable output inventory
+  snapshots-v1/<snapshot hash>         Immutable graph membership
+  local-v1/<build-directory hash>      Local lookup hints and usage
+  local-v1/imports                     Local leases for restored snapshots
+```
+
+Object names are lowercase hexadecimal BLAKE3 digests. Each manifest's name hashes
+its complete serialized contents. Unit manifests start with
+`cargo-shared-blob-unit-result-v2\0`, followed by a path-encoding byte and a count.
+Each entry contains a path length, path bytes, a 32-byte blob hash, and a size.
+Paths are sorted and unique, relative to the unit directory, and slash-separated.
+Encoding tags identify Unix bytes (`1`), Windows UTF-16 code units in little-endian
+order (`2`), or UTF-8 (`3`). Snapshot manifests start with
+`cargo-shared-blob-snapshot-v1\0`, followed by a count and sorted unique 32-byte
+unit-result hashes. Counts, lengths, and sizes are unsigned little-endian 64-bit
+integers. Manifests contain no usage timestamps or build-directory identifiers.
+
+Mutable usage and freshness hints live in one atomically replaced receipt per
+build directory. Usage is updated at most once every four hours for each
+build-directory/snapshot pair. Fresh builds read consolidated receipts instead of
+walking and hashing every output. Enabling the feature on an existing build
+directory captures its previously untracked outputs once.
+
+Publication writes unit manifests before the snapshot, then replaces the local
+receipt last. GC verifies manifest identities and checks that referenced blobs
+exist with the declared sizes. Blob contents are verified before replacing
+compiler outputs, and damaged cached contents are repaired from those outputs.
+Stored symlinks are repaired instead of reused.
+
+The earlier `blobs/index.sqlite` format is no longer read. The next enabled build
+re-inventories outputs while reusing existing blob contents. Collection removes
+obsolete database and timestamp files. Cargo's separate `.global-cache` database
+is unchanged.
+
+Automatic garbage collection expires snapshot usage after 30 days. Blobs shared
+by retained snapshots remain in the cache. To also enforce a logical blob-size
+limit, evicting the oldest snapshots first, run:
+
+```console
+cargo clean gc -Zgc -Zshared-blob-storage --max-blob-size 10GiB
+```
+
+`--dry-run` changes neither metadata nor blobs. Collection removes cache entries,
+leaving build-directory files intact. Removing a shared blob may not free its
+data blocks while build-directory links still exist. Ordinary `cargo clean`
+removes build-directory outputs but does not clear the shared cache.
+
+### Transporting the cache
+
+Blobs, unit manifests, and snapshot manifests can be copied as independent
+immutable objects or packed into an archive. Exclude `local-v1`: it contains
+machine-local lookup hints and usage, which can be recreated. Restore the complete
+snapshot closure before running Cargo. Each complete snapshot restored without a
+usage receipt receives a single 30-day import lease when GC first discovers it.
+Subsequent collection does not renew that lease. Incomplete or corrupt graphs
+cannot keep otherwise unreferenced blobs alive.
+
+For [S3 object storage](https://docs.aws.amazon.com/AmazonS3/latest/userguide/conditional-writes.html),
+publish blobs and unit manifests first, then the snapshot manifest. Conditional
+`If-None-Match: *` writes can avoid replacing existing objects. Coordinate
+remote deletion with publication separately from local Cargo GC.
+
+[GitHub Actions caches](https://docs.github.com/en/actions/reference/workflows-and-actions/dependency-caching)
+are immutable archives. Bundle a snapshot and its referenced objects under a new
+cache key when contents change, rather than creating an Actions cache entry for
+every blob. GitHub controls archive retention and quotas independently of Cargo's
+local 30-day policy. Restrict cache writers to trusted workflows.
+
+These files are transportable without a shared database, filesystem timestamps,
+or hardlink relationships. Compiled outputs remain specific to their toolchain
+and target. Cargo does not yet provide S3 or GitHub Actions network clients or
+action-keyed remote compilation reuse.
 
 ## builtin-dependencies
 * Tracking Issue: [rust-lang/cargo#16960](https://github.com/rust-lang/cargo/issues/16960)

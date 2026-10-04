@@ -125,8 +125,9 @@
 //! `target/{debug,release}/.fingerprint/` directory. Each Unit is stored in a
 //! separate directory. Each Unit directory contains:
 //!
-//! - A file with a 16 hex-digit hash. This is the Fingerprint hash, used for
-//!   quick loading and comparison.
+//! - A file with a 16 hex-digit hash, used for quick loading and comparison.
+//!   Shared blob tracking can append an inventory ID and cache revision to this
+//!   record. These optional fields do not participate in the fingerprint hash.
 //! - A `.json` file that contains details about the Fingerprint. This is only
 //!   used to log details about *why* a fingerprint is considered dirty.
 //!   `CARGO_LOG=cargo::compiler::fingerprint=trace cargo build` can be
@@ -402,6 +403,7 @@ use serde::ser;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info};
 
+use crate::compiler::blob_storage::BlobRecord;
 use crate::compiler::unit_graph::UnitDep;
 use crate::context::FingerprintMethod;
 use crate::util;
@@ -472,8 +474,14 @@ pub fn prepare_target(
     // information about failed comparisons to aid in debugging.
     let fingerprint = calculate(build_runner, unit)?;
     let mtime_on_use = build_runner.bcx.gctx.cli_unstable().mtime_on_use;
-    let dirty_reason = match compare_old_fingerprint(unit, &loc, &*fingerprint, mtime_on_use, force)
-    {
+    let dirty_reason = match compare_old_fingerprint(
+        unit,
+        &loc,
+        &*fingerprint,
+        mtime_on_use,
+        force,
+        super::should_dedup_out_dir(build_runner, unit),
+    ) {
         FingerprintComparison::Fresh => None,
         FingerprintComparison::Dirty { reason } => Some(reason),
     };
@@ -499,6 +507,7 @@ pub fn prepare_target(
     let Some(dirty_reason) = dirty_reason else {
         return Ok(Job::new_fresh());
     };
+    *fingerprint.blob_inventory.lock().unwrap() = None;
 
     // We're going to rebuild, so ensure the source of the crate passes all
     // verification checks before we build it.
@@ -664,6 +673,9 @@ pub struct Fingerprint {
     /// for hashing.
     #[serde(skip)]
     memoized_hash: Mutex<Option<u64>>,
+    /// Inventory published for these outputs, checked against the cache revision.
+    #[serde(skip)]
+    blob_inventory: Mutex<Option<BlobRecord>>,
     /// RUSTFLAGS/RUSTDOCFLAGS environment variable value (or config value).
     rustflags: Vec<String>,
     /// Hash of various config settings that change how things are compiled.
@@ -1048,6 +1060,7 @@ impl Fingerprint {
             deps: Vec::new(),
             local: Mutex::new(Vec::new()),
             memoized_hash: Mutex::new(None),
+            blob_inventory: Mutex::new(None),
             rustflags: Vec::new(),
             config: 0,
             compile_kind: 0,
@@ -1067,33 +1080,31 @@ impl Fingerprint {
         *self.memoized_hash.lock().unwrap() = None;
     }
 
-    /// Identifies the output generation without another filesystem lookup.
-    ///
-    /// This only invalidates blob bookkeeping. It is not a content hash.
-    pub(super) fn cached_blob_generation(&self) -> Option<[u8; 32]> {
-        let FsStatus::UpToDate { mtimes } = &self.fs_status else {
-            return None;
-        };
-        let mut hasher = blake3::Hasher::new_derive_key("cargo blob output generation v1");
-        hasher.update(&self.hash_u64().to_le_bytes());
-        for output in &self.outputs {
-            let mtime = mtimes[output];
-            hasher.update(&mtime.unix_seconds().to_le_bytes());
-            hasher.update(&mtime.nanoseconds().to_le_bytes());
-        }
-        Some(*hasher.finalize().as_bytes())
+    pub(super) fn blob_inventory(&self) -> Option<BlobRecord> {
+        *self.blob_inventory.lock().unwrap()
     }
 
-    /// Reads the generation after output publication has finished.
-    pub(super) fn capture_blob_generation(&self) -> CargoResult<[u8; 32]> {
-        let mut hasher = blake3::Hasher::new_derive_key("cargo blob output generation v1");
-        hasher.update(&self.hash_u64().to_le_bytes());
-        for output in &self.outputs {
-            let mtime = paths::mtime(output)?;
-            hasher.update(&mtime.unix_seconds().to_le_bytes());
-            hasher.update(&mtime.nanoseconds().to_le_bytes());
+    /// Attach a pointer only after its immutable inventory has been published.
+    pub(super) fn record_blob_inventory(&self, loc: &Path, record: BlobRecord) -> CargoResult<()> {
+        let hash = util::to_hex(self.hash_u64());
+        let revision = blake3::Hash::from(record.revision).to_hex();
+        let result = blake3::Hash::from(record.result).to_hex();
+        let mut bytes = [0; 154];
+        let mut remaining = bytes.as_mut_slice();
+        for part in [
+            hash.as_bytes(),
+            b"\nblob-v1 ",
+            revision.as_bytes(),
+            b" ",
+            result.as_bytes(),
+        ] {
+            let (destination, rest) = remaining.split_at_mut(part.len());
+            destination.copy_from_slice(part);
+            remaining = rest;
         }
-        Ok(*hasher.finalize().as_bytes())
+        paths::write_atomic(loc, bytes)?;
+        *self.blob_inventory.lock().unwrap() = Some(record);
+        Ok(())
     }
 
     fn hash_u64(&self) -> u64 {
@@ -1746,6 +1757,7 @@ fn calculate_normal(
         deps,
         local: Mutex::new(local),
         memoized_hash: Mutex::new(None),
+        blob_inventory: Mutex::new(None),
         config: Hasher::finish(&config),
         compile_kind,
         index: build_runner.bcx.unit_to_index[unit],
@@ -2052,6 +2064,7 @@ fn compare_old_fingerprint(
     new_fingerprint: &Fingerprint,
     mtime_on_use: bool,
     forced: bool,
+    track_blobs: bool,
 ) -> FingerprintComparison {
     if mtime_on_use {
         // update the mtime so other cleaners know we used it
@@ -2060,7 +2073,7 @@ fn compare_old_fingerprint(
         paths::set_file_time_no_err(old_hash_path, t);
     }
 
-    let compare = _compare_old_fingerprint(old_hash_path, new_fingerprint);
+    let compare = _compare_old_fingerprint(old_hash_path, new_fingerprint, track_blobs);
 
     match compare.as_ref() {
         Ok(FingerprintComparison::Fresh) => {}
@@ -2094,12 +2107,19 @@ fn compare_old_fingerprint(
 fn _compare_old_fingerprint(
     old_hash_path: &Path,
     new_fingerprint: &Fingerprint,
+    track_blobs: bool,
 ) -> CargoResult<FingerprintComparison> {
     let old_fingerprint_short = paths::read(old_hash_path)?;
+    let (old_hash, blob_record) = old_fingerprint_short
+        .split_once('\n')
+        .unwrap_or((&old_fingerprint_short, ""));
 
     let new_hash = new_fingerprint.hash_u64();
 
-    if util::to_hex(new_hash) == old_fingerprint_short && new_fingerprint.fs_status.up_to_date() {
+    if util::to_hex(new_hash) == old_hash && new_fingerprint.fs_status.up_to_date() {
+        if track_blobs {
+            *new_fingerprint.blob_inventory.lock().unwrap() = parse_blob_record(blob_record);
+        }
         return Ok(FingerprintComparison::Fresh);
     }
 
@@ -2107,15 +2127,20 @@ fn _compare_old_fingerprint(
     let old_fingerprint: Fingerprint = serde_json::from_str(&old_fingerprint_json)
         .with_context(|| internal("failed to deserialize json"))?;
     // Fingerprint can be empty after a failed rebuild (see comment in prepare_target).
-    if !old_fingerprint_short.is_empty() {
-        debug_assert_eq!(
-            util::to_hex(old_fingerprint.hash_u64()),
-            old_fingerprint_short
-        );
+    if !old_hash.is_empty() {
+        debug_assert_eq!(util::to_hex(old_fingerprint.hash_u64()), old_hash);
     }
 
     let reason = new_fingerprint.compare(&old_fingerprint);
     Ok(FingerprintComparison::Dirty { reason })
+}
+
+fn parse_blob_record(record: &str) -> Option<BlobRecord> {
+    let (revision, result) = record.strip_prefix("blob-v1 ")?.split_once(' ')?;
+    Some(BlobRecord {
+        revision: *blake3::Hash::from_hex(revision).ok()?.as_bytes(),
+        result: *blake3::Hash::from_hex(result).ok()?.as_bytes(),
+    })
 }
 
 /// Calculates the fingerprint of a unit thats contains no dep-info files.

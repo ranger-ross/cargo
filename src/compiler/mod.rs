@@ -262,29 +262,41 @@ fn compile<'gctx>(
             if should_dedup_out_dir(build_runner, unit)
                 && let Some(blob_storage) = build_runner.files().blob_storage()
             {
-                let unit_dir = build_runner.files().build_unit_dir(unit);
                 let fingerprint = &build_runner.fingerprints[unit];
-                let generation = if job.freshness().is_dirty() {
+                let previous = if job.freshness().is_dirty() {
                     None
                 } else {
-                    fingerprint.cached_blob_generation()
+                    fingerprint.blob_inventory()
                 };
-                match blob_storage.prepare_unit(&unit_dir, generation) {
-                    Ok(true) => {
-                        let out_dir = build_runner.files().out_dir_new_layout(unit);
+                match blob_storage.prepare_unit(previous) {
+                    Ok(Some(record)) if Some(record) == previous => {}
+                    Ok(Some(record)) => {
+                        let loc = build_runner.files().fingerprint_file_path(unit, "");
                         let fingerprint = Arc::clone(fingerprint);
                         job.after(Work::new(move |_state| {
-                            if let Err(err) =
-                                blob_storage.capture_unit(&unit_dir, &out_dir, &fingerprint)
-                            {
+                            if let Err(err) = fingerprint.record_blob_inventory(&loc, record) {
+                                debug!(?loc, ?err, "failed to update blob inventory pointer");
+                            }
+                            Ok(())
+                        }));
+                    }
+                    Ok(None) => {
+                        let unit_dir = build_runner.files().build_unit_dir(unit);
+                        let out_dir = build_runner.files().out_dir_new_layout(unit);
+                        let loc = build_runner.files().fingerprint_file_path(unit, "");
+                        let fingerprint = Arc::clone(fingerprint);
+                        job.after(Work::new(move |_state| {
+                            let result = blob_storage
+                                .capture_unit(&unit_dir, &out_dir)
+                                .and_then(|record| fingerprint.record_blob_inventory(&loc, record));
+                            if let Err(err) = result {
                                 debug!(?unit_dir, ?err, "failed to capture blob outputs");
                             }
                             Ok(())
                         }));
                     }
-                    Ok(false) => {}
                     Err(err) => {
-                        debug!(?unit_dir, ?err, "failed to track blob outputs");
+                        debug!(?unit, ?err, "failed to track blob outputs");
                     }
                 }
             }

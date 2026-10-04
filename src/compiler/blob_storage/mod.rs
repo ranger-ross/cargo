@@ -7,30 +7,28 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use cargo_util::paths::create_dir_all;
 use filetime::FileTime;
-use format::{Digest, Output, StoredUnit, UnitResult, encode_output_path};
+use format::{Digest, Output, UnitResult, encode_output_path};
 use parking_lot::Mutex;
 use tracing::instrument;
 
-use crate::compiler::fingerprint::Fingerprint;
 use crate::ops::CleanContext;
 use crate::util::cache_lock::CacheLockMode;
-use crate::util::data_structures::{HashMap, HashSet};
+use crate::util::data_structures::HashSet;
 use crate::{CargoResult, GlobalContext};
 use snapshots::SnapshotStore;
 
-pub struct BlobStorage {
-    root: PathBuf,
-    build_dir: PathBuf,
-    build_dir_id: Vec<u8>,
-    tracking: Mutex<Tracking>,
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct BlobRecord {
+    pub revision: [u8; 32],
+    pub result: [u8; 32],
 }
 
-#[derive(Default)]
-struct Tracking {
-    known: HashMap<Vec<u8>, StoredUnit>,
-    used: HashSet<Vec<u8>>,
-    invalidated: HashSet<Vec<u8>>,
-    updates: HashMap<Vec<u8>, UnitResult>,
+pub struct BlobStorage {
+    root: PathBuf,
+    build_dir_id: Vec<u8>,
+    revision: Digest,
+    validate_all: bool,
+    used: Mutex<HashSet<Digest>>,
 }
 
 impl BlobStorage {
@@ -42,47 +40,41 @@ impl BlobStorage {
             .as_encoded_bytes()
             .to_vec();
         let _lock = gctx.acquire_package_cache_lock(CacheLockMode::DownloadExclusive)?;
-        let known = SnapshotStore::new(&root).load_units(&build_dir_id)?;
+        let store = SnapshotStore::new(&root);
+        let revision = store.revision()?;
+        let validate_all = !store.has_receipt(&build_dir_id)?;
         Ok(Self {
             root,
-            build_dir: build_dir.to_path_buf(),
             build_dir_id,
-            tracking: Mutex::new(Tracking {
-                known,
-                ..Tracking::default()
-            }),
+            revision,
+            validate_all,
+            used: Mutex::new(HashSet::default()),
         })
     }
 
-    /// Records membership without opening the unit's output files.
-    ///
-    /// Returns whether the completed output set needs to be captured.
-    pub fn prepare_unit(&self, unit_dir: &Path, generation: Option<Digest>) -> CargoResult<bool> {
-        let key = unit_dir
-            .strip_prefix(&self.build_dir)?
-            .as_os_str()
-            .as_encoded_bytes();
-        let mut tracking = self.tracking.lock();
-        let capture = !tracking
-            .known
-            .get(key)
-            .is_some_and(|unit| Some(unit.generation) == generation);
-        if capture {
-            tracking.known.remove(key);
-            tracking.invalidated.insert(key.to_vec());
+    /// Reuses a fingerprint pointer, checking its inventory after collection.
+    pub(super) fn prepare_unit(
+        &self,
+        record: Option<BlobRecord>,
+    ) -> CargoResult<Option<BlobRecord>> {
+        let Some(record) = record else {
+            return Ok(None);
+        };
+        if (self.validate_all || record.revision != self.revision)
+            && !SnapshotStore::new(&self.root).unit_is_complete(&record.result)?
+        {
+            return Ok(None);
         }
-        tracking.used.insert(key.to_vec());
-        Ok(capture)
+        self.used.lock().insert(record.result);
+        Ok(Some(BlobRecord {
+            revision: self.revision,
+            result: record.result,
+        }))
     }
 
     /// Captures a newly completed unit or adopts previously untracked outputs.
     #[instrument(skip_all)]
-    pub fn capture_unit(
-        &self,
-        unit_dir: &Path,
-        out_dir: &Path,
-        fingerprint: &Fingerprint,
-    ) -> CargoResult<()> {
+    pub(super) fn capture_unit(&self, unit_dir: &Path, out_dir: &Path) -> CargoResult<BlobRecord> {
         let mut outputs = Vec::new();
         for entry in walkdir::WalkDir::new(out_dir) {
             let entry = entry?;
@@ -104,48 +96,24 @@ impl BlobStorage {
                 size,
             });
         }
-        let mut result = UnitResult::new(outputs);
-        result.generation = fingerprint.capture_blob_generation()?;
-        let key = unit_dir
-            .strip_prefix(&self.build_dir)?
-            .as_os_str()
-            .as_encoded_bytes()
-            .to_vec();
-        let mut tracking = self.tracking.lock();
-        tracking.known.insert(
-            key.clone(),
-            StoredUnit {
-                result: result.id,
-                generation: result.generation,
-            },
-        );
-        tracking.updates.insert(key, result);
-        Ok(())
+        let result = UnitResult::new(outputs);
+        SnapshotStore::new(&self.root).publish_unit(&result)?;
+        self.used.lock().insert(result.id);
+        Ok(BlobRecord {
+            revision: self.revision,
+            result: result.id,
+        })
     }
 
-    /// Saves completed units even when another unit failed.
-    ///
-    /// Only successful builds publish a graph snapshot.
+    /// Only successful builds publish a graph snapshot and refresh usage.
     pub fn finish(&self, gctx: &GlobalContext, successful: bool) -> CargoResult<()> {
-        let tracking = self.tracking.lock();
-        if tracking.used.is_empty() {
+        let used = self.used.lock();
+        if !successful || used.is_empty() {
             return Ok(());
         }
-        let results = successful.then(|| {
-            tracking
-                .used
-                .iter()
-                .filter_map(|key| tracking.known.get(key).map(|unit| unit.result))
-                .collect::<Vec<_>>()
-        });
+        let results = used.iter().copied().collect();
         let _lock = gctx.acquire_package_cache_lock(CacheLockMode::DownloadExclusive)?;
-        SnapshotStore::new(&self.root).save(
-            &self.build_dir_id,
-            &tracking.invalidated,
-            &tracking.updates,
-            results,
-            now(),
-        )
+        SnapshotStore::new(&self.root).save(&self.build_dir_id, results, now())
     }
 
     /// Collects expired snapshots under the package-cache mutation lock.
@@ -280,9 +248,10 @@ mod tests {
         let build_dir = tempfile::tempdir().unwrap();
         let storage = BlobStorage {
             root: root.path().to_path_buf(),
-            build_dir: build_dir.path().to_path_buf(),
             build_dir_id: Vec::new(),
-            tracking: Mutex::default(),
+            revision: [0; 32],
+            validate_all: false,
+            used: Mutex::default(),
         };
         let contents = b"#!/bin/sh\nprintf 'cache-ok\\n'\n";
         let hash = *blake3::hash(contents).as_bytes();
@@ -318,9 +287,10 @@ mod tests {
         let build_dir = tempfile::tempdir().unwrap();
         let storage = BlobStorage {
             root: root.path().to_path_buf(),
-            build_dir: build_dir.path().to_path_buf(),
             build_dir_id: Vec::new(),
-            tracking: Mutex::default(),
+            revision: [0; 32],
+            validate_all: false,
+            used: Mutex::default(),
         };
         let contents = b"compiled output";
         let hash = *blake3::hash(contents).as_bytes();

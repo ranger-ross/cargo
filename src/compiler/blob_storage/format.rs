@@ -6,12 +6,11 @@ use std::path::{Component, Path};
 use anyhow::{bail, ensure};
 
 use crate::CargoResult;
-use crate::util::data_structures::HashMap;
 
 pub(super) type Digest = [u8; 32];
 const UNIT_MAGIC: &[u8] = b"cargo-shared-blob-unit-result-v2\0";
 const SNAPSHOT_MAGIC: &[u8] = b"cargo-shared-blob-snapshot-v1\0";
-const STATE_MAGIC: &[u8] = b"cargo-shared-blob-state-v1\0";
+const STATE_MAGIC: &[u8] = b"cargo-shared-blob-state-v2\0";
 
 #[cfg(unix)]
 const PATH_ENCODING: u8 = 1;
@@ -30,8 +29,6 @@ pub(super) struct Output {
 #[derive(Debug)]
 pub(super) struct UnitResult {
     pub id: Digest,
-    /// Local freshness token, excluded from the immutable inventory.
-    pub generation: Digest,
     pub bytes: Vec<u8>,
 }
 
@@ -55,21 +52,13 @@ impl UnitResult {
         }
         Self {
             id: *blake3::hash(&bytes).as_bytes(),
-            generation: [0; 32],
             bytes,
         }
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) struct StoredUnit {
-    pub result: Digest,
-    pub generation: Digest,
-}
-
 #[derive(Default, Debug, Eq, PartialEq)]
 pub(super) struct Receipt {
-    pub units: HashMap<Vec<u8>, StoredUnit>,
     pub usage: BTreeMap<Digest, u64>,
 }
 
@@ -180,20 +169,9 @@ pub(super) fn decode_snapshot(bytes: &[u8], id: &Digest) -> CargoResult<Vec<Dige
 
 impl Receipt {
     pub fn encode(&self) -> Vec<u8> {
-        let capacity = STATE_MAGIC.len()
-            + 16
-            + self.usage.len() * 40
-            + self.units.keys().map(|path| 72 + path.len()).sum::<usize>();
+        let capacity = STATE_MAGIC.len() + 8 + self.usage.len() * 40;
         let mut bytes = Vec::with_capacity(capacity);
         bytes.extend_from_slice(STATE_MAGIC);
-        put_u64(&mut bytes, self.units.len() as u64);
-        let mut units: Vec<_> = self.units.iter().collect();
-        units.sort_unstable_by(|a, b| a.0.cmp(b.0));
-        for (path, unit) in units {
-            put_bytes(&mut bytes, path);
-            bytes.extend_from_slice(&unit.result);
-            bytes.extend_from_slice(&unit.generation);
-        }
         put_u64(&mut bytes, self.usage.len() as u64);
         for (snapshot, last_used) in &self.usage {
             bytes.extend_from_slice(snapshot);
@@ -204,24 +182,8 @@ impl Receipt {
 
     pub fn decode(bytes: &[u8]) -> CargoResult<Self> {
         let mut reader = Reader::new(bytes, STATE_MAGIC)?;
-        let count = reader.count(72)?;
-        let mut receipt = Self::default();
-        receipt.units.reserve(count);
-        let mut previous: Option<&[u8]> = None;
-        for _ in 0..count {
-            let path = reader.bytes()?;
-            ensure!(
-                previous.is_none_or(|last| last < path),
-                "unordered or duplicate local unit slot"
-            );
-            previous = Some(path);
-            let unit = StoredUnit {
-                result: reader.digest()?,
-                generation: reader.digest()?,
-            };
-            receipt.units.insert(path.to_vec(), unit);
-        }
         let count = reader.count(40)?;
+        let mut receipt = Self::default();
         for _ in 0..count {
             let snapshot = reader.digest()?;
             ensure!(
@@ -477,23 +439,17 @@ mod tests {
     #[test]
     fn receipt_roundtrip_and_duplicate_rejection() {
         let mut receipt = Receipt::default();
-        receipt.units.insert(
-            b"unit".to_vec(),
-            StoredUnit {
-                result: [1; 32],
-                generation: [2; 32],
-            },
-        );
         receipt.usage.insert([3; 32], u64::MAX);
         assert_eq!(Receipt::decode(&receipt.encode()).unwrap(), receipt);
-        let mut bytes = Receipt::default().encode();
-        let usage_offset = STATE_MAGIC.len() + 8;
-        bytes[usage_offset..].copy_from_slice(&2_u64.to_le_bytes());
-        for _ in 0..2 {
-            bytes.extend_from_slice(&[3; 32]);
-            put_u64(&mut bytes, 0);
+        for snapshots in [[3, 3], [4, 3]] {
+            let mut bytes = STATE_MAGIC.to_vec();
+            put_u64(&mut bytes, 2);
+            for snapshot in snapshots {
+                bytes.extend_from_slice(&[snapshot; 32]);
+                put_u64(&mut bytes, 0);
+            }
+            assert!(Receipt::decode(&bytes).is_err());
         }
-        assert!(Receipt::decode(&bytes).is_err());
     }
 
     #[test]

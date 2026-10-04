@@ -148,11 +148,74 @@ fn build_snapshot(p: &Project, feature: &str) {
         .run();
 }
 
+fn build_fresh_snapshot(p: &Project, feature: &str) {
+    let output = p
+        .cargo("build --message-format=json")
+        .args(&["--features", feature, "-Zshared-blob-storage"])
+        .masquerade_as_nightly_cargo(&["shared-blob-storage"])
+        .run();
+    assert_fresh_artifacts(&output.stdout);
+}
+
+fn assert_fresh_artifacts(stdout: &[u8]) {
+    let artifacts: BTreeMap<_, _> = std::str::from_utf8(stdout)
+        .unwrap()
+        .lines()
+        .filter_map(|line| {
+            let value: serde_json::Value = serde_json::from_str(line).unwrap();
+            (value["reason"] == "compiler-artifact").then(|| {
+                (
+                    value["target"]["name"].as_str().unwrap().to_owned(),
+                    value["fresh"].as_bool().unwrap(),
+                )
+            })
+        })
+        .collect();
+    assert_eq!(
+        artifacts,
+        ["app", "common", "variant"]
+            .into_iter()
+            .map(|name| (name.to_owned(), true))
+            .collect()
+    );
+}
+
+fn fingerprint_file(p: &Project, name: &str) -> PathBuf {
+    let files: Vec<_> = p
+        .glob(&format!("target/**/lib-{name}"))
+        .map(|path| t!(path))
+        .collect();
+    assert_eq!(files.len(), 1);
+    files.into_iter().next().unwrap()
+}
+
+fn fingerprint_pointer(path: &Path) -> (Digest, Digest) {
+    let data = t!(fs::read_to_string(path));
+    let (base, pointer) = data.split_once('\n').unwrap();
+    assert_eq!(base.len(), 16);
+    let fields: Vec<_> = pointer.split(' ').collect();
+    assert_eq!(fields.len(), 3);
+    assert_eq!(fields[0], "blob-v1");
+    (
+        *t!(blake3::Hash::from_hex(fields[1])).as_bytes(),
+        *t!(blake3::Hash::from_hex(fields[2])).as_bytes(),
+    )
+}
+
+fn cache_revision(root: &Path) -> Digest {
+    let data = t!(fs::read(root.join("local-v2/revision")));
+    data.strip_prefix(REVISION_MAGIC)
+        .unwrap()
+        .try_into()
+        .unwrap()
+}
+
 type Digest = [u8; 32];
 
 const SNAPSHOT_MAGIC: &[u8] = b"cargo-shared-blob-snapshot-v1\0";
 const UNIT_MAGIC: &[u8] = b"cargo-shared-blob-unit-result-v2\0";
-const STATE_MAGIC: &[u8] = b"cargo-shared-blob-state-v1\0";
+const STATE_MAGIC: &[u8] = b"cargo-shared-blob-state-v2\0";
+const REVISION_MAGIC: &[u8] = b"cargo-shared-blob-revision-v1\0";
 
 fn blob_root() -> PathBuf {
     paths::cargo_home().join("blobs")
@@ -211,10 +274,13 @@ fn snapshot_units(root: &Path, id: &Digest) -> BTreeSet<Digest> {
 }
 
 fn snapshot_blobs(id: &Digest) -> BTreeSet<PathBuf> {
-    let root = blob_root();
+    snapshot_blobs_at(&blob_root(), id)
+}
+
+fn snapshot_blobs_at(root: &Path, id: &Digest) -> BTreeSet<PathBuf> {
     let mut blobs = BTreeSet::new();
-    for unit in snapshot_units(&root, id) {
-        let data = object_bytes(&root, "units-v1", &unit);
+    for unit in snapshot_units(root, id) {
+        let data = object_bytes(root, "units-v1", &unit);
         let mut bytes = data.strip_prefix(UNIT_MAGIC).unwrap();
         assert!(matches!(bytes[0], 1..=3));
         bytes = &bytes[1..];
@@ -223,7 +289,7 @@ fn snapshot_blobs(id: &Digest) -> BTreeSet<PathBuf> {
             bytes = &bytes[path_len..];
             let hash = take_digest(&mut bytes);
             let size = take_u64(&mut bytes);
-            let path = object_path(&root, "", &hash);
+            let path = object_path(root, "", &hash);
             let contents = t!(fs::read(&path));
             assert_eq!(contents.len() as u64, size);
             assert_eq!(blake3::hash(&contents).as_bytes(), &hash);
@@ -238,10 +304,6 @@ fn snapshot_blobs(id: &Digest) -> BTreeSet<PathBuf> {
 // manifests or maintaining their own implementation of the storage backend.
 fn usage_offsets(data: &[u8]) -> Vec<(Digest, usize)> {
     let mut bytes = data.strip_prefix(STATE_MAGIC).unwrap();
-    for _ in 0..take_u64(&mut bytes) {
-        let path_len = take_u64(&mut bytes) as usize;
-        bytes = &bytes[path_len + 64..];
-    }
     let mut offsets = Vec::new();
     for _ in 0..take_u64(&mut bytes) {
         let id = take_digest(&mut bytes);
@@ -253,8 +315,9 @@ fn usage_offsets(data: &[u8]) -> Vec<(Digest, usize)> {
 }
 
 fn receipts(root: &Path) -> Vec<PathBuf> {
-    t!(fs::read_dir(root.join("local-v1")))
+    t!(fs::read_dir(root.join("local-v2")))
         .map(|entry| t!(entry).path())
+        .filter(|path| path.file_name().unwrap() != "revision")
         .collect()
 }
 
@@ -450,12 +513,16 @@ fn pressure_gc_preserves_build_outputs_and_dry_run_preserves_cache() {
     }
     assert_eq!(t!(fs::read(p.bin("app"))), executable);
     p.process(&p.bin("app")).with_stdout_data("11\n").run();
-    // Existing build-dir outputs must remain usable by Cargo too, including
-    // recovery of the local lookup mapping removed by pressure GC.
+    // Fresh build outputs must repopulate every evicted inventory and blob.
     p.cargo("run --features foo -Zshared-blob-storage")
         .masquerade_as_nightly_cargo(&["shared-blob-storage"])
         .with_stdout_data("11\n")
         .run();
+    assert_eq!(snapshot_ids(), BTreeSet::from([id]));
+    assert_eq!(
+        snapshot_blobs(&id),
+        blobs.into_iter().map(|(path, _)| path).collect()
+    );
 }
 
 #[cargo_test]
@@ -498,14 +565,14 @@ fn fresh_build_recaptures_outputs_replaced_without_blob_storage() {
         .unwrap();
     let original = t!(fs::read(&artifact));
 
-    // Rebuild the same unit slot while snapshot tracking is disabled. env! embeds
-    // different bytes and changes the fingerprint without changing the unit's
-    // output path, unlike toggling a feature or changing RUSTFLAGS.
-    p.cargo("clean -p changing").run();
+    // Rebuild the same output path with tracking disabled.
     p.cargo("run")
         .env("BLOB_STORAGE_TEST_VALUE", "replacement")
         .with_stdout_data("replacement\n")
         .run();
+    let fingerprint = fingerprint_file(&p, "changing");
+    let plain = t!(fs::read_to_string(&fingerprint));
+    assert_eq!(plain.len(), 16, "disabled rebuild retained a blob pointer");
     let replacement = t!(fs::read(&artifact));
     assert_ne!(replacement, original);
     let replacement_blob = paths::cargo_home()
@@ -513,9 +580,7 @@ fn fresh_build_recaptures_outputs_replaced_without_blob_storage() {
         .join(blake3::hash(&replacement).to_hex().as_str());
     assert!(!replacement_blob.exists());
 
-    // Everything is fresh now, but the stored mapping describes the old
-    // generation. Re-enabling tracking must capture the replacement, not
-    // renew the old graph merely because the unit output path still matches.
+    // Re-enabling tracking must capture the replacement, not renew the old graph.
     p.cargo("run -Zshared-blob-storage")
         .env("BLOB_STORAGE_TEST_VALUE", "replacement")
         .masquerade_as_nightly_cargo(&["shared-blob-storage"])
@@ -553,7 +618,7 @@ fn archive_restore_without_local_receipts_gets_one_expiring_lease() {
     // Model an archive extraction: new files containing only immutable bytes,
     // with no hardlinks, preserved mtimes, or workspace-local receipts.
     for (path, contents) in cache_files(&source) {
-        if path.starts_with("local-v1") {
+        if path.starts_with("local-v2") {
             continue;
         }
         let destination = restored.join(path);
@@ -561,16 +626,16 @@ fn archive_restore_without_local_receipts_gets_one_expiring_lease() {
         t!(fs::write(destination, contents));
     }
     t!(fs::remove_dir_all(&source));
-    assert!(!restored.join("local-v1").exists());
+    assert!(!restored.join("local-v2").exists());
     assert_eq!(snapshot_ids_at(&restored), ids);
     let immutable = cache_files(&restored);
 
     clean_blobs_in(&p, &restored_home, "1GiB", true);
     assert_eq!(cache_files(&restored), immutable);
-    assert!(!restored.join("local-v1").exists());
+    assert!(!restored.join("local-v2").exists());
 
     clean_blobs_in(&p, &restored_home, "1GiB", false);
-    let imports = restored.join("local-v1/imports");
+    let imports = restored.join("local-v2/imports");
     assert!(receipt_usage(&imports, id) > 1);
     for blob in &blobs {
         let path = restored.join(blob.file_name().unwrap());
@@ -695,6 +760,11 @@ fn incomplete_graph_preserves_other_snapshot(damage: &str) {
         .masquerade_as_nightly_cargo(&["shared-blob-storage"])
         .with_stdout_data("12\n")
         .run();
+    build_fresh_snapshot(&p, "foo");
+    p.process(&p.bin("app")).with_stdout_data("11\n").run();
+    assert_eq!(snapshot_ids(), BTreeSet::from([foo_id, bar_id]));
+    assert_eq!(snapshot_blobs(&foo_id), foo_blobs);
+    assert_eq!(snapshot_blobs(&bar_id), bar_blobs);
 }
 
 #[cargo_test]
@@ -732,10 +802,262 @@ fn corrupt_restored_blob_is_repaired_without_replacing_good_build_output() {
     t!(fs::rename(replacement, &blob));
     assert_eq!(t!(fs::read(&artifact)), original);
     assert_eq!(t!(fs::read(&blob)), wrong);
-    t!(fs::remove_dir_all(blob_root().join("local-v1")));
+    // Missing inventory forces capture; metadata-only checks do not hash blobs.
+    let id = snapshot_ids().pop_first().unwrap();
+    for unit in snapshot_units(&blob_root(), &id) {
+        t!(fs::remove_file(object_path(
+            &blob_root(),
+            "units-v1",
+            &unit
+        )));
+    }
+    t!(fs::remove_dir_all(blob_root().join("local-v2")));
 
     build_snapshot(&p, "foo");
     assert_eq!(t!(fs::read(&artifact)), original);
     assert_eq!(t!(fs::read(&blob)), original);
+    p.process(&p.bin("app")).with_stdout_data("11\n").run();
+}
+
+#[cargo_test]
+fn dormant_feature_pointer_recovers_after_another_feature_validates_revision() {
+    let p = snapshot_project();
+    build_snapshot(&p, "foo");
+    let foo_id = snapshot_ids().pop_first().unwrap();
+    let foo_blobs = snapshot_blobs(&foo_id);
+    let foo_fingerprint = fingerprint_file(&p, "variant");
+    let foo_pointer = fingerprint_pointer(&foo_fingerprint);
+    let common_fingerprint = fingerprint_file(&p, "common");
+    let common_pointer = fingerprint_pointer(&common_fingerprint);
+    let common_inventory = object_path(&blob_root(), "units-v1", &common_pointer.1);
+    let common_modified = t!(t!(fs::metadata(&common_inventory)).modified());
+    assert_eq!(foo_pointer.0, cache_revision(&blob_root()));
+    assert!(snapshot_units(&blob_root(), &foo_id).contains(&foo_pointer.1));
+
+    build_snapshot(&p, "bar");
+    let bar_id = *snapshot_ids().iter().find(|id| **id != foo_id).unwrap();
+    let bar_blobs = snapshot_blobs(&bar_id);
+    backdate_snapshot(&foo_id, 1);
+    clean_blobs(&p, "1GiB", false);
+    let revision = cache_revision(&blob_root());
+    assert_ne!(revision, foo_pointer.0);
+    assert!(!object_path(&blob_root(), "units-v1", &foo_pointer.1).exists());
+
+    build_fresh_snapshot(&p, "bar");
+    p.process(&p.bin("app")).with_stdout_data("12\n").run();
+    assert_eq!(
+        fingerprint_pointer(&common_fingerprint),
+        (revision, common_pointer.1)
+    );
+    assert_eq!(
+        t!(t!(fs::metadata(&common_inventory)).modified()),
+        common_modified
+    );
+    assert_eq!(fingerprint_pointer(&foo_fingerprint), foo_pointer);
+    assert_eq!(snapshot_blobs(&bar_id), bar_blobs);
+
+    build_fresh_snapshot(&p, "foo");
+    p.process(&p.bin("app")).with_stdout_data("11\n").run();
+    assert_eq!(
+        fingerprint_pointer(&foo_fingerprint),
+        (revision, foo_pointer.1)
+    );
+    assert_eq!(snapshot_ids(), BTreeSet::from([foo_id, bar_id]));
+    assert_eq!(snapshot_blobs(&foo_id), foo_blobs);
+    assert_eq!(snapshot_blobs(&bar_id), bar_blobs);
+}
+
+fn fresh_pointer_recovers_missing_cache(remove_store: bool) {
+    let p = snapshot_project();
+    build_snapshot(&p, "foo");
+    let id = snapshot_ids().pop_first().unwrap();
+    let blobs = snapshot_blobs(&id);
+    let fingerprint = fingerprint_file(&p, "common");
+    let pointer = fingerprint_pointer(&fingerprint);
+    if remove_store {
+        t!(fs::remove_dir_all(blob_root()));
+    } else {
+        t!(fs::remove_dir_all(blob_root().join("local-v2")));
+        // An old pointer must not hide missing data in an otherwise intact store.
+        t!(fs::remove_file(object_path(
+            &blob_root(),
+            "units-v1",
+            &pointer.1
+        )));
+    }
+    build_fresh_snapshot(&p, "foo");
+    p.process(&p.bin("app")).with_stdout_data("11\n").run();
+    let revision = cache_revision(&blob_root());
+    assert_ne!(revision, pointer.0);
+    assert_eq!(fingerprint_pointer(&fingerprint), (revision, pointer.1));
+    assert_eq!(snapshot_ids(), BTreeSet::from([id]));
+    assert_eq!(snapshot_blobs(&id), blobs);
+}
+
+#[cargo_test]
+fn fresh_pointers_recover_after_store_deletion() {
+    fresh_pointer_recovers_missing_cache(true);
+}
+
+#[cargo_test]
+fn fresh_pointers_recover_after_local_metadata_recreation() {
+    fresh_pointer_recovers_missing_cache(false);
+}
+
+#[cargo_test]
+fn missing_receipt_validates_pointers_even_with_matching_revision() {
+    let p = snapshot_project();
+    build_snapshot(&p, "foo");
+    let id = snapshot_ids().pop_first().unwrap();
+    let blobs = snapshot_blobs(&id);
+    let fingerprint = fingerprint_file(&p, "common");
+    let pointer = fingerprint_pointer(&fingerprint);
+    for receipt in receipts(&blob_root()) {
+        t!(fs::remove_file(receipt));
+    }
+    t!(fs::remove_file(object_path(
+        &blob_root(),
+        "units-v1",
+        &pointer.1
+    )));
+
+    build_fresh_snapshot(&p, "foo");
+    assert_eq!(fingerprint_pointer(&fingerprint), pointer);
+    assert_eq!(snapshot_blobs(&id), blobs);
+    assert!(usage_time(&id) > 1);
+    p.process(&p.bin("app")).with_stdout_data("11\n").run();
+}
+
+#[cargo_test]
+fn new_cargo_home_does_not_trust_old_fingerprint_pointers() {
+    let p = snapshot_project();
+    p.cargo("vendor --respect-source-config vendor").run();
+    t!(fs::create_dir_all(p.root().join(".cargo")));
+    p.change_file(
+        ".cargo/config.toml",
+        r#"
+            [source.crates-io]
+            replace-with = "vendored"
+            [source.vendored]
+            directory = "vendor"
+        "#,
+    );
+    build_snapshot(&p, "foo");
+    let old_revision = cache_revision(&blob_root());
+    let new_home = p.root().join("new-cargo-home");
+    // Keep source paths fixed so changing Cargo home does not require rebuilding.
+    t!(fs::create_dir_all(&new_home));
+    let fingerprint = fingerprint_file(&p, "common");
+    let output = p
+        .cargo("build --features foo -Zshared-blob-storage --message-format=json")
+        .env("CARGO_HOME", &new_home)
+        .masquerade_as_nightly_cargo(&["shared-blob-storage"])
+        .run();
+    assert_fresh_artifacts(&output.stdout);
+    let new_root = new_home.join("blobs");
+    let pointer = fingerprint_pointer(&fingerprint);
+    assert_ne!(pointer.0, old_revision);
+    assert_eq!(pointer.0, cache_revision(&new_root));
+    let ids = snapshot_ids_at(&new_root);
+    assert_eq!(ids.len(), 1);
+    assert!(snapshot_units(&new_root, ids.first().unwrap()).contains(&pointer.1));
+    snapshot_blobs_at(&new_root, ids.first().unwrap());
+    p.process(&p.bin("app")).with_stdout_data("11\n").run();
+}
+
+#[cargo_test]
+fn failed_build_does_not_refresh_snapshot_and_recovers_completed_units_after_gc() {
+    Package::new("changing", "0.1.0")
+        .file(
+            "src/lib.rs",
+            "pub fn value() -> &'static str { env!(\"BLOB_STORAGE_TEST_VALUE\") }",
+        )
+        .publish();
+    let p = project()
+        .file(
+            "Cargo.toml",
+            r#"
+                [package]
+                name = "app"
+                version = "0.1.0"
+                edition = "2021"
+                [dependencies]
+                changing = "0.1.0"
+            "#,
+        )
+        .file(
+            "src/main.rs",
+            "fn main() { println!(\"{}\", changing::value()); }",
+        )
+        .build();
+    p.cargo("run -Zshared-blob-storage")
+        .env("BLOB_STORAGE_TEST_VALUE", "original")
+        .masquerade_as_nightly_cargo(&["shared-blob-storage"])
+        .with_stdout_data("original\n")
+        .run();
+    let ids = snapshot_ids();
+    let id = ids.first().unwrap();
+    backdate_snapshot(id, 1);
+    let fingerprint = fingerprint_file(&p, "changing");
+    let original_pointer = fingerprint_pointer(&fingerprint);
+    p.change_file(
+        "src/main.rs",
+        "compile_error!(\"build must fail\"); fn main() {}",
+    );
+    p.cargo("build -Zshared-blob-storage")
+        .env("BLOB_STORAGE_TEST_VALUE", "replacement")
+        .masquerade_as_nightly_cargo(&["shared-blob-storage"])
+        .with_status(101)
+        .with_stderr_contains("[ERROR] build must fail")
+        .run();
+    let completed_pointer = fingerprint_pointer(&fingerprint);
+    assert_ne!(completed_pointer.1, original_pointer.1);
+    assert!(object_path(&blob_root(), "units-v1", &completed_pointer.1).is_file());
+    assert_eq!(snapshot_ids(), ids);
+    assert_eq!(usage_time(id), 1);
+
+    clean_blobs(&p, "0", false);
+    assert!(!object_path(&blob_root(), "units-v1", &completed_pointer.1).exists());
+    p.change_file(
+        "src/main.rs",
+        "fn main() { println!(\"{}\", changing::value()); }",
+    );
+    p.cargo("run -Zshared-blob-storage")
+        .env("BLOB_STORAGE_TEST_VALUE", "replacement")
+        .masquerade_as_nightly_cargo(&["shared-blob-storage"])
+        .with_stdout_data("replacement\n")
+        .run();
+    let recovered = fingerprint_pointer(&fingerprint);
+    assert_eq!(
+        recovered,
+        (cache_revision(&blob_root()), completed_pointer.1)
+    );
+    let ids = snapshot_ids();
+    assert_eq!(ids.len(), 1);
+    let id = ids.first().unwrap();
+    assert!(snapshot_units(&blob_root(), id).contains(&completed_pointer.1));
+    snapshot_blobs(id);
+}
+
+#[cargo_test]
+fn malformed_optional_pointer_recaptures_without_recompiling() {
+    let p = snapshot_project();
+    build_snapshot(&p, "foo");
+    let id = snapshot_ids().pop_first().unwrap();
+    let blobs = snapshot_blobs(&id);
+    let fingerprint = fingerprint_file(&p, "common");
+    let pointer = fingerprint_pointer(&fingerprint);
+    let record = t!(fs::read_to_string(&fingerprint));
+    let base = record.split_once('\n').unwrap().0;
+    t!(fs::write(&fingerprint, format!("{base}\nblob-v1 invalid")));
+    t!(fs::remove_file(object_path(
+        &blob_root(),
+        "units-v1",
+        &pointer.1
+    )));
+
+    build_fresh_snapshot(&p, "foo");
+    assert_eq!(fingerprint_pointer(&fingerprint), pointer);
+    assert_eq!(snapshot_blobs(&id), blobs);
     p.process(&p.bin("app")).with_stdout_data("11\n").run();
 }

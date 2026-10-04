@@ -2109,8 +2109,9 @@ $CARGO_HOME/blobs/
   <blob hash>                         File contents
   units-v1/<unit-result hash>          Immutable output inventory
   snapshots-v1/<snapshot hash>         Immutable graph membership
-  local-v1/<build-directory hash>      Local lookup hints and usage
-  local-v1/imports                     Local leases for restored snapshots
+  local-v2/<build-directory hash>      Local snapshot usage
+  local-v2/imports                     Local leases for restored snapshots
+  local-v2/revision                    Cache identity and invalidation token
 ```
 
 Object names are lowercase hexadecimal BLAKE3 digests. Each manifest's name hashes
@@ -2124,22 +2125,43 @@ order (`2`), or UTF-8 (`3`). Snapshot manifests start with
 unit-result hashes. Counts, lengths, and sizes are unsigned little-endian 64-bit
 integers. Manifests contain no usage timestamps or build-directory identifiers.
 
-Mutable usage and freshness hints live in one atomically replaced receipt per
-build directory. Usage is updated at most once every four hours for each
-build-directory/snapshot pair. Fresh builds read consolidated receipts instead of
-walking and hashing every output. Enabling the feature on an existing build
-directory captures its previously untracked outputs once.
+Mutable snapshot usage lives in one atomically replaced receipt per build
+directory. Receipts start with `cargo-shared-blob-state-v2\0`, followed by a
+little-endian 64-bit count and sorted pairs of 32-byte snapshot hashes and
+little-endian 64-bit last-used timestamps. Usage is updated at most once every
+four hours for each build-directory/snapshot pair. Receipts contain no unit table.
 
-Publication writes unit manifests before the snapshot, then replaces the local
-receipt last. GC verifies manifest identities and checks that referenced blobs
-exist with the declared sizes. Blob contents are verified before replacing
-compiler outputs, and damaged cached contents are repaired from those outputs.
-Stored symlinks are repaired instead of reused.
+Each eligible unit's short fingerprint can carry an optional inventory pointer:
+`<16-digit fingerprint>\nblob-v1 <64-digit revision> <64-digit inventory hash>`.
+The pointer is cache metadata, not part of Cargo's freshness hash. A successful
+rebuild writes a plain fingerprint first; only successful inventory publication
+attaches a pointer. Rebuilding with tracking disabled cannot leave a stale pointer.
+Enabling the feature on an existing build directory captures untracked outputs.
+Older Cargo binaries do not understand the extended fingerprint record. Use
+separate build directories when switching between those binaries and this format.
 
-The earlier `blobs/index.sqlite` format is no longer read. The next enabled build
-re-inventories outputs while reusing existing blob contents. Collection removes
-obsolete database and timestamp files. Cargo's separate `.global-cache` database
-is unchanged.
+The revision file starts with `cargo-shared-blob-revision-v1\0`, followed by a
+random 32-byte token. A new store or recreated `local-v2` gets a new token. GC
+rotates it before invalidating receipts or deleting managed data; no-op collection
+and dry runs leave it unchanged. When the pointer's revision matches and the
+build directory has a receipt, fresh builds avoid per-unit inventory reads.
+Otherwise Cargo checks that particular inventory's hash and encoding and that
+every referenced blob is a regular file with the declared size. Intact inventories
+are reused; missing or invalid ones are recaptured from local build outputs.
+Validation is per pointer: checking one feature variant does not validate dormant
+variants. These checks do not hash blob contents.
+
+Publication writes unit inventories before attaching fingerprint pointers, then
+publishes a snapshot and updates usage only after a successful build. Failed
+builds can leave completed inventories but do not refresh snapshot retention.
+Blob contents are verified before replacing compiler outputs, and damaged cached
+contents are repaired from those outputs. Stored symlinks are repaired instead
+of reused.
+
+The earlier `blobs/index.sqlite` and `local-v1` metadata are no longer read.
+Enabled builds recreate tracking metadata while reusing existing blob contents.
+Collection removes obsolete local metadata, database and timestamp files.
+Cargo's separate `.global-cache` database is unchanged.
 
 Automatic garbage collection expires snapshot usage after 30 days. Blobs shared
 by retained snapshots remain in the cache. To also enforce a logical blob-size
@@ -2157,10 +2179,10 @@ removes build-directory outputs but does not clear the shared cache.
 ### Transporting the cache
 
 Blobs, unit manifests, and snapshot manifests can be copied as independent
-immutable objects or packed into an archive. Exclude `local-v1`: it contains
-machine-local lookup hints and usage, which can be recreated. Restore the complete
-snapshot closure before running Cargo. Each complete snapshot restored without a
-usage receipt receives a single 30-day import lease when GC first discovers it.
+immutable objects or packed into an archive. Exclude `local-v2`: it contains
+machine-local usage and revision metadata, which can be recreated. Restore the
+complete snapshot closure before running Cargo. Each complete snapshot restored
+without a usage receipt receives a single 30-day import lease when GC first discovers it.
 Subsequent collection does not renew that lease. Incomplete or corrupt graphs
 cannot keep otherwise unreferenced blobs alive.
 

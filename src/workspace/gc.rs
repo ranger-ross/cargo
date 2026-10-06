@@ -19,6 +19,7 @@
 //! module documentation for an in-depth explanation of how global cache
 //! tracking works.
 
+use crate::compiler::blob_storage::BlobStorage;
 use crate::context::{CargoCacheConfig, GlobalCleanConfig};
 use crate::ops::CleanContext;
 use crate::util::cache_lock::{CacheLock, CacheLockMode};
@@ -110,6 +111,8 @@ pub struct GcOpts {
     pub max_git_size: Option<u64>,
     /// The `--max-download-size` CLI option.
     pub max_download_size: Option<u64>,
+    /// The `--max-blob-size` CLI option.
+    pub max_blob_size: Option<u64>,
 }
 
 impl GcOpts {
@@ -124,6 +127,7 @@ impl GcOpts {
             || self.max_crate_size.is_some()
             || self.max_git_size.is_some()
             || self.max_download_size.is_some()
+            || self.max_blob_size.is_some()
     }
 
     /// Returns whether any download cache cleaning options based on size are set.
@@ -281,6 +285,9 @@ impl<'a, 'gctx> Gc<'a, 'gctx> {
     /// Performs garbage collection based on the given options.
     pub fn gc(&mut self, clean_ctx: &mut CleanContext<'gctx>, gc_opts: &GcOpts) -> CargoResult<()> {
         self.global_cache_tracker.clean(clean_ctx, gc_opts)?;
+        if let Some(blob_dir) = self.gctx.blob_storage_dir() {
+            BlobStorage::clean(&blob_dir, clean_ctx, gc_opts.max_blob_size)?;
+        }
         // In the future, other gc operations go here, such as target cleaning.
         Ok(())
     }

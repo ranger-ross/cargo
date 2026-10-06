@@ -101,6 +101,7 @@ Each new feature described below should explain how to use it.
     * [json-target-spec](#json-target-spec) --- Allows the use of `.json` custom target specs.
     * [hint-msrv](#hint-msrv) --- Allows Cargo to set `-Zhint-msrv`
     * [mem-stats](#mem-stats) --- Reports peak memory usage per build unit in `--timings`.
+    * [shared-blob-storage](#shared-blob-storage) --- Deduplicates build artifacts between workspaces
 * rustdoc
     * [rustdoc-map](#rustdoc-map) --- Provides mappings for documentation to link to external sites like [docs.rs](https://docs.rs/).
     * [scrape-examples](#scrape-examples) --- Shows examples within documentation.
@@ -2076,6 +2077,221 @@ option:
 [unstable]
 hint-msrv = true
 ```
+
+## shared-blob-storage
+* Tracking Issue: [rust-lang/cargo#17453](https://github.com/rust-lang/cargo/issues/17453)
+
+Enables shared blob storage and local or remote build caching for non-local build units.
+Blob storage deduplicates output files by their BLAKE3 content hashes. It prefers
+reflinks, uses hardlinks where later compiler writes and artifact metadata permit,
+and otherwise copies. It requires the new build-directory layout.
+
+You can set this via your global `~/.cargo/config.toml`, and nightly Cargo will
+automatically use it, while stable Cargo will silently ignore the unstable
+option:
+
+```toml
+[unstable]
+shared-blob-storage = true
+```
+
+### Blob storage and tracking
+
+The tracking system separates output contents from build and workspace identity:
+
+```text
+$CARGO_HOME/blobs/
+  <blob hash>
+$CARGO_HOME/shared-storage/
+  unit-output/<unit-output hash>
+  snapshots/<snapshot hash>
+  workspace-history/<workspace-id>/<snapshot hash>
+  cache-entries/<unit-hash>
+```
+
+A **unit output** contains relative output paths, blob hashes, and sizes. It is
+keyed by the BLAKE3 hash of its canonical contents and contains no unit identity.
+A **build snapshot** contains the sorted, unique unit-output hashes used by a
+successful invocation. It covers the non-local outputs participating in blob
+storage, including fresh units and restored cache entries.
+
+**Workspace history** records when a workspace last used each build snapshot.
+Each snapshot has its own file containing a Unix timestamp in seconds. Every
+successful use refreshes that file. The workspace ID hashes the canonical
+workspace root, so changing the build directory does not create another
+workspace history. This identity is local to the machine.
+
+Each eligible unit's short fingerprint can carry an optional unit-output hash:
+`<16-digit fingerprint>\nunit-output-v1 <64-digit unit-output hash>`.
+This field does not participate in fingerprint propagation. Fresh units reuse it
+without rehashing their output files. Cargo validates the unit output and blob
+sizes, recapturing outputs if storage is missing or incomplete. A rebuild clears
+the field before attaching a newly published unit output.
+
+Unit outputs and build snapshots use versioned binary formats with explicit path
+encodings. Workspace history uses decimal timestamps. These unstable formats
+are not a public compatibility contract. There are no per-blob usage timestamps,
+workspace receipts, cache revision tokens, or import grace periods.
+
+### Local build cache
+
+A **cache entry** is keyed by Cargo's unit hash and references a unit output.
+Cargo also checks a fingerprint and dependency-artifact guard before accepting
+an entry. Entries carry output permissions and modification times separately
+from the content-addressed unit output.
+
+The initial build cache restores immutable registry and Git library units for
+`cargo build` and `cargo check`. Local units, build scripts, proc-macros, and
+units depending on them are excluded. Forced builds, custom compiler commands,
+compiler wrappers, extra per-unit arguments, and artifact dependencies are also
+excluded.
+
+On a cache hit, Cargo verifies each blob's contents, restores the output tree,
+checks the environment dependencies recorded by rustc, regenerates Cargo's
+dep-info, and replays cached diagnostics. Inputs outside the immutable package
+cause a cache miss. A missing, corrupt, or incompatible entry falls back to
+compilation. Restored compiler outputs receive the current invocation timestamp
+so the next invocation can consider them fresh.
+
+Restoration uses private reflinks or copies because updating a hardlinked
+file's metadata would also change the blob. Before rebuilding a non-local rustc
+unit, Cargo removes its output tree to detach previously hardlinked artifacts.
+This protection applies even when shared blob storage is disabled for that
+invocation. Rustdoc output capture does not use hardlinks.
+
+Ordinary `cargo clean` removes build-directory outputs and leaves shared storage
+available for the next build. Cache writers must be trusted. Content hashes
+detect damaged bytes but do not authenticate their producer.
+
+### Remote build cache
+
+Configure `[cache.remote]` to share eligible library artifacts with
+[BuildBuddy](https://www.buildbuddy.io/) or another Bazel Remote Execution API
+(REAPI) cache. Cargo uses ActionCache for lookups and CAS/ByteStream for artifact
+transfer. It does not request remote execution.
+
+```toml
+[unstable]
+shared-blob-storage = true
+
+[cache.remote]
+url = "grpcs://remote.buildbuddy.io"
+instance-name = "cargo"
+api-key-env = "BUILDBUDDY_API_KEY"
+read-only = false
+timeout = 30
+```
+
+Set `BUILDBUDDY_API_KEY` in your environment to a BuildBuddy cache API key.
+Cargo sends its value as the `x-buildbuddy-api-key` gRPC header. Keep the key out
+of checked-in configuration.
+
+The remote configuration fields are:
+
+* `url` (required): a gRPC server origin. `grpcs://` and `https://` enable TLS
+  with system certificate roots. `grpc://` and `http://` use plaintext and are
+  suitable for a trusted local server. URLs cannot contain credentials, a path,
+  a query, or a fragment. Cargo's `[http]` options do not configure this transport.
+* `instance-name`: optional cache namespace, defaulting to the empty string.
+  Nested names such as `"organization/cargo"` are supported.
+* `api-key-env`: optional environment variable containing a BuildBuddy API key.
+  Omit it for a server that does not require authentication.
+* `read-only`: allows remote reads but prevents uploads, defaulting to `false`.
+* `timeout`: positive timeout in seconds, defaulting to `30`. It bounds connection
+  setup and each unary RPC. Streaming transfers apply it separately when waiting
+  for the next response chunk, handing off an upload chunk, or waiting for the
+  final upload acknowledgment. A progressing transfer or a unit's combined uploads
+  can take longer than this limit. Local file hashing does not count toward it.
+
+Local cache entries are tried first. A remote hit downloads and verifies the
+complete unit output before applying the existing fingerprint, source, and
+environment checks. SHA256 protects transfers through REAPI. Cargo also verifies
+the local BLAKE3 identities and rejects unexpected paths or metadata.
+
+Newly compiled eligible units can populate the remote cache. Local and remote
+cache hits are not republished. If a restored entry is rejected by the input
+checks and recompilation changes its inputs or outputs, the rebuilt entry can
+be published.
+
+Fresh builds do not contact the remote cache. Ordinary `cargo clean` retains the
+local shared cache, so rebuilding afterward can restore locally without any
+remote requests. It does not populate a newly configured remote cache from
+existing local hits. A remote-hit test needs both a clean build directory and an
+empty local shared cache.
+
+Enable cache diagnostics with:
+
+```sh
+CARGO_LOG=cargo::compiler::blob_storage=debug cargo build -Zshared-blob-storage -vv
+```
+
+Logs go to stderr. Initialization reports the local blob directory and whether
+the remote cache is enabled and read-only. Cache events distinguish:
+
+* `restored unit from local cache`: local artifacts satisfied the lookup, so no
+  remote request was needed. Ordinary `cargo clean` preserves this cache.
+* `remote cache miss`: the server had no action result for the unit's key.
+* `published unit to remote cache`: the unit's action result was published.
+  `FindMissingBlobs completed` reports how many blobs the server lacked.
+  Existing remote blobs do not need another upload.
+* `uploaded remote cache blob` and `downloaded remote cache blob`: completed
+  blob transfers, including their SHA256 digest and byte count.
+* `restored unit from remote cache`: the remote entry and its outputs were
+  downloaded or reused locally, verified, and restored.
+* `skipping remote publication of unchanged cache hit`: the restored unit is
+  still valid, so Cargo does not upload blobs or update its remote action result.
+
+For a fresh build, `-vv` shows `Fresh` packages. There are no cache lookups or
+transfers for those units. Uploads indicate newly compiled eligible units rather
+than accepted cache hits.
+
+Remote caching retains the local cache's eligibility and source-path checks.
+Use compatible toolchains, targets, flags, and source-cache layouts across
+machines. Cargo does not relocate embedded absolute paths. Incompatible entries
+fall back to compilation.
+
+`--offline`, `--frozen`, and `net.offline` disable all remote access. A remote
+failure emits a warning, disables further remote operations for that invocation,
+and leaves local caching and compilation available. Invalid remote configuration
+also disables only the remote cache.
+
+Remote cache writers must be trusted. Outputs can contain source paths, recorded
+environment values, and diagnostics. Content hashes detect corruption but do not
+authenticate the producer. Workspace history and build snapshots remain local.
+The server controls remote retention, and `cargo clean gc` only collects local
+storage.
+
+### Garbage collection
+
+Workspace history is the retention root. Automatic collection expires history
+after 30 days, walks retained build snapshots and unit outputs, and removes
+unreferenced blobs. A cache entry survives only while its unit output is retained
+by a build snapshot. A successful cache hit refreshes workspace history in the
+same way as a successful compilation. Failed builds do not refresh history.
+
+Snapshots without recent workspace history do not retain blobs. Unreadable or
+malformed history stops collection before deletion. Collection validates the
+metadata graph and blob sizes without rehashing every blob.
+
+Builds hold Cargo's shared package-cache lock to exclude garbage collection.
+Immutable objects are published atomically. Snapshot and workspace-history
+commits also take the package-cache download/append lock. Collection takes its
+exclusive mutation lock before traversing or deleting shared storage.
+
+To additionally enforce a logical blob-size limit, evicting the oldest build
+snapshots first, run:
+
+```console
+cargo clean gc -Zgc -Zshared-blob-storage --max-blob-size 10GiB
+```
+
+`--dry-run` changes neither metadata nor blobs. Size accounting counts each
+distinct blob once and excludes metadata and filesystem overhead. Collection
+leaves build-directory outputs intact. Removing a blob name may not free its
+data blocks while build-directory hardlinks still exist.
+
+Remote storage, remote cache lookup, and remote garbage collection are not
+implemented.
 
 ## builtin-dependencies
 * Tracking Issue: [rust-lang/cargo#16960](https://github.com/rust-lang/cargo/issues/16960)

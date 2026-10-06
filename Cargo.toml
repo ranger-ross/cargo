@@ -25,6 +25,7 @@ anstyle-progress = "0.1.0"
 anyhow = "1.0.102"
 async-trait = "0.1.89"
 base64 = "0.23.0"
+bazel-remote-apis = "0.29"
 blake3 = "1.8.4"
 build-rs = { version = "0.3.6", path = "crates/build-rs" }
 cargo = { path = "" }
@@ -86,6 +87,7 @@ percent-encoding = "2.3.2"
 proptest = "1.11.0"
 pulldown-cmark = { version = "0.13.3", default-features = false, features = ["html"] }
 rand = "0.10.1"
+reflink-copy = "0.1.30"
 regex = "1.12.3"
 rusqlite = { version = "0.40.0", features = ["bundled"] }
 rustc-hash = "2.1.2"
@@ -111,10 +113,12 @@ tar = { version = "0.4.45", default-features = false }
 tempfile = "3.27.0"
 thiserror = "2.0.18"
 time = { version = "0.3.47", features = ["parsing", "formatting", "serde"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "sync", "fs", "io-util"] }
 toml = { version = "1.1.5", default-features = false }
 toml_edit = { version = "0.25.10", features = ["serde"] }
 toml_parser = "1.1.2"
 toml_writer = "1.1.1"
+tonic = { version = "0.14", features = ["transport", "tls-native-roots", "tls-ring"] }
 tracing = { version = "0.1.44", default-features = false, features = ["std"] } # be compatible with rustc_log: https://github.com/rust-lang/rust/blob/e51e98dde6a/compiler/rustc_log/Cargo.toml#L9
 tracing-chrome = "0.7.2"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
@@ -202,6 +206,7 @@ os_info.workspace = true
 pathdiff.workspace = true
 portable-atomic.workspace = true
 rand.workspace = true
+reflink-copy.workspace = true
 regex.workspace = true
 rusqlite = { workspace = true, features = ["fallible_uint"] }
 rustc-hash.workspace = true
@@ -232,6 +237,10 @@ unicode-ident.workspace = true
 url.workspace = true
 walkdir.workspace = true
 winnow.workspace = true
+parking_lot = "0.12.5"
+bazel-remote-apis.workspace = true
+tonic.workspace = true
+tokio.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
@@ -269,6 +278,7 @@ gix = { workspace = true, features = ["revision"] }
 # to allow sending credentials over HTTP connections.
 gix-transport = { workspace = true, features = ["http-client-insecure-credentials"] }
 same-file.workspace = true
+sha2.workspace = true
 snapbox.workspace = true
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]

@@ -50,6 +50,8 @@ pub struct BuildRunner<'a, 'gctx> {
     pub build_explicit_deps: HashMap<Unit, BuildDeps>,
     /// Fingerprints used to detect if a unit is out-of-date.
     pub fingerprints: HashMap<Unit, Arc<Fingerprint>>,
+    /// Whether a unit and all its dependencies can use the local build cache.
+    pub(super) local_cache_eligible: HashMap<Unit, bool>,
     /// Cache of file mtimes to reduce filesystem hits.
     pub mtime_cache: HashMap<PathBuf, FileTime>,
     /// Cache of file checksums to reduce filesystem reads.
@@ -121,6 +123,7 @@ impl<'a, 'gctx> BuildRunner<'a, 'gctx> {
             compilation: Compilation::new(bcx)?,
             build_script_outputs: Arc::new(Mutex::new(BuildScriptOutputs::default())),
             fingerprints: HashMap::default(),
+            local_cache_eligible: HashMap::default(),
             mtime_cache: HashMap::default(),
             checksum_cache: HashMap::default(),
             compiled: HashSet::default(),
@@ -205,7 +208,13 @@ impl<'a, 'gctx> BuildRunner<'a, 'gctx> {
         }
 
         // Now that we've figured out everything that we're going to do, do it!
-        queue.execute(&mut self)?;
+        let result = queue.execute(&mut self);
+        if let Some(blob_storage) = self.files().blob_storage()
+            && let Err(err) = blob_storage.finish(self.bcx.gctx, result.is_ok())
+        {
+            tracing::warn!(?err, "failed to save build snapshot");
+        }
+        result?;
 
         // Add `OUT_DIR` to env vars if unit has a build script.
         let units_with_build_script = &self
@@ -455,7 +464,7 @@ impl<'a, 'gctx> BuildRunner<'a, 'gctx> {
 
         self.record_units_requiring_metadata();
 
-        let files = CompilationFiles::new(self, host_layout, targets);
+        let files = CompilationFiles::new(self, host_layout, targets)?;
         self.files = Some(files);
         Ok(())
     }

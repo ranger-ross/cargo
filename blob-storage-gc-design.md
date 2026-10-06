@@ -1,164 +1,119 @@
-# Blob storage GC design
+# Blob storage / cache design
 
-## 1. Purpose and scope
+## Scope
 
-The cache shares identical build outputs across builds and workspaces. Garbage collection removes outputs that no retained build snapshot needs.
+Blob storage deduplicates non-local compiler outputs and supplies the content-addressed data for a local build cache. Tracking uses unit outputs, build snapshots, and workspace history. Remote storage, remote cache lookup, and remote garbage collection are not implemented.
 
-The main rules are:
+Enable the implementation with `-Zshared-blob-storage` and the new build-directory layout. Local packages are not stored. Build-cache restoration has stricter eligibility than blob deduplication.
 
-- Keep recently used snapshots.
-- Delete older snapshots when necessary to meet a size limit.
-- Keep shared files until their last retained reference disappears.
-- Never delete build-directory files.
-- Store everything needed for transport without a shared database.
+## Storage graph
 
-Blob metadata no longer uses SQLite. Cargo's separate `.global-cache` database still handles unrelated cache tracking and GC scheduling.
-
-The current capture path covers eligible non-local build units using the new build-directory layout. A snapshot describes their recorded outputs, rather than every output or input in the entire workspace.
-
-## 2. What is stored
-
-| Item | Meaning |
-|---|---|
-| Blob | One output file's contents, named by its BLAKE3 hash. |
-| Unit inventory | A list of output paths, blob hashes, and sizes for one recorded build step. |
-| Snapshot | A sorted, duplicate-free list of unit inventories used by a successful build. |
-| Local receipt | Last-used snapshot times for one build directory. |
-| Import receipt | Temporary retention records for snapshots restored without local receipts. |
-| Inventory pointer | Optional cache revision and inventory ID in a unit's short fingerprint. |
-| Cache revision | A random token invalidating pointers after cache loss or GC mutation. |
+```text
+Workspace history -> Build snapshot -> Unit output -> Blob
+                       Cache entry -> Unit output
+```
 
 ```text
 $CARGO_HOME/blobs/
-  <hash>                  Blob contents
-  units-v1/<hash>          Unit inventory
-  snapshots-v1/<hash>      Snapshot
-  local-v2/<directory-id>  Local snapshot usage
-  local-v2/imports         Import retention records
-  local-v2/revision        Cache identity and invalidation token
+  <blob hash>
+$CARGO_HOME/shared-storage/
+  unit-output/<unit-output hash>
+  snapshots/<snapshot hash>
+  workspace-history/<workspace-id>/<snapshot hash>
+  cache-entries/<unit-hash>
 ```
 
-Blobs, inventories, and snapshots are immutable: changing their contents changes their names. Receipts are mutable and replaced atomically.
+A blob contains one file's bytes and is named by its lowercase hexadecimal BLAKE3 hash. Blobs remain in a flat directory.
 
-Manifests use versioned binary formats with explicit path encodings. They contain no machine-specific build-directory identifiers or usage timestamps.
+A unit output contains sorted, unique relative output paths, blob hashes, and sizes. Its name hashes its canonical serialized contents. It contains no Cargo unit identity, workspace identity, permissions, or timestamps. Compiler dep-info and cached diagnostics are output files and can be referenced like other blobs.
 
-Usage-only receipts start with `cargo-shared-blob-state-v2\0`, followed by a little-endian u64 count and sorted `(32-byte snapshot ID, u64 last-used timestamp)` entries. The revision file starts with `cargo-shared-blob-revision-v1\0` followed by 32 random bytes. Receipt enumeration excludes this file.
+A build snapshot contains the sorted, unique unit-output hashes used by one successful build or check. It covers the non-local outputs participating in blob storage. Fresh units, newly compiled units, and cache hits all contribute. Identical sets produce identical snapshot hashes.
 
-## 3. Recording a build
+Workspace history has a separate file for each workspace/snapshot pair. The file contains decimal Unix seconds followed by a newline. Every successful invocation updates its snapshot's timestamp. No per-blob timestamp or workspace-wide history file is rewritten.
 
-1. Read the cache revision and check whether the build directory has a receipt.
-2. Read each eligible unit's inventory pointer from its short fingerprint.
-3. Reuse a fresh unit's inventory directly if that pointer's revision matches and a receipt exists.
-4. Otherwise validate that inventory's hash and encoding and its blobs' regular-file status and sizes. Reuse it if complete; capture outputs if missing or invalid.
-5. Publish each captured inventory before attaching its fingerprint pointer.
-6. After a successful build, publish the full used-inventory snapshot and update its usage receipt.
+The local workspace ID is the BLAKE3 hash of the canonical workspace-root path's native bytes. It is independent of the build directory. Separate build directories and targets can contribute different snapshots to the same history. This is a local identity, not a remote workspace identity.
 
-The short fingerprint remains a 16-digit hexadecimal hash, optionally followed by `\nblob-v1 <64-digit revision> <64-digit inventory ID>`. This metadata does not affect Cargo's freshness hash or diagnostic JSON. There are no separate pointer files or local unit tables.
+## Fingerprints and build recording
 
-Dirty units clear their in-memory pointer. Successful compilation writes a plain fingerprint before capture; tracking-disabled rebuilds therefore cannot retain an old pointer. Failed capture leaves a valid plain fingerprint, allowing the next enabled build to capture its outputs.
-
-A newly created store or recreated `local-v2` gets a new revision. GC rotates it before invalidating managed data. Revision validation is per pointer, not per receipt: validating `bar` must not validate a dormant `foo` feature variant. Missing receipts also require per-pointer validation, even if the revision matches.
-
-Ordinary fresh builds with matching revisions avoid per-unit inventory I/O and output hashing. After a revision change, surviving inventories need only metadata checks, not blob content hashing or recapture.
-
-Identical recorded output sets produce the same snapshot ID. Different feature combinations can retain separate snapshots while sharing unchanged blobs.
-
-Failed builds can save completed unit inventories, but they do not create or refresh a successful-build snapshot. Those inventories alone do not protect blobs from GC.
-
-## 4. Retention rules
-
-### Normal usage
-
-A snapshot remains eligible for retention while at least one build directory has recorded using it within the last 30 days.
-
-Usage updates are limited to once every four hours per build-directory/snapshot pair. One workspace's update does not suppress another workspace's update.
-
-GC uses the most recent retained usage across all receipts.
-
-This makes age approximate: recorded usage can lag actual usage by almost four hours. Wall-clock changes can also affect expiry.
-
-### Restored snapshots
-
-A complete snapshot with no usage record receives a 30-day grace period, starting when local GC first discovers it.
-
-Ordinary GC does not renew that period. Expired records are considered before assigning new import periods, preventing automatic renewal during normal collection.
-
-This is local retention. A new machine, deleted receipts, or some interrupted deletion sequences can result in a new grace period.
-
-### Size pressure
-
-An explicit size limit can evict snapshots before their 30 days expire.
-
-GC counts each distinct blob once, then removes the oldest snapshots until retained blob contents fit the limit. Equal usage times are ordered by snapshot hash for consistent results.
-
-The limit excludes manifest files, receipts, temporary files, and filesystem overhead. A zero-byte limit therefore does not guarantee an entirely empty cache directory.
-
-## 5. Collection procedure
-
-GC prepares the complete deletion plan before changing the blob store.
-
-1. Find managed files. List blobs, inventories, snapshots, and receipts.
-2. Validate inventories. Check their hashes and structure, and require referenced blobs to exist with the declared sizes.
-3. Validate snapshots. Require every referenced inventory to be valid and complete.
-4. Choose retained snapshots. Apply recorded usage, import grace periods, and the age cutoff.
-5. Apply the size limit. Remove oldest snapshots while tracking which inventories and blobs remain shared.
-6. Rotate the revision before receipt invalidation or managed-object deletion. No-op collection and dry runs preserve it.
-7. Update receipts. Remove obsolete usage entries; delete empty receipts.
-8. Delete unused objects. Remove snapshot files first, then inventories, then blobs. Remove obsolete `local-v1` metadata and recognized legacy database and timestamp files as well.
-
-For example:
+An eligible unit's short fingerprint may contain:
 
 ```text
-Snapshot A -> blobs X, Y
-Snapshot B -> blobs Y, Z
+<16-digit fingerprint>
+unit-output-v1 <64-digit unit-output hash>
 ```
 
-Evicting A removes X. Y remains because B still needs it.
+The unit-output hash is excluded from Cargo's fingerprint hash and diagnostic JSON. It does not propagate to dependent fingerprints or implement early cutoff.
 
-Blobs without any retained snapshot are eligible for removal immediately; their file modification times do not grant retention.
+1. Load fingerprints while building the unit graph.
+2. Reuse a fresh unit's unit-output hash after validating its metadata and referenced blob sizes. This does not rehash output files.
+3. For a rebuilt or previously untracked unit, hash and deduplicate its output files, then publish its unit output.
+4. Attach the unit-output hash to the fingerprint only after publication.
+5. After a successful invocation, publish the build snapshot and update its workspace-history file.
 
-## 6. Safety and failure handling
+Dirty units clear their optional hash. A successful rebuild without tracking writes a plain fingerprint, so re-enabling tracking cannot reuse an obsolete unit output. Missing or damaged metadata is recaptured from still-fresh compiler outputs.
 
-### Concurrent builds
+A failed invocation may leave completed unit outputs and cache entries, but it does not create or refresh a build snapshot. These objects alone do not retain blobs during garbage collection.
 
-Builds hold Cargo's shared package-cache lock. GC requires the exclusive mutation lock, so it cannot remove blobs while participating builds are using or publishing them.
+## Local build cache
 
-Initialization and successful snapshot/usage commits use the exclusive download lock. Workers can publish immutable inventories under the build-wide shared lock before attaching fingerprint pointers. These locks protect local Cargo processes; they do not coordinate remote machines.
+A cache entry is keyed by Cargo's unit hash and references a unit output. It also contains a guard derived from Cargo's fingerprint and the dependency artifacts supplied to the compiler. The guard protects against changed compiler inputs, including changed transitive environment-dependent outputs. Dependency artifact hashing is needed for cache lookup/publication, not ordinary fresh-build usage tracking.
 
-### Corrupt or incomplete data
+Initial eligibility is immutable registry or Git library units in build or non-test check mode. Local units, build scripts, proc-macros, and their transitive consumers are excluded. Artifact dependencies, per-unit extra arguments, forced rebuilds, custom compiler commands, and compiler wrappers are excluded. Custom executors are excluded unless they explicitly opt into local caching.
 
-- Invalid manifests and missing or wrong-sized blobs make affected snapshots ineligible for retention.
-- An unreadable or corrupt receipt stops blob GC before deletion. It may contain usage that would otherwise protect data.
-- Unexpected non-regular metadata files also stop collection.
-- Unrecognized files are left alone.
+On a cache hit:
 
-GC does not hash every blob's contents. Same-size corruption can remain until reuse.
+1. Read the cache entry and check its input guard.
+2. Read the referenced unit output and validate native relative output paths.
+3. Stage private reflinks or copies and verify every blob's BLAKE3 hash before replacing the output tree.
+4. Check rustc's recorded environment dependencies and reject source inputs outside the immutable package.
+5. Regenerate Cargo's translated dep-info, replay cached diagnostics, and notify the scheduler when metadata is available.
+6. Persist the fingerprint and include the unit output in the successful build snapshot.
 
-Before cached bytes replace compiler outputs, their hash is checked. Incorrect contents and stored symlinks are repaired from the existing compiler output.
+Missing, corrupt, or incompatible entries fall back to compilation. A clean build directory can restore dependencies without invoking rustc, while local packages still compile.
 
-### Interrupted writes and deletion
+Permissions and modification times are stored in the cache entry, separate from the unit-output identity. Restored compiler outputs receive the current invocation timestamp to preserve subsequent freshness. Restoration therefore uses private reflinks or copies rather than hardlinks.
 
-Files are staged and renamed into place. Publication writes referenced inventories before fingerprint pointers, snapshots before receipts, and receipts last.
+Cache entries are not independent garbage-collection roots. An entry remains available while a retained build snapshot references its unit output. A successful cache hit refreshes workspace history. This resolves cache-entry retention without adding a timestamp to each entry or changing build-snapshot identity.
 
-Collection rotates the revision before invalidating receipts or deleting objects. An interruption can leave extra data, and a later run may retain some of it again. Old fingerprint pointers must still validate individually against the new revision.
+## Deduplication and hardlink safety
 
-This provides ordered, atomic file replacement, not a database transaction or a guarantee against every power-loss scenario.
+Capture prefers reflinks, then hardlinks where permitted, then copies. Reuse through a hardlink requires compatible permissions and modification times. A private replacement preserves the original compiler output's metadata. Cached bytes are verified before replacing good compiler output.
 
-### Existing build outputs
+Before any dirty non-local rustc invocation, Cargo removes the per-unit output tree. This detaches artifacts, raw dep-info, and auxiliary outputs from blobs before a compiler or linker can truncate them. It also applies when tracking is disabled for that invocation.
 
-GC removes cache entries, not build-directory outputs. Removing a cache entry may free less disk space than its reported size because build outputs can still share the underlying data.
+Rustdoc capture does not use hardlinks because its output-writing lifecycle differs. Cache restoration remains private because the compiler updates restored timestamps.
 
-A blob-store dry run changes neither receipts nor objects.
+Hardlinked output files and cache contents must not be modified by external tools in place. Cache writers must be trusted. BLAKE3 verifies contents, not provenance.
 
-## 7. When GC runs
+## Locking and publication
 
-Blob collection uses Cargo's existing GC scheduling:
+The implementation reuses Cargo's package-cache locking system for local coordination:
 
-- Automatic collection normally runs at most once a day.
-- It is skipped offline.
-- Automatic collection skips rather than waits when the required lock is busy.
-- `cache.auto-clean-frequency` controls the schedule.
-- Automatic blob collection applies age retention without a default blob-size cap.
+- Builds hold its shared lock for the storage lifetime, excluding garbage collection.
+- Immutable object writes use staged atomic publication.
+- Snapshot and workspace-history commits also hold the download/append lock.
+- Garbage collection holds the exclusive mutation lock before traversing or deleting shared storage.
+
+Publication orders blobs before unit outputs, unit outputs before fingerprint hashes and cache entries, and build snapshots before workspace history. A crash can leave unreferenced objects. Garbage collection removes them later. Unrecognized files, including interrupted staging files, are left alone.
+
+There is no remote locking protocol.
+
+## Garbage collection
+
+Workspace history is the retention root. Automatic collection uses the existing Cargo GC schedule and a 30-day maximum age. It is skipped offline and does not wait for a busy automatic-GC lock.
+
+Under the exclusive mutation lock:
+
+1. Read workspace histories and identify recent build snapshots.
+2. Validate build snapshots and their unit outputs.
+3. Walk unit outputs to discover referenced blobs, checking regular-file status and sizes.
+4. If a size limit is requested, evict the oldest snapshots until retained blobs fit. Count each distinct blob once.
+5. Remove expired history files and cache entries whose unit outputs are no longer retained.
+6. Remove unretained build snapshots, unit outputs, and blobs.
+
+The collector prepares the complete plan before deletion. Unreadable or malformed recognized history files stop collection because they may hide a live root. Incomplete snapshots do not retain blobs. Blob contents are not rehashed during collection.
+
+Snapshots without recent workspace history do not receive an import grace period. There are no cache revision tokens, workspace receipts, or throttled history updates.
 
 Manual size-limited collection:
 
@@ -166,82 +121,23 @@ Manual size-limited collection:
 cargo clean gc -Zgc -Zshared-blob-storage --max-blob-size 10GiB
 ```
 
-Preview the same operation:
+Add `--dry-run` to preview without changing metadata or blobs. Logical size excludes metadata and filesystem overhead. Collection does not delete build-directory outputs. A blob's data blocks may remain allocated while build-directory hardlinks exist. Ordinary `cargo clean` leaves shared storage available for restoration.
 
-```sh
-cargo clean gc -Zgc -Zshared-blob-storage --max-blob-size 10GiB --dry-run
-```
+## Metadata formats
 
-Ordinary `cargo clean` removes build outputs without clearing the shared blob cache.
+Formats are versioned binary records, except workspace-history timestamps. They are unstable implementation details, not a public compatibility promise.
 
-## 8. Remote storage
+- Unit output: `cargo-shared-storage-unit-output-v1\0`, path-encoding byte, u64 count, then repeated u64 path length, path bytes, 32-byte blob hash, and u64 size.
+- Build snapshot: `cargo-shared-storage-snapshot-v1\0`, u64 count, and sorted unique 32-byte unit-output hashes.
+- Cache entry: `cargo-shared-storage-cache-entry-v1\0`, 32-byte unit-output hash, u64 input guard, u64 count, then output metadata in canonical path order: u32 permission bits, i64 modification-time seconds, and u32 nanoseconds.
+- Workspace history: decimal Unix seconds and a newline.
 
-Transfer blobs, inventories, and snapshots. Exclude `local-v2`, including its revision token.
+Integers are little-endian. Path encodings distinguish Unix bytes, Windows UTF-16 code units, and UTF-8 fallback. Paths are relative to the unit directory. Restoration accepts only paths within its output tree. Metadata traversal does not require native path decoding, while restoration requires the native encoding.
 
-A complete transfer includes each snapshot and every inventory and blob it references. Restore that complete set before running Cargo.
+## Remaining design boundaries
 
-### S3
-
-The layout maps directly to immutable object keys:
-
-1. Upload blobs.
-2. Upload unit inventories.
-3. Upload snapshots last.
-
-[S3 conditional writes](https://docs.aws.amazon.com/AmazonS3/latest/userguide/conditional-writes.html) can avoid replacing existing objects.
-
-Remote deletion needs separate coordination with all uploaders. Publishing snapshots last alone does not prevent a remote collector from deleting an upload's not-yet-referenced blobs. One machine's local retention records cannot determine what every other machine still needs.
-
-### GitHub Actions cache
-
-[Actions caches](https://docs.github.com/en/actions/reference/workflows-and-actions/dependency-caching) store immutable archives. Bundle complete snapshots and their files, using a new cache key when contents change.
-
-GitHub retains or removes whole archives under its own policies. Cargo GC only manages the restored local copy. Separate archives may duplicate shared blobs.
-
-### Boundaries
-
-The implementation does not include cloud network clients or remote lookup that skips compilation. Compiled outputs can still depend on their toolchain, target, flags, and paths.
-
-Hashes detect changed contents; they do not establish who produced them. Cache writers should be trusted.
-
-## 9. Cost, migration, and verification
-
-Fresh-build tracking stays small, but GC scans the stored metadata and keeps its reference counts in memory. GC work and memory grow with the cache. It avoids reading all blob contents.
-
-Existing blob bytes and immutable manifest formats are reused. Old SQLite and `local-v1` metadata are not read; enabled builds recreate pointers and usage receipts. GC removes recognized obsolete metadata without following directory symlinks.
-
-Verification of the fingerprint-pointer implementation:
-
-- 55 compiler unit tests and 20 blob-storage integration tests passed.
-- 52 freshness tests passed; 26 were ignored.
-- Formatting, strict Clippy, and the release build passed.
-- Release CLI runs covered feature switches, disabled-tracking rebuilds, failed rebuilds, GC eviction, and recapture from still-fresh outputs.
-- The regression suite also covers archive restoration, corrupt cached contents, new cache identities, and dormant feature variants after GC.
-
-Fresh Zed builds used Rust 1.97.1, four warmup rounds, and 30 randomized interleaved measured rounds. Separate copied target directories kept the old binary from reading the new fingerprint format.
-
-| Tracking design | Disabled | Enabled |
-|---|---:|---:|
-| Previous unit table | 582.37 ms | 585.33 ms |
-| Fingerprint pointers | 582.49 ms | 581.08 ms |
-
-Run-to-run standard deviations were 8-12 ms. The new tracking overhead was below the measurement noise; the negative measured difference is not evidence of a speedup.
-
-A separate post-GC benchmark used private filesystem mounts over copied cache and build directories. GC removed one unreferenced blob per round, preserving Zed's 1,359 inventories and 20,337 distinct blobs. Over 20 measured paired rounds:
-
-- Ordinary fresh build: 603.70 ms.
-- First build after GC: 709.52 ms.
-- One-time revision validation overhead: 105.82 ms.
-- GC itself: 74.97 ms.
-
-All 1,595 compiler artifacts remained fresh. Surviving inventory files were not replaced, and the live cache's revision was unchanged. Evicted inventories require recapture, so this measurement describes validation of surviving data rather than recovery of an empty cache. The namespace and offline setup differs from the ordinary fresh-build benchmark.
-
-Raw samples and commands are in `target/blob-snapshot-bench/fingerprint-interleaved.json` and `target/blob-snapshot-bench/fingerprint-post-gc.json`. Actual S3 and GitHub Actions transfers were not exercised.
-
-Core implementation:
-
-- `src/compiler/blob_storage/format.rs`: file formats.
-- `src/compiler/blob_storage/snapshots.rs`: retention and deletion planning.
-- `src/compiler/blob_storage/mod.rs`: capture, publication, and safe blob reuse.
-- `src/compiler/fingerprint/mod.rs`: optional inventory pointers and freshness handling.
-- `src/workspace/gc.rs`: scheduling and GC entry points.
+- Remote workspace identity and protocols are unresolved and not implemented.
+- Remote garbage collection needs its own retention and publication coordination.
+- Unit outputs and cache entries remain separate because they have different keys and responsibilities.
+- Local packages, build-script opt-in, proc-macro opt-in, and rebuild early cutoff remain outside this implementation.
+- Sharding blob paths is deferred. The blob directory is flat as specified.

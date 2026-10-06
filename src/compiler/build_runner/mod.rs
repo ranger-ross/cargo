@@ -50,6 +50,8 @@ pub struct BuildRunner<'a, 'gctx> {
     pub build_explicit_deps: HashMap<Unit, BuildDeps>,
     /// Fingerprints used to detect if a unit is out-of-date.
     pub fingerprints: HashMap<Unit, Arc<Fingerprint>>,
+    /// Whether a unit and all its dependencies can use the local build cache.
+    pub(super) local_cache_eligible: HashMap<Unit, bool>,
     /// Cache of file mtimes to reduce filesystem hits.
     pub mtime_cache: HashMap<PathBuf, FileTime>,
     /// Cache of file checksums to reduce filesystem reads.
@@ -121,6 +123,7 @@ impl<'a, 'gctx> BuildRunner<'a, 'gctx> {
             compilation: Compilation::new(bcx)?,
             build_script_outputs: Arc::new(Mutex::new(BuildScriptOutputs::default())),
             fingerprints: HashMap::default(),
+            local_cache_eligible: HashMap::default(),
             mtime_cache: HashMap::default(),
             checksum_cache: HashMap::default(),
             compiled: HashSet::default(),
@@ -209,7 +212,7 @@ impl<'a, 'gctx> BuildRunner<'a, 'gctx> {
         if let Some(blob_storage) = self.files().blob_storage()
             && let Err(err) = blob_storage.finish(self.bcx.gctx, result.is_ok())
         {
-            tracing::warn!(?err, "failed to save blob snapshot");
+            tracing::warn!(?err, "failed to save build snapshot");
         }
         result?;
 

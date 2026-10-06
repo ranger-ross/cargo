@@ -185,13 +185,9 @@ impl<'a, 'gctx: 'a> CompilationFiles<'a, 'gctx> {
             .gctx
             .blob_storage_dir()
             .and_then(|shared| {
-                BlobStorage::new(
-                    shared,
-                    build_runner.bcx.ws.build_dir().as_path_unlocked(),
-                    build_runner.bcx.gctx,
-                )
-                .inspect_err(|err| warn!(?err, "Could not initialize blob storage, disabling"))
-                .ok()
+                BlobStorage::new(shared, build_runner.bcx.ws.root(), build_runner.bcx.gctx)
+                    .inspect_err(|err| warn!(?err, "Could not initialize blob storage, disabling"))
+                    .ok()
             })
             .map(Arc::new);
         Ok(CompilationFiles {

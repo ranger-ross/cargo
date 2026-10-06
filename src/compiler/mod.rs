@@ -42,6 +42,7 @@ pub mod future_incompat;
 pub(crate) mod job_queue;
 pub(crate) mod layout;
 mod links;
+mod local_cache;
 mod locking;
 mod lto;
 mod output_depinfo;
@@ -153,6 +154,12 @@ pub trait Executor: Send + Sync + 'static {
     fn force_rebuild(&self, _unit: &Unit) -> bool {
         false
     }
+
+    /// Whether immutable units may bypass this executor using the local cache.
+    /// Custom executors opt out so their compilation hooks are always honored.
+    fn supports_local_cache(&self) -> bool {
+        false
+    }
 }
 
 /// A `DefaultExecutor` calls rustc without doing anything else. It is Cargo's
@@ -175,6 +182,10 @@ impl Executor for DefaultExecutor {
         let (stats, result) =
             cmd.exec_with_streaming(on_stdout_line, on_stderr_line, false, capture_rusage);
         (stats, result.map(drop))
+    }
+
+    fn supports_local_cache(&self) -> bool {
+        true
     }
 }
 
@@ -238,11 +249,28 @@ fn compile<'gctx>(
         } else {
             let force = exec.force_rebuild(unit) || force_rebuild;
             let mut job = fingerprint::prepare_target(build_runner, unit, force)?;
+            let blob_storage = should_dedup_out_dir(build_runner, unit)
+                .then(|| build_runner.files().blob_storage())
+                .flatten();
+            let retained = blob_storage.as_ref().and_then(|storage| {
+                match storage.prepare_unit(build_runner.fingerprints[unit].unit_output()) {
+                    Ok(retained) => retained,
+                    Err(err) => {
+                        debug!(?unit, ?err, "failed to track unit output");
+                        None
+                    }
+                }
+            });
+            let local_cache = if blob_storage.is_some() && retained.is_none() {
+                local_cache::LocalCache::new(build_runner, unit, exec, force)?
+            } else {
+                None
+            };
             job.before(if job.freshness().is_dirty() {
                 let work = if unit.mode.is_doc() || unit.mode.is_doc_scrape() {
                     rustdoc(build_runner, unit)?
                 } else {
-                    rustc(build_runner, unit, exec)?
+                    rustc(build_runner, unit, exec, local_cache.clone())?
                 };
                 work.then(link_targets(build_runner, unit, false)?)
             } else {
@@ -259,46 +287,38 @@ fn compile<'gctx>(
                 work.then(link_targets(build_runner, unit, true)?)
             });
 
-            if should_dedup_out_dir(build_runner, unit)
-                && let Some(blob_storage) = build_runner.files().blob_storage()
+            if let Some(blob_storage) = blob_storage
+                && retained.is_none()
             {
-                let fingerprint = &build_runner.fingerprints[unit];
-                let previous = if job.freshness().is_dirty() {
-                    None
-                } else {
-                    fingerprint.blob_inventory()
-                };
-                match blob_storage.prepare_unit(previous) {
-                    Ok(Some(record)) if Some(record) == previous => {}
-                    Ok(Some(record)) => {
-                        let loc = build_runner.files().fingerprint_file_path(unit, "");
-                        let fingerprint = Arc::clone(fingerprint);
-                        job.after(Work::new(move |_state| {
-                            if let Err(err) = fingerprint.record_blob_inventory(&loc, record) {
-                                debug!(?loc, ?err, "failed to update blob inventory pointer");
+                let fingerprint = Arc::clone(&build_runner.fingerprints[unit]);
+                let unit_dir = build_runner.files().build_unit_dir(unit);
+                let out_dir = build_runner.files().out_dir_new_layout(unit);
+                let loc = build_runner.files().fingerprint_file_path(unit, "");
+                let messages = build_runner.files().message_cache_path(unit);
+                let hardlink_allowed = !unit.mode.is_doc() && !unit.mode.is_doc_scrape();
+                job.after(Work::new(move |_state| {
+                    let result = (|| {
+                        let restored = local_cache.as_ref().and_then(|cache| cache.restored());
+                        let unit_output = match restored {
+                            Some(unit_output) => unit_output,
+                            None => {
+                                if local_cache.is_some() && messages.is_file() {
+                                    paths::copy(&messages, &out_dir.join(".cargo-output"))?;
+                                }
+                                blob_storage.capture_unit(&unit_dir, &out_dir, hardlink_allowed)?
                             }
-                            Ok(())
-                        }));
+                        };
+                        fingerprint.record_unit_output(&loc, unit_output)?;
+                        if let Some(cache) = &local_cache {
+                            cache.publish(unit_output)?;
+                        }
+                        CargoResult::Ok(())
+                    })();
+                    if let Err(err) = result {
+                        debug!(?unit_dir, ?err, "failed to publish unit output");
                     }
-                    Ok(None) => {
-                        let unit_dir = build_runner.files().build_unit_dir(unit);
-                        let out_dir = build_runner.files().out_dir_new_layout(unit);
-                        let loc = build_runner.files().fingerprint_file_path(unit, "");
-                        let fingerprint = Arc::clone(fingerprint);
-                        job.after(Work::new(move |_state| {
-                            let result = blob_storage
-                                .capture_unit(&unit_dir, &out_dir)
-                                .and_then(|record| fingerprint.record_blob_inventory(&loc, record));
-                            if let Err(err) = result {
-                                debug!(?unit_dir, ?err, "failed to capture blob outputs");
-                            }
-                            Ok(())
-                        }));
-                    }
-                    Err(err) => {
-                        debug!(?unit, ?err, "failed to track blob outputs");
-                    }
-                }
+                    Ok(())
+                }));
             }
 
             // If -Zfine-grain-locking is enabled, we wrap the job with an upgrade to exclusive
@@ -359,6 +379,7 @@ fn rustc(
     build_runner: &mut BuildRunner<'_, '_>,
     unit: &Unit,
     exec: &Arc<dyn Executor>,
+    local_cache: Option<Arc<local_cache::LocalCache>>,
 ) -> CargoResult<Work> {
     let mut rustc = prepare_rustc(build_runner, unit)?;
 
@@ -366,6 +387,20 @@ fn rustc(
 
     let outputs = build_runner.outputs(unit)?;
     let root = build_runner.files().output_dir(unit);
+    let detach_out_dir = (build_runner.bcx.gctx.cli_unstable().build_dir_new_layout
+        && !unit.is_local())
+    .then(|| build_runner.files().out_dir_new_layout(unit));
+    let rmeta_required = build_runner.rmeta_required(unit);
+    let message_cache = build_runner.files().message_cache_path(unit);
+    let mut cache_replay = local_cache.as_ref().map(|_| {
+        replay_output_cache(
+            unit.pkg.package_id(),
+            ManifestErrorContext::new(build_runner, unit),
+            &unit.target,
+            message_cache.clone(),
+            OutputOptions::for_fresh(build_runner, unit),
+        )
+    });
 
     // Prepare the native lib state (extra `-L` and `-l` flags).
     let build_script_outputs = Arc::clone(&build_runner.build_script_outputs);
@@ -475,6 +510,74 @@ fn rustc(
                 add_plugin_deps(&mut rustc, &script_outputs, &build_scripts, root_output)?;
             }
             add_custom_flags(&mut rustc, &script_outputs, script_metadatas)?;
+        }
+
+        if let Some(cache) = &local_cache {
+            let restored = (|| {
+                let Some(unit_output) = cache.restore()? else {
+                    return CargoResult::Ok(false);
+                };
+                local_cache::validate_dep_info(&rustc_dep_info_loc, &rustc, &cwd, &pkg_root)?;
+                for output in outputs.iter().filter(|output| {
+                    !matches!(output.flavor, FileFlavor::DebugInfo | FileFlavor::Auxiliary)
+                }) {
+                    anyhow::ensure!(
+                        output.path.is_file(),
+                        "cache entry is missing compiler output {}",
+                        output.path.display()
+                    );
+                }
+                let timestamp = paths::set_invocation_time(&fingerprint_dir)?;
+                fingerprint::translate_dep_info(
+                    &rustc_dep_info_loc,
+                    &dep_info_loc,
+                    &cwd,
+                    &pkg_root,
+                    &build_dir,
+                    &rustc,
+                    is_local,
+                    &env_config,
+                )?;
+                paths::set_file_time_no_err(&dep_info_loc, timestamp);
+                for output in outputs.iter() {
+                    paths::set_file_time_no_err(&output.path, timestamp);
+                }
+                let messages = root.join(".cargo-output");
+                if messages.is_file() {
+                    paths::copy(&messages, &message_cache)?;
+                }
+                cache_replay
+                    .take()
+                    .expect("cache replay work")
+                    .call(state)?;
+                cache.accept(unit_output)?;
+                Ok(true)
+            })();
+            match restored {
+                Ok(true) => {
+                    if rmeta_required {
+                        state.rmeta_produced();
+                    }
+                    return Ok(());
+                }
+                Ok(false) => {}
+                Err(err) => {
+                    debug!(?package_id, ?err, "local cache miss");
+                }
+            }
+            // A failed restore may already have copied diagnostic state.
+            // The actual compilation must start with an empty message cache.
+            drop(fs::remove_file(&message_cache));
+        }
+
+        // Older builds may have linked these files directly to immutable blobs.
+        // Detach the whole per-unit out tree, including dep-info and auxiliary
+        // outputs, even if shared storage is disabled for this invocation.
+        if let Some(out_dir) = &detach_out_dir {
+            if out_dir.exists() {
+                paths::remove_dir_all(out_dir)?;
+            }
+            paths::create_dir_all(out_dir)?;
         }
 
         for output in outputs.iter() {

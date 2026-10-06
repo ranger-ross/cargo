@@ -2081,11 +2081,10 @@ hint-msrv = true
 ## shared-blob-storage
 * Tracking Issue: [rust-lang/cargo#17453](https://github.com/rust-lang/cargo/issues/17453)
 
-Enables Cargo to deduplicate output files across build units and workspaces using a
-shared content-addressable store at `$CARGO_HOME/blobs` (normally `~/.cargo/blobs`).
-Cargo prefers reflinks, uses hardlinks when artifact metadata is compatible, and
-otherwise copies. Copies also support build directories on another filesystem.
-Reusing a blob preserves the compiler output's permissions and modification time.
+Enables shared blob storage and a local build cache for non-local build units.
+Blob storage deduplicates output files by their BLAKE3 content hashes. It prefers
+reflinks, uses hardlinks where later compiler writes and artifact metadata permit,
+and otherwise copies. It requires the new build-directory layout.
 
 You can set this via your global `~/.cargo/config.toml`, and nightly Cargo will
 automatically use it, while stable Cargo will silently ignore the unstable
@@ -2096,111 +2095,105 @@ option:
 shared-blob-storage = true
 ```
 
-Completed unit outputs and successful build graphs are recorded as immutable
-binary manifests. A unit inventory lists relative output paths, blob hashes, and
-sizes. A snapshot contains a sorted, deduplicated set of unit-result hashes.
-Repeating the same output graph reuses its snapshot. Different feature
-combinations can retain separate snapshots.
+### Blob storage and tracking
 
-The shared blob store does not use SQLite:
+The tracking system separates output contents from build and workspace identity:
 
 ```text
 $CARGO_HOME/blobs/
-  <blob hash>                         File contents
-  units-v1/<unit-result hash>          Immutable output inventory
-  snapshots-v1/<snapshot hash>         Immutable graph membership
-  local-v2/<build-directory hash>      Local snapshot usage
-  local-v2/imports                     Local leases for restored snapshots
-  local-v2/revision                    Cache identity and invalidation token
+  <blob hash>
+$CARGO_HOME/shared-storage/
+  unit-output/<unit-output hash>
+  snapshots/<snapshot hash>
+  workspace-history/<workspace-id>/<snapshot hash>
+  cache-entries/<unit-hash>
 ```
 
-Object names are lowercase hexadecimal BLAKE3 digests. Each manifest's name hashes
-its complete serialized contents. Unit manifests start with
-`cargo-shared-blob-unit-result-v2\0`, followed by a path-encoding byte and a count.
-Each entry contains a path length, path bytes, a 32-byte blob hash, and a size.
-Paths are sorted and unique, relative to the unit directory, and slash-separated.
-Encoding tags identify Unix bytes (`1`), Windows UTF-16 code units in little-endian
-order (`2`), or UTF-8 (`3`). Snapshot manifests start with
-`cargo-shared-blob-snapshot-v1\0`, followed by a count and sorted unique 32-byte
-unit-result hashes. Counts, lengths, and sizes are unsigned little-endian 64-bit
-integers. Manifests contain no usage timestamps or build-directory identifiers.
+A **unit output** contains relative output paths, blob hashes, and sizes. It is
+keyed by the BLAKE3 hash of its canonical contents and contains no unit identity.
+A **build snapshot** contains the sorted, unique unit-output hashes used by a
+successful invocation. It covers the non-local outputs participating in blob
+storage, including fresh units and restored cache entries.
 
-Mutable snapshot usage lives in one atomically replaced receipt per build
-directory. Receipts start with `cargo-shared-blob-state-v2\0`, followed by a
-little-endian 64-bit count and sorted pairs of 32-byte snapshot hashes and
-little-endian 64-bit last-used timestamps. Usage is updated at most once every
-four hours for each build-directory/snapshot pair. Receipts contain no unit table.
+**Workspace history** records when a workspace last used each build snapshot.
+Each snapshot has its own file containing a Unix timestamp in seconds. Every
+successful use refreshes that file. The workspace ID hashes the canonical
+workspace root, so changing the build directory does not create another
+workspace history. This identity is local to the machine.
 
-Each eligible unit's short fingerprint can carry an optional inventory pointer:
-`<16-digit fingerprint>\nblob-v1 <64-digit revision> <64-digit inventory hash>`.
-The pointer is cache metadata, not part of Cargo's freshness hash. A successful
-rebuild writes a plain fingerprint first; only successful inventory publication
-attaches a pointer. Rebuilding with tracking disabled cannot leave a stale pointer.
-Enabling the feature on an existing build directory captures untracked outputs.
-Older Cargo binaries do not understand the extended fingerprint record. Use
-separate build directories when switching between those binaries and this format.
+Each eligible unit's short fingerprint can carry an optional unit-output hash:
+`<16-digit fingerprint>\nunit-output-v1 <64-digit unit-output hash>`.
+This field does not participate in fingerprint propagation. Fresh units reuse it
+without rehashing their output files. Cargo validates the unit output and blob
+sizes, recapturing outputs if storage is missing or incomplete. A rebuild clears
+the field before attaching a newly published unit output.
 
-The revision file starts with `cargo-shared-blob-revision-v1\0`, followed by a
-random 32-byte token. A new store or recreated `local-v2` gets a new token. GC
-rotates it before invalidating receipts or deleting managed data; no-op collection
-and dry runs leave it unchanged. When the pointer's revision matches and the
-build directory has a receipt, fresh builds avoid per-unit inventory reads.
-Otherwise Cargo checks that particular inventory's hash and encoding and that
-every referenced blob is a regular file with the declared size. Intact inventories
-are reused; missing or invalid ones are recaptured from local build outputs.
-Validation is per pointer: checking one feature variant does not validate dormant
-variants. These checks do not hash blob contents.
+Unit outputs and build snapshots use versioned binary formats with explicit path
+encodings. Workspace history uses decimal timestamps. These unstable formats
+are not a public compatibility contract. There are no per-blob usage timestamps,
+workspace receipts, cache revision tokens, or import grace periods.
 
-Publication writes unit inventories before attaching fingerprint pointers, then
-publishes a snapshot and updates usage only after a successful build. Failed
-builds can leave completed inventories but do not refresh snapshot retention.
-Blob contents are verified before replacing compiler outputs, and damaged cached
-contents are repaired from those outputs. Stored symlinks are repaired instead
-of reused.
+### Local build cache
 
-The earlier `blobs/index.sqlite` and `local-v1` metadata are no longer read.
-Enabled builds recreate tracking metadata while reusing existing blob contents.
-Collection removes obsolete local metadata, database and timestamp files.
-Cargo's separate `.global-cache` database is unchanged.
+A **cache entry** is keyed by Cargo's unit hash and references a unit output.
+Cargo also checks a fingerprint and dependency-artifact guard before accepting
+an entry. Entries carry output permissions and modification times separately
+from the content-addressed unit output.
 
-Automatic garbage collection expires snapshot usage after 30 days. Blobs shared
-by retained snapshots remain in the cache. To also enforce a logical blob-size
-limit, evicting the oldest snapshots first, run:
+The initial build cache restores immutable registry and Git library units for
+`cargo build` and `cargo check`. Local units, build scripts, proc-macros, and
+units depending on them are excluded. Forced builds, custom compiler commands,
+compiler wrappers, extra per-unit arguments, and artifact dependencies are also
+excluded.
+
+On a cache hit, Cargo verifies each blob's contents, restores the output tree,
+checks the environment dependencies recorded by rustc, regenerates Cargo's
+dep-info, and replays cached diagnostics. Inputs outside the immutable package
+cause a cache miss. A missing, corrupt, or incompatible entry falls back to
+compilation. Restored compiler outputs receive the current invocation timestamp
+so the next invocation can consider them fresh.
+
+Restoration uses private reflinks or copies because updating a hardlinked
+file's metadata would also change the blob. Before rebuilding a non-local rustc
+unit, Cargo removes its output tree to detach previously hardlinked artifacts.
+This protection applies even when shared blob storage is disabled for that
+invocation. Rustdoc output capture does not use hardlinks.
+
+Ordinary `cargo clean` removes build-directory outputs and leaves shared storage
+available for the next build. Cache writers must be trusted. Content hashes
+detect damaged bytes but do not authenticate their producer.
+
+### Garbage collection
+
+Workspace history is the retention root. Automatic collection expires history
+after 30 days, walks retained build snapshots and unit outputs, and removes
+unreferenced blobs. A cache entry survives only while its unit output is retained
+by a build snapshot. A successful cache hit refreshes workspace history in the
+same way as a successful compilation. Failed builds do not refresh history.
+
+Snapshots without recent workspace history do not retain blobs. Unreadable or
+malformed history stops collection before deletion. Collection validates the
+metadata graph and blob sizes without rehashing every blob.
+
+Builds hold Cargo's shared package-cache lock to exclude garbage collection.
+Immutable objects are published atomically. Snapshot and workspace-history
+commits also take the package-cache download/append lock. Collection takes its
+exclusive mutation lock before traversing or deleting shared storage.
+
+To additionally enforce a logical blob-size limit, evicting the oldest build
+snapshots first, run:
 
 ```console
 cargo clean gc -Zgc -Zshared-blob-storage --max-blob-size 10GiB
 ```
 
-`--dry-run` changes neither metadata nor blobs. Collection removes cache entries,
-leaving build-directory files intact. Removing a shared blob may not free its
-data blocks while build-directory links still exist. Ordinary `cargo clean`
-removes build-directory outputs but does not clear the shared cache.
+`--dry-run` changes neither metadata nor blobs. Size accounting counts each
+distinct blob once and excludes metadata and filesystem overhead. Collection
+leaves build-directory outputs intact. Removing a blob name may not free its
+data blocks while build-directory hardlinks still exist.
 
-### Transporting the cache
-
-Blobs, unit manifests, and snapshot manifests can be copied as independent
-immutable objects or packed into an archive. Exclude `local-v2`: it contains
-machine-local usage and revision metadata, which can be recreated. Restore the
-complete snapshot closure before running Cargo. Each complete snapshot restored
-without a usage receipt receives a single 30-day import lease when GC first discovers it.
-Subsequent collection does not renew that lease. Incomplete or corrupt graphs
-cannot keep otherwise unreferenced blobs alive.
-
-For [S3 object storage](https://docs.aws.amazon.com/AmazonS3/latest/userguide/conditional-writes.html),
-publish blobs and unit manifests first, then the snapshot manifest. Conditional
-`If-None-Match: *` writes can avoid replacing existing objects. Coordinate
-remote deletion with publication separately from local Cargo GC.
-
-[GitHub Actions caches](https://docs.github.com/en/actions/reference/workflows-and-actions/dependency-caching)
-are immutable archives. Bundle a snapshot and its referenced objects under a new
-cache key when contents change, rather than creating an Actions cache entry for
-every blob. GitHub controls archive retention and quotas independently of Cargo's
-local 30-day policy. Restrict cache writers to trusted workflows.
-
-These files are transportable without a shared database, filesystem timestamps,
-or hardlink relationships. Compiled outputs remain specific to their toolchain
-and target. Cargo does not yet provide S3 or GitHub Actions network clients or
-action-keyed remote compilation reuse.
+Remote storage, remote cache lookup, and remote garbage collection are not
+implemented.
 
 ## builtin-dependencies
 * Tracking Issue: [rust-lang/cargo#16960](https://github.com/rust-lang/cargo/issues/16960)

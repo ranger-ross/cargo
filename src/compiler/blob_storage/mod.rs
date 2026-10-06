@@ -1,13 +1,16 @@
 mod format;
 mod snapshots;
 
-use std::fs::File;
+use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use anyhow::{Context, ensure};
 use cargo_util::paths::create_dir_all;
 use filetime::FileTime;
-use format::{Digest, Output, UnitResult, encode_output_path};
+use format::{
+    CacheEntry, Digest, Output, OutputMetadata, UnitOutput, decode_output_path, encode_output_path,
+};
 use parking_lot::Mutex;
 use tracing::instrument;
 
@@ -15,80 +18,77 @@ use crate::ops::CleanContext;
 use crate::util::cache_lock::CacheLockMode;
 use crate::util::data_structures::HashSet;
 use crate::{CargoResult, GlobalContext};
-use snapshots::SnapshotStore;
+use snapshots::{SnapshotStore, check_directory, hex, regular_size};
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) struct BlobRecord {
-    pub revision: [u8; 32],
-    pub result: [u8; 32],
-}
+pub(super) type UnitOutputHash = [u8; 32];
 
 pub struct BlobStorage {
     root: PathBuf,
-    build_dir_id: Vec<u8>,
-    revision: Digest,
-    validate_all: bool,
+    workspace_id: Digest,
     used: Mutex<HashSet<Digest>>,
 }
 
 impl BlobStorage {
-    pub fn new(root: PathBuf, build_dir: &Path, gctx: &GlobalContext) -> CargoResult<Self> {
-        create_dir_all(&root)?;
-
-        let build_dir_id = std::fs::canonicalize(build_dir)?
-            .as_os_str()
-            .as_encoded_bytes()
-            .to_vec();
+    pub fn new(root: PathBuf, workspace_root: &Path, gctx: &GlobalContext) -> CargoResult<Self> {
         let _lock = gctx.acquire_package_cache_lock(CacheLockMode::DownloadExclusive)?;
-        let store = SnapshotStore::new(&root);
-        let revision = store.revision()?;
-        let validate_all = !store.has_receipt(&build_dir_id)?;
+        check_directory(&root)?;
+        create_dir_all(&root)?;
+        let workspace_root = fs::canonicalize(workspace_root)?;
+        let workspace_id = *blake3::hash(workspace_root.as_os_str().as_encoded_bytes()).as_bytes();
         Ok(Self {
             root,
-            build_dir_id,
-            revision,
-            validate_all,
-            used: Mutex::new(HashSet::default()),
+            workspace_id,
+            used: Mutex::default(),
         })
     }
 
-    /// Reuses a fingerprint pointer, checking its inventory after collection.
+    /// Validate the immutable unit output before reusing a fingerprint pointer.
     pub(super) fn prepare_unit(
         &self,
-        record: Option<BlobRecord>,
-    ) -> CargoResult<Option<BlobRecord>> {
-        let Some(record) = record else {
+        unit_output: Option<UnitOutputHash>,
+    ) -> CargoResult<Option<UnitOutputHash>> {
+        let Some(id) = unit_output else {
             return Ok(None);
         };
-        if (self.validate_all || record.revision != self.revision)
-            && !SnapshotStore::new(&self.root).unit_is_complete(&record.result)?
-        {
+        if !SnapshotStore::new(&self.root).unit_is_complete(&id)? {
             return Ok(None);
         }
-        self.used.lock().insert(record.result);
-        Ok(Some(BlobRecord {
-            revision: self.revision,
-            result: record.result,
-        }))
+        self.used.lock().insert(id);
+        Ok(Some(id))
     }
 
-    /// Captures a newly completed unit or adopts previously untracked outputs.
+    /// Capture all regular compiler outputs, including raw rustc dep-info.
+    /// Hardlinks are allowed only when the compiler detaches the output tree
+    /// before every dirty run, including builds with tracking disabled.
     #[instrument(skip_all)]
-    pub(super) fn capture_unit(&self, unit_dir: &Path, out_dir: &Path) -> CargoResult<BlobRecord> {
+    pub(super) fn capture_unit(
+        &self,
+        unit_dir: &Path,
+        out_dir: &Path,
+        hardlink_allowed: bool,
+    ) -> CargoResult<UnitOutputHash> {
+        ensure!(
+            out_dir == unit_dir.join("out"),
+            "unexpected unit output directory"
+        );
+        check_directory(out_dir)?;
         let mut outputs = Vec::new();
         for entry in walkdir::WalkDir::new(out_dir) {
             let entry = entry?;
+            ensure!(
+                !entry.file_type().is_symlink(),
+                "symlink in unit output: {}",
+                entry.path().display()
+            );
             if !entry.file_type().is_file() {
                 continue;
             }
             let path = entry.path();
             let size = entry.metadata()?.len();
             let hash = Self::hash(path)?;
-            let storage_path = self
-                .root
-                .join(blake3::Hash::from_bytes(hash).to_hex().as_str());
-            if !self.insert(path, &storage_path, false)? {
-                self.dedup(path, &storage_path, &hash)?;
+            let storage_path = self.root.join(hex(&hash));
+            if !self.insert(path, &storage_path, &hash, false, hardlink_allowed)? {
+                self.dedup(path, &storage_path, &hash, hardlink_allowed)?;
             }
             outputs.push(Output {
                 path: encode_output_path(path.strip_prefix(unit_dir)?)?,
@@ -96,91 +96,227 @@ impl BlobStorage {
                 size,
             });
         }
-        let result = UnitResult::new(outputs);
-        SnapshotStore::new(&self.root).publish_unit(&result)?;
-        self.used.lock().insert(result.id);
-        Ok(BlobRecord {
-            revision: self.revision,
-            result: result.id,
-        })
+        let output = UnitOutput::new(outputs);
+        SnapshotStore::new(&self.root).publish_unit(&output)?;
+        self.used.lock().insert(output.id);
+        Ok(output.id)
     }
 
-    /// Only successful builds publish a graph snapshot and refresh usage.
+    pub(super) fn publish_cache_entry(
+        &self,
+        unit_hash: &str,
+        fingerprint: u64,
+        unit_output: UnitOutputHash,
+        unit_dir: &Path,
+    ) -> CargoResult<()> {
+        let store = SnapshotStore::new(&self.root);
+        let outputs = store
+            .read_unit(&unit_output)?
+            .context("missing captured unit output")?;
+        let mut metadata = Vec::with_capacity(outputs.len());
+        for output in outputs {
+            let relative = restore_path(&output.path)?;
+            let path = unit_dir.join(relative);
+            let file = fs::symlink_metadata(&path)?;
+            ensure!(
+                file.is_file() && file.len() == output.size,
+                "captured output changed: {}",
+                path.display()
+            );
+            let mtime = FileTime::from_last_modification_time(&file);
+            metadata.push(OutputMetadata {
+                mode: permission_mode(&file),
+                mtime_seconds: mtime.unix_seconds(),
+                mtime_nanos: mtime.nanoseconds(),
+            });
+        }
+        store.publish_cache_entry(
+            unit_hash,
+            &CacheEntry {
+                unit_output,
+                fingerprint,
+                outputs: metadata,
+            },
+        )
+    }
+
+    /// Stage and verify all restored bytes before replacing the output tree.
+    /// The compiler calls `prepare_unit` after accepting dep-info/environment
+    /// validation, so a rejected hit cannot become a successful snapshot member.
+    pub(super) fn restore_cache_entry(
+        &self,
+        unit_hash: &str,
+        fingerprint: u64,
+        unit_dir: &Path,
+    ) -> CargoResult<Option<UnitOutputHash>> {
+        let store = SnapshotStore::new(&self.root);
+        let Some(entry) = store.read_cache_entry(unit_hash)? else {
+            return Ok(None);
+        };
+        if entry.fingerprint != fingerprint {
+            return Ok(None);
+        }
+        match self.restore_outputs(&store, &entry, unit_dir) {
+            Ok(()) => Ok(Some(entry.unit_output)),
+            Err(error) => {
+                tracing::debug!(?error, unit_hash, "discarding invalid local cache entry");
+                store.evict_cache_entry(unit_hash)?;
+                Ok(None)
+            }
+        }
+    }
+
+    fn restore_outputs(
+        &self,
+        store: &SnapshotStore<'_>,
+        entry: &CacheEntry,
+        unit_dir: &Path,
+    ) -> CargoResult<()> {
+        let outputs = store
+            .read_unit(&entry.unit_output)?
+            .context("missing cached unit output")?;
+        ensure!(
+            outputs.len() == entry.outputs.len(),
+            "cached output metadata count mismatch"
+        );
+        check_directory(unit_dir)?;
+        fs::create_dir_all(unit_dir)?;
+        let staging = tempfile::Builder::new()
+            .prefix(".cache-restore")
+            .tempdir_in(unit_dir)?;
+        let staged_out = staging.path().join("out");
+        fs::create_dir(&staged_out)?;
+        for (output, metadata) in outputs.iter().zip(&entry.outputs) {
+            let relative = restore_path(&output.path)?;
+            let source = self.root.join(hex(&output.hash));
+            ensure!(
+                regular_size(&source)? == Some(output.size),
+                "missing or invalid cached blob"
+            );
+            let dest = staging.path().join(relative);
+            fs::create_dir_all(dest.parent().unwrap())?;
+            private_copy(&source, &dest)?;
+            ensure!(
+                Self::hash(&dest)? == output.hash,
+                "cached blob digest mismatch"
+            );
+            set_permission_mode(&dest, metadata.mode)?;
+            let mtime = FileTime::from_unix_time(metadata.mtime_seconds, metadata.mtime_nanos);
+            filetime::set_file_times(&dest, mtime, mtime)?;
+            #[cfg(target_os = "linux")]
+            ensure_no_writers(&dest)?;
+        }
+        let out = unit_dir.join("out");
+        check_directory(&out)?;
+        let backup = staging.path().join("previous-out");
+        let had_out = out.try_exists()?;
+        if had_out {
+            fs::rename(&out, &backup)?;
+        }
+        if let Err(error) = fs::rename(&staged_out, &out) {
+            if had_out {
+                if let Err(rollback) = fs::rename(&backup, &out) {
+                    // Preserve the original output if rollback itself fails.
+                    let preserved = staging.keep();
+                    return Err(rollback).with_context(|| {
+                        format!(
+                            "restoring output after {error}; original output preserved at {}",
+                            preserved.join("previous-out").display()
+                        )
+                    });
+                }
+            }
+            return Err(error.into());
+        }
+        Ok(())
+    }
+
+    /// Only successful builds publish a snapshot and refresh workspace history.
     pub fn finish(&self, gctx: &GlobalContext, successful: bool) -> CargoResult<()> {
         let used = self.used.lock();
         if !successful || used.is_empty() {
             return Ok(());
         }
-        let results = used.iter().copied().collect();
+        let outputs = used.iter().copied().collect();
         let _lock = gctx.acquire_package_cache_lock(CacheLockMode::DownloadExclusive)?;
-        SnapshotStore::new(&self.root).save(&self.build_dir_id, results, now())
+        SnapshotStore::new(&self.root).save(&self.workspace_id, outputs, now())
     }
 
-    /// Collects expired snapshots under the package-cache mutation lock.
     pub fn clean(
         root: &Path,
         clean_ctx: &mut CleanContext<'_>,
         max_size: Option<u64>,
     ) -> CargoResult<()> {
-        if !root.try_exists()? {
-            return Ok(());
-        }
         SnapshotStore::new(root).clean(clean_ctx, max_size, now())
     }
 
     fn insert(
         &self,
-        artifact_path: &Path,
-        storage_path: &Path,
-        replace_corrupt: bool,
+        artifact: &Path,
+        blob: &Path,
+        expected: &Digest,
+        replace: bool,
+        hardlink_allowed: bool,
     ) -> CargoResult<bool> {
-        if !replace_corrupt && storage_path.try_exists()? {
+        if !replace && fs::symlink_metadata(blob).is_ok() {
             return Ok(false);
         }
-
-        // Publish complete bytes atomically. A concurrent producer of the same
-        // digest has identical contents, so replacing its name is harmless.
-        let staging_dir = tempfile::Builder::new()
+        let staging = tempfile::Builder::new()
             .prefix(".blob")
             .tempdir_in(&self.root)?;
-        let staged = staging_dir.path().join("artifact");
-        if reflink_copy::reflink(artifact_path, &staged).is_err()
-            && std::fs::hard_link(artifact_path, &staged).is_err()
+        let staged = staging.path().join("artifact");
+        if reflink_copy::reflink(artifact, &staged).is_err()
+            && (!hardlink_allowed || fs::hard_link(artifact, &staged).is_err())
         {
-            std::fs::copy(artifact_path, &staged)?;
+            fs::copy(artifact, &staged)?;
         }
+        ensure!(
+            &Self::hash(&staged)? == expected,
+            "compiler output changed during capture"
+        );
         #[cfg(target_os = "linux")]
         ensure_no_writers(&staged)?;
-        std::fs::rename(&staged, storage_path)?;
+        fs::rename(&staged, blob)?;
         Ok(true)
     }
 
-    fn dedup(&self, path: &Path, storage_path: &Path, expected: &Digest) -> CargoResult<()> {
+    fn dedup(
+        &self,
+        path: &Path,
+        blob: &Path,
+        expected: &Digest,
+        hardlink_allowed: bool,
+    ) -> CargoResult<()> {
         let metadata = path.metadata()?;
-        let stored = std::fs::symlink_metadata(storage_path)?;
-        if !stored.is_file() || stored.len() != metadata.len() {
-            self.insert(path, storage_path, true)?;
+        if regular_size(blob)? != Some(metadata.len()) {
+            self.insert(path, blob, expected, true, hardlink_allowed)?;
             return Ok(());
         }
-        let staging_dir = tempfile::Builder::new()
+        let staging = tempfile::Builder::new()
             .prefix(".blob")
             .tempdir_in(path.parent().unwrap())?;
-        let replacement = staging_dir.path().join("artifact");
-        let private_copy = if reflink_copy::reflink(storage_path, &replacement).is_ok() {
+        let replacement = staging.path().join("artifact");
+        let stored = fs::symlink_metadata(blob)?;
+        let private = if reflink_copy::reflink(blob, &replacement).is_ok() {
             true
         } else {
-            let compatible = stored.permissions() == metadata.permissions()
+            let compatible = hardlink_allowed
+                && stored.permissions() == metadata.permissions()
                 && FileTime::from_last_modification_time(&stored)
                     == FileTime::from_last_modification_time(&metadata);
-            if compatible && std::fs::hard_link(storage_path, &replacement).is_ok() {
+            if compatible && fs::hard_link(blob, &replacement).is_ok() {
                 false
             } else {
-                std::fs::copy(storage_path, &replacement)?;
+                fs::copy(blob, &replacement)?;
                 true
             }
         };
-        if private_copy {
-            std::fs::set_permissions(&replacement, metadata.permissions())?;
+        if &Self::hash(&replacement)? != expected {
+            self.insert(path, blob, expected, true, hardlink_allowed)?;
+            return Ok(());
+        }
+        if private {
+            fs::set_permissions(&replacement, metadata.permissions())?;
             filetime::set_file_times(
                 &replacement,
                 FileTime::from_last_access_time(&metadata),
@@ -189,47 +325,89 @@ impl BlobStorage {
         }
         #[cfg(target_os = "linux")]
         ensure_no_writers(&replacement)?;
-        // Restored cache objects must not replace good compiler outputs with
-        // bytes that do not match their content-addressed name.
-        if &Self::hash(&replacement)? != expected {
-            self.insert(path, storage_path, true)?;
-            return Ok(());
-        }
-        std::fs::rename(&replacement, path)?;
-
+        fs::rename(&replacement, path)?;
         Ok(())
     }
 
     #[instrument]
     fn hash(path: &Path) -> CargoResult<Digest> {
         let mut hasher = blake3::Hasher::new();
-        let file = File::open(path)?;
-        hasher.update_reader(file)?;
+        hasher.update_reader(File::open(path)?)?;
         Ok(*hasher.finalize().as_bytes())
     }
+}
+
+fn restore_path(bytes: &[u8]) -> CargoResult<PathBuf> {
+    let path = decode_output_path(bytes)?;
+    let suffix = path
+        .strip_prefix("out")
+        .context("cached output is outside the output tree")?;
+    ensure!(
+        !suffix.as_os_str().is_empty(),
+        "cached output has no filename"
+    );
+    Ok(path)
+}
+
+fn private_copy(source: &Path, dest: &Path) -> CargoResult<()> {
+    if reflink_copy::reflink(source, dest).is_err() {
+        fs::copy(source, dest)?;
+    }
+    Ok(())
+}
+
+fn permission_mode(metadata: &fs::Metadata) -> u32 {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        metadata.permissions().mode() & 0o777
+    }
+    #[cfg(not(unix))]
+    {
+        if metadata.permissions().readonly() {
+            0o444
+        } else {
+            0o666
+        }
+    }
+}
+
+fn set_permission_mode(path: &Path, mode: u32) -> CargoResult<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(mode))?;
+    }
+    #[cfg(not(unix))]
+    {
+        let mut permissions = fs::metadata(path)?.permissions();
+        permissions.set_readonly(mode & 0o222 == 0);
+        fs::set_permissions(path, permissions)?;
+    }
+    Ok(())
 }
 
 fn now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
+        .map(|duration| duration.as_secs())
         .unwrap_or_default()
 }
 
-/// Errors if there we cannot get a read lease to a file (ensuring no writers)
-///
-/// On Linux we need this to avoid concurrency issues when deduplicating with reflinks.
-/// During reflinking, there is a brief window where we hold a write lease to the file.
-/// If during this period, another worker fork's (say to spawn a rustc process) that process
-/// will inhierit the writable fd. This is problematic as we cannot execute a file that has a
-/// writable fd which breaks things like executing build scripts.
+/// Reflinking briefly holds a writable fd which a concurrently forked compiler
+/// may inherit. Wait for its read lease before executing or publishing the file.
 #[cfg(target_os = "linux")]
 fn ensure_no_writers(path: &Path) -> std::io::Result<()> {
     use std::os::fd::AsRawFd;
-
     let file = File::open(path)?;
-    if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETLEASE, libc::F_RDLCK) } == -1 {
-        return Err(std::io::Error::last_os_error());
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    while unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETLEASE, libc::F_RDLCK) } == -1 {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::EAGAIN) || std::time::Instant::now() >= deadline {
+            return Err(error);
+        }
+        // A child can retain our closed writable descriptor until it execs.
+        std::thread::sleep(std::time::Duration::from_millis(1));
     }
     if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETLEASE, libc::F_UNLCK) } == -1 {
         return Err(std::io::Error::last_os_error());
@@ -237,75 +415,189 @@ fn ensure_no_writers(path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::PermissionsExt;
+
+    fn storage(root: &Path) -> BlobStorage {
+        let root = root.join("blobs");
+        fs::create_dir(&root).unwrap();
+        BlobStorage {
+            root,
+            workspace_id: [1; 32],
+            used: Mutex::default(),
+        }
+    }
+
+    fn capture(storage: &BlobStorage, unit: &Path, hardlink_allowed: bool) -> UnitOutputHash {
+        fs::create_dir_all(unit.join("out")).unwrap();
+        fs::write(unit.join("out/artifact"), b"compiled bytes").unwrap();
+        fs::write(unit.join("out/artifact.d"), b"artifact: input.rs\n").unwrap();
+        let output = storage
+            .capture_unit(unit, &unit.join("out"), hardlink_allowed)
+            .unwrap();
+        storage
+            .publish_cache_entry("1234", 42, output, unit)
+            .unwrap();
+        output
+    }
 
     #[test]
-    fn restored_blob_preserves_executability_and_mtime() {
+    fn cache_hit_restores_tree_and_dep_info_without_tracking_rejected_hits() {
         let root = tempfile::tempdir().unwrap();
-        let build_dir = tempfile::tempdir().unwrap();
-        let storage = BlobStorage {
-            root: root.path().to_path_buf(),
-            build_dir_id: Vec::new(),
-            revision: [0; 32],
-            validate_all: false,
-            used: Mutex::default(),
-        };
+        let storage = storage(root.path());
+        let unit = root.path().join("unit");
+        let output = capture(&storage, &unit, true);
+        storage.used.lock().clear();
+        fs::remove_dir_all(unit.join("out")).unwrap();
+        assert_eq!(
+            storage.restore_cache_entry("1234", 41, &unit).unwrap(),
+            None
+        );
+        assert!(!unit.join("out").exists());
+        assert_eq!(
+            storage.restore_cache_entry("1234", 42, &unit).unwrap(),
+            Some(output)
+        );
+        assert_eq!(
+            fs::read(unit.join("out/artifact")).unwrap(),
+            b"compiled bytes"
+        );
+        assert_eq!(
+            fs::read(unit.join("out/artifact.d")).unwrap(),
+            b"artifact: input.rs\n"
+        );
+        assert!(storage.used.lock().is_empty());
+        assert_eq!(storage.prepare_unit(Some(output)).unwrap(), Some(output));
+        assert!(storage.used.lock().contains(&output));
+    }
+
+    #[test]
+    fn corrupt_blob_misses_without_replacing_any_output() {
+        let root = tempfile::tempdir().unwrap();
+        let storage = storage(root.path());
+        let unit = root.path().join("unit");
+        capture(&storage, &unit, true);
+        let blob = storage
+            .root
+            .join(blake3::hash(b"compiled bytes").to_hex().as_str());
+        fs::write(blob, b"corrupted data").unwrap();
+        fs::write(unit.join("out/artifact"), b"keep original").unwrap();
+        fs::write(unit.join("out/artifact.d"), b"keep dep-info").unwrap();
+        assert_eq!(
+            storage.restore_cache_entry("1234", 42, &unit).unwrap(),
+            None
+        );
+        assert_eq!(
+            fs::read(unit.join("out/artifact")).unwrap(),
+            b"keep original"
+        );
+        assert_eq!(
+            fs::read(unit.join("out/artifact.d")).unwrap(),
+            b"keep dep-info"
+        );
+        assert!(
+            SnapshotStore::new(&storage.root)
+                .read_cache_entry("1234")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn capture_does_not_share_mutable_blob_inodes() {
+        let root = tempfile::tempdir().unwrap();
+        let storage = storage(root.path());
+        let unit = root.path().join("unit");
+        capture(&storage, &unit, false);
+        storage
+            .capture_unit(&unit, &unit.join("out"), false)
+            .unwrap();
+        fs::write(unit.join("out/artifact"), b"later compiler output").unwrap();
+        let blob = storage
+            .root
+            .join(blake3::hash(b"compiled bytes").to_hex().as_str());
+        assert_eq!(fs::read(blob).unwrap(), b"compiled bytes");
+    }
+
+    #[test]
+    fn restores_only_paths_inside_output_tree() {
+        for path in [
+            "../escape",
+            "out/../escape",
+            "fingerprint/entry",
+            "out",
+            "/out/file",
+        ] {
+            assert!(
+                encode_output_path(Path::new(path))
+                    .and_then(|path| restore_path(&path))
+                    .is_err()
+            );
+        }
+        assert_eq!(
+            restore_path(&encode_output_path(Path::new("out/a/b")).unwrap()).unwrap(),
+            Path::new("out/a/b")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_preserves_execution_and_mtime_without_mutating_blob_metadata() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let storage = storage(root.path());
+        let unit = root.path().join("unit");
+        fs::create_dir_all(unit.join("out")).unwrap();
+        let artifact = unit.join("out/program");
         let contents = b"#!/bin/sh\nprintf 'cache-ok\\n'\n";
-        let hash = *blake3::hash(contents).as_bytes();
-        let blob = root
-            .path()
-            .join(blake3::Hash::from_bytes(hash).to_hex().as_str());
-        let artifact = build_dir.path().join("program");
-        std::fs::write(&blob, contents).unwrap();
-        std::fs::write(&artifact, contents).unwrap();
-        std::fs::set_permissions(&blob, std::fs::Permissions::from_mode(0o444)).unwrap();
-        std::fs::set_permissions(&artifact, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let downloaded = FileTime::from_unix_time(1_600_000_000, 0);
+        fs::write(&artifact, contents).unwrap();
+        fs::set_permissions(&artifact, fs::Permissions::from_mode(0o755)).unwrap();
         let compiled = FileTime::from_unix_time(1_600_000_100, 0);
-        filetime::set_file_mtime(&blob, downloaded).unwrap();
         filetime::set_file_mtime(&artifact, compiled).unwrap();
-
-        storage.dedup(&artifact, &blob, &hash).unwrap();
-
+        let output = storage
+            .capture_unit(&unit, &unit.join("out"), true)
+            .unwrap();
+        storage
+            .publish_cache_entry("1234", 42, output, &unit)
+            .unwrap();
+        let blob = storage.root.join(blake3::hash(contents).to_hex().as_str());
+        fs::set_permissions(&blob, fs::Permissions::from_mode(0o444)).unwrap();
+        let downloaded = FileTime::from_unix_time(1_600_000_000, 0);
+        filetime::set_file_mtime(&blob, downloaded).unwrap();
+        fs::remove_dir_all(unit.join("out")).unwrap();
+        assert_eq!(
+            storage.restore_cache_entry("1234", 42, &unit).unwrap(),
+            Some(output)
+        );
         let metadata = artifact.metadata().unwrap();
         assert_eq!(FileTime::from_last_modification_time(&metadata), compiled);
         assert_eq!(metadata.permissions().mode() & 0o777, 0o755);
-        let output = std::process::Command::new(&artifact).output().unwrap();
-        assert!(output.status.success());
-        assert_eq!(output.stdout, b"cache-ok\n");
+        let result = std::process::Command::new(&artifact).output().unwrap();
+        assert!(result.status.success());
+        assert_eq!(result.stdout, b"cache-ok\n");
         let metadata = blob.metadata().unwrap();
         assert_eq!(FileTime::from_last_modification_time(&metadata), downloaded);
         assert_eq!(metadata.permissions().mode() & 0o777, 0o444);
     }
 
+    #[cfg(unix)]
     #[test]
-    fn restored_blob_symlink_cannot_redirect_compiler_output() {
+    fn blob_symlink_cannot_redirect_compiler_output() {
         let root = tempfile::tempdir().unwrap();
-        let build_dir = tempfile::tempdir().unwrap();
-        let storage = BlobStorage {
-            root: root.path().to_path_buf(),
-            build_dir_id: Vec::new(),
-            revision: [0; 32],
-            validate_all: false,
-            used: Mutex::default(),
-        };
+        let storage = storage(root.path());
+        let unit = root.path().join("unit");
+        fs::create_dir_all(unit.join("out")).unwrap();
+        let artifact = unit.join("out/artifact");
         let contents = b"compiled output";
+        fs::write(&artifact, contents).unwrap();
         let hash = *blake3::hash(contents).as_bytes();
-        let blob = root
-            .path()
-            .join(blake3::Hash::from_bytes(hash).to_hex().as_str());
-        let artifact = build_dir.path().join("artifact");
-        std::fs::write(&artifact, contents).unwrap();
+        let blob = storage.root.join(hex(&hash));
         std::os::unix::fs::symlink(&artifact, &blob).unwrap();
-
-        storage.dedup(&artifact, &blob, &hash).unwrap();
-
-        assert!(std::fs::symlink_metadata(&artifact).unwrap().is_file());
-        assert!(std::fs::symlink_metadata(&blob).unwrap().is_file());
-        assert_eq!(std::fs::read(&artifact).unwrap(), contents);
-        assert_eq!(std::fs::read(&blob).unwrap(), contents);
+        storage.dedup(&artifact, &blob, &hash, true).unwrap();
+        assert!(fs::symlink_metadata(&artifact).unwrap().is_file());
+        assert!(fs::symlink_metadata(&blob).unwrap().is_file());
+        assert_eq!(fs::read(artifact).unwrap(), contents);
+        assert_eq!(fs::read(blob).unwrap(), contents);
     }
 }

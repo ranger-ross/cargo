@@ -1,16 +1,15 @@
-//! Versioned immutable inventories and local-only usage receipts.
+//! Versioned immutable graph objects and local cache entries.
 
-use std::collections::BTreeMap;
-use std::path::{Component, Path};
+use std::path::{Component, Path, PathBuf};
 
 use anyhow::{bail, ensure};
 
 use crate::CargoResult;
 
 pub(super) type Digest = [u8; 32];
-const UNIT_MAGIC: &[u8] = b"cargo-shared-blob-unit-result-v2\0";
-const SNAPSHOT_MAGIC: &[u8] = b"cargo-shared-blob-snapshot-v1\0";
-const STATE_MAGIC: &[u8] = b"cargo-shared-blob-state-v2\0";
+const UNIT_MAGIC: &[u8] = b"cargo-shared-storage-unit-output-v1\0";
+const SNAPSHOT_MAGIC: &[u8] = b"cargo-shared-storage-snapshot-v1\0";
+const CACHE_MAGIC: &[u8] = b"cargo-shared-storage-cache-entry-v1\0";
 
 #[cfg(unix)]
 const PATH_ENCODING: u8 = 1;
@@ -27,12 +26,12 @@ pub(super) struct Output {
 }
 
 #[derive(Debug)]
-pub(super) struct UnitResult {
+pub(super) struct UnitOutput {
     pub id: Digest,
     pub bytes: Vec<u8>,
 }
 
-impl UnitResult {
+impl UnitOutput {
     pub fn new(mut outputs: Vec<Output>) -> Self {
         outputs.sort_unstable_by(|a, b| a.path.cmp(&b.path));
         let capacity = UNIT_MAGIC.len()
@@ -57,9 +56,19 @@ impl UnitResult {
     }
 }
 
-#[derive(Default, Debug, Eq, PartialEq)]
-pub(super) struct Receipt {
-    pub usage: BTreeMap<Digest, u64>,
+#[derive(Debug, Eq, PartialEq)]
+pub(super) struct OutputMetadata {
+    pub mode: u32,
+    pub mtime_seconds: i64,
+    pub mtime_nanos: u32,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub(super) struct CacheEntry {
+    pub unit_output: Digest,
+    pub fingerprint: u64,
+    /// Metadata follows the unit output's canonical path order.
+    pub outputs: Vec<OutputMetadata>,
 }
 
 /// Encode components explicitly; native OsStr encoding is not a wire format.
@@ -99,6 +108,42 @@ pub(super) fn encode_output_path(path: &Path) -> CargoResult<Vec<u8>> {
     }
     validate_path(PATH_ENCODING, &bytes)?;
     Ok(bytes)
+}
+
+/// Decode only native paths for restoration; unit-output traversal is portable.
+pub(super) fn decode_output_path(bytes: &[u8]) -> CargoResult<PathBuf> {
+    validate_path(PATH_ENCODING, bytes)?;
+    #[cfg(unix)]
+    let path = {
+        use std::os::unix::ffi::OsStrExt;
+        PathBuf::from(std::ffi::OsStr::from_bytes(bytes))
+    };
+    #[cfg(windows)]
+    let path = {
+        use std::os::windows::ffi::OsStringExt;
+        let units: Vec<_> = bytes
+            .chunks_exact(2)
+            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+            .collect();
+        PathBuf::from(std::ffi::OsString::from_wide(&units))
+    };
+    #[cfg(not(any(unix, windows)))]
+    let path = PathBuf::from(std::str::from_utf8(bytes)?);
+    ensure!(
+        path.components()
+            .all(|component| matches!(component, Component::Normal(_))),
+        "non-relative output path"
+    );
+    Ok(path)
+}
+
+pub(super) fn decode_native_unit(bytes: &[u8], id: &Digest) -> CargoResult<Vec<Output>> {
+    let outputs = decode_unit(bytes, id)?;
+    ensure!(
+        bytes[UNIT_MAGIC.len()] == PATH_ENCODING,
+        "foreign output path encoding"
+    );
+    Ok(outputs)
 }
 
 pub(super) fn decode_unit(bytes: &[u8], id: &Digest) -> CargoResult<Vec<Output>> {
@@ -167,36 +212,48 @@ pub(super) fn decode_snapshot(bytes: &[u8], id: &Digest) -> CargoResult<Vec<Dige
     Ok(results)
 }
 
-impl Receipt {
+impl CacheEntry {
     pub fn encode(&self) -> Vec<u8> {
-        let capacity = STATE_MAGIC.len() + 8 + self.usage.len() * 40;
-        let mut bytes = Vec::with_capacity(capacity);
-        bytes.extend_from_slice(STATE_MAGIC);
-        put_u64(&mut bytes, self.usage.len() as u64);
-        for (snapshot, last_used) in &self.usage {
-            bytes.extend_from_slice(snapshot);
-            put_u64(&mut bytes, *last_used);
+        let mut bytes = Vec::with_capacity(CACHE_MAGIC.len() + 48 + self.outputs.len() * 16);
+        bytes.extend_from_slice(CACHE_MAGIC);
+        bytes.extend_from_slice(&self.unit_output);
+        put_u64(&mut bytes, self.fingerprint);
+        put_u64(&mut bytes, self.outputs.len() as u64);
+        for output in &self.outputs {
+            bytes.extend_from_slice(&output.mode.to_le_bytes());
+            bytes.extend_from_slice(&output.mtime_seconds.to_le_bytes());
+            bytes.extend_from_slice(&output.mtime_nanos.to_le_bytes());
         }
         bytes
     }
 
     pub fn decode(bytes: &[u8]) -> CargoResult<Self> {
-        let mut reader = Reader::new(bytes, STATE_MAGIC)?;
-        let count = reader.count(40)?;
-        let mut receipt = Self::default();
+        let mut reader = Reader::new(bytes, CACHE_MAGIC)?;
+        let unit_output = reader.digest()?;
+        let fingerprint = reader.u64()?;
+        let count = reader.count(16)?;
+        let mut outputs = Vec::with_capacity(count);
         for _ in 0..count {
-            let snapshot = reader.digest()?;
+            let mode = u32::from_le_bytes(reader.take(4)?.try_into().unwrap());
+            let mtime_seconds = i64::from_le_bytes(reader.take(8)?.try_into().unwrap());
+            let mtime_nanos = u32::from_le_bytes(reader.take(4)?.try_into().unwrap());
+            ensure!(mode & !0o777 == 0, "invalid cached output permissions");
             ensure!(
-                receipt
-                    .usage
-                    .last_key_value()
-                    .is_none_or(|(last, _)| last < &snapshot),
-                "unordered or duplicate snapshot usage"
+                mtime_nanos < 1_000_000_000,
+                "invalid cached output timestamp"
             );
-            receipt.usage.insert(snapshot, reader.u64()?);
+            outputs.push(OutputMetadata {
+                mode,
+                mtime_seconds,
+                mtime_nanos,
+            });
         }
         reader.finish()?;
-        Ok(receipt)
+        Ok(Self {
+            unit_output,
+            fingerprint,
+            outputs,
+        })
     }
 }
 
@@ -336,8 +393,8 @@ impl<'a> Reader<'a> {
 mod tests {
     use super::*;
 
-    fn unit(paths: &[&[u8]]) -> UnitResult {
-        UnitResult::new(
+    fn unit(paths: &[&[u8]]) -> UnitOutput {
+        UnitOutput::new(
             paths
                 .iter()
                 .map(|path| Output {
@@ -380,10 +437,6 @@ mod tests {
         let mut bytes = result.bytes;
         bytes.push(0);
         assert!(decode_unit(&bytes, blake3::hash(&bytes).as_bytes()).is_err());
-        let receipt = Receipt::default().encode();
-        for end in 0..receipt.len() {
-            assert!(Receipt::decode(&receipt[..end]).is_err());
-        }
         let mut snapshot = encode_snapshot(&[[1; 32]]);
         for end in 0..snapshot.len() {
             let bytes = &snapshot[..end];
@@ -391,9 +444,6 @@ mod tests {
         }
         snapshot.push(0);
         assert!(decode_snapshot(&snapshot, blake3::hash(&snapshot).as_bytes()).is_err());
-        let mut receipt = receipt;
-        receipt.push(0);
-        assert!(Receipt::decode(&receipt).is_err());
     }
 
     #[test]
@@ -431,25 +481,27 @@ mod tests {
             put_u64(&mut bytes, 1);
         }
         assert!(decode_unit(&bytes, blake3::hash(&bytes).as_bytes()).is_err());
-        let mut receipt = Receipt::default().encode();
-        receipt[STATE_MAGIC.len()..STATE_MAGIC.len() + 8].copy_from_slice(&u64::MAX.to_le_bytes());
-        assert!(Receipt::decode(&receipt).is_err());
     }
 
     #[test]
-    fn receipt_roundtrip_and_duplicate_rejection() {
-        let mut receipt = Receipt::default();
-        receipt.usage.insert([3; 32], u64::MAX);
-        assert_eq!(Receipt::decode(&receipt.encode()).unwrap(), receipt);
-        for snapshots in [[3, 3], [4, 3]] {
-            let mut bytes = STATE_MAGIC.to_vec();
-            put_u64(&mut bytes, 2);
-            for snapshot in snapshots {
-                bytes.extend_from_slice(&[snapshot; 32]);
-                put_u64(&mut bytes, 0);
-            }
-            assert!(Receipt::decode(&bytes).is_err());
+    fn cache_entry_roundtrip_and_rejects_truncation() {
+        let entry = CacheEntry {
+            unit_output: [3; 32],
+            fingerprint: u64::MAX,
+            outputs: vec![OutputMetadata {
+                mode: 0o755,
+                mtime_seconds: -1,
+                mtime_nanos: 123,
+            }],
+        };
+        let bytes = entry.encode();
+        assert_eq!(CacheEntry::decode(&bytes).unwrap(), entry);
+        for end in 0..bytes.len() {
+            assert!(CacheEntry::decode(&bytes[..end]).is_err());
         }
+        let mut trailing = bytes;
+        trailing.push(0);
+        assert!(CacheEntry::decode(&trailing).is_err());
     }
 
     #[test]

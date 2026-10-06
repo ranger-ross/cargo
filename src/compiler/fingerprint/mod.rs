@@ -126,8 +126,8 @@
 //! separate directory. Each Unit directory contains:
 //!
 //! - A file with a 16 hex-digit hash, used for quick loading and comparison.
-//!   Shared blob tracking can append an inventory ID and cache revision to this
-//!   record. These optional fields do not participate in the fingerprint hash.
+//!   Shared storage can append an optional unit-output hash to this record.
+//!   This pointer does not participate in the fingerprint hash.
 //! - A `.json` file that contains details about the Fingerprint. This is only
 //!   used to log details about *why* a fingerprint is considered dirty.
 //!   `CARGO_LOG=cargo::compiler::fingerprint=trace cargo build` can be
@@ -403,7 +403,7 @@ use serde::ser;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info};
 
-use crate::compiler::blob_storage::BlobRecord;
+use crate::compiler::blob_storage::UnitOutputHash;
 use crate::compiler::unit_graph::UnitDep;
 use crate::context::FingerprintMethod;
 use crate::util;
@@ -507,7 +507,7 @@ pub fn prepare_target(
     let Some(dirty_reason) = dirty_reason else {
         return Ok(Job::new_fresh());
     };
-    *fingerprint.blob_inventory.lock().unwrap() = None;
+    *fingerprint.unit_output.lock() = None;
 
     // We're going to rebuild, so ensure the source of the crate passes all
     // verification checks before we build it.
@@ -673,9 +673,9 @@ pub struct Fingerprint {
     /// for hashing.
     #[serde(skip)]
     memoized_hash: Mutex<Option<u64>>,
-    /// Inventory published for these outputs, checked against the cache revision.
+    /// Published unit output, excluded from fingerprint propagation.
     #[serde(skip)]
-    blob_inventory: Mutex<Option<BlobRecord>>,
+    unit_output: parking_lot::Mutex<Option<UnitOutputHash>>,
     /// RUSTFLAGS/RUSTDOCFLAGS environment variable value (or config value).
     rustflags: Vec<String>,
     /// Hash of various config settings that change how things are compiled.
@@ -1060,7 +1060,7 @@ impl Fingerprint {
             deps: Vec::new(),
             local: Mutex::new(Vec::new()),
             memoized_hash: Mutex::new(None),
-            blob_inventory: Mutex::new(None),
+            unit_output: parking_lot::Mutex::new(None),
             rustflags: Vec::new(),
             config: 0,
             compile_kind: 0,
@@ -1080,34 +1080,31 @@ impl Fingerprint {
         *self.memoized_hash.lock().unwrap() = None;
     }
 
-    pub(super) fn blob_inventory(&self) -> Option<BlobRecord> {
-        *self.blob_inventory.lock().unwrap()
+    pub(super) fn unit_output(&self) -> Option<UnitOutputHash> {
+        *self.unit_output.lock()
     }
 
-    /// Attach a pointer only after its immutable inventory has been published.
-    pub(super) fn record_blob_inventory(&self, loc: &Path, record: BlobRecord) -> CargoResult<()> {
+    /// Attach a pointer only after its immutable unit output has been published.
+    pub(super) fn record_unit_output(
+        &self,
+        loc: &Path,
+        unit_output: UnitOutputHash,
+    ) -> CargoResult<()> {
         let hash = util::to_hex(self.hash_u64());
-        let revision = blake3::Hash::from(record.revision).to_hex();
-        let result = blake3::Hash::from(record.result).to_hex();
-        let mut bytes = [0; 154];
+        let output = blake3::Hash::from(unit_output).to_hex();
+        let mut bytes = [0; 96];
         let mut remaining = bytes.as_mut_slice();
-        for part in [
-            hash.as_bytes(),
-            b"\nblob-v1 ",
-            revision.as_bytes(),
-            b" ",
-            result.as_bytes(),
-        ] {
+        for part in [hash.as_bytes(), b"\nunit-output-v1 ", output.as_bytes()] {
             let (destination, rest) = remaining.split_at_mut(part.len());
             destination.copy_from_slice(part);
             remaining = rest;
         }
         paths::write_atomic(loc, bytes)?;
-        *self.blob_inventory.lock().unwrap() = Some(record);
+        *self.unit_output.lock() = Some(unit_output);
         Ok(())
     }
 
-    fn hash_u64(&self) -> u64 {
+    pub(super) fn hash_u64(&self) -> u64 {
         if let Some(s) = *self.memoized_hash.lock().unwrap() {
             return s;
         }
@@ -1757,7 +1754,7 @@ fn calculate_normal(
         deps,
         local: Mutex::new(local),
         memoized_hash: Mutex::new(None),
-        blob_inventory: Mutex::new(None),
+        unit_output: parking_lot::Mutex::new(None),
         config: Hasher::finish(&config),
         compile_kind,
         index: build_runner.bcx.unit_to_index[unit],
@@ -2110,7 +2107,7 @@ fn _compare_old_fingerprint(
     track_blobs: bool,
 ) -> CargoResult<FingerprintComparison> {
     let old_fingerprint_short = paths::read(old_hash_path)?;
-    let (old_hash, blob_record) = old_fingerprint_short
+    let (old_hash, unit_output) = old_fingerprint_short
         .split_once('\n')
         .unwrap_or((&old_fingerprint_short, ""));
 
@@ -2118,7 +2115,7 @@ fn _compare_old_fingerprint(
 
     if util::to_hex(new_hash) == old_hash && new_fingerprint.fs_status.up_to_date() {
         if track_blobs {
-            *new_fingerprint.blob_inventory.lock().unwrap() = parse_blob_record(blob_record);
+            *new_fingerprint.unit_output.lock() = parse_unit_output(unit_output);
         }
         return Ok(FingerprintComparison::Fresh);
     }
@@ -2135,12 +2132,9 @@ fn _compare_old_fingerprint(
     Ok(FingerprintComparison::Dirty { reason })
 }
 
-fn parse_blob_record(record: &str) -> Option<BlobRecord> {
-    let (revision, result) = record.strip_prefix("blob-v1 ")?.split_once(' ')?;
-    Some(BlobRecord {
-        revision: *blake3::Hash::from_hex(revision).ok()?.as_bytes(),
-        result: *blake3::Hash::from_hex(result).ok()?.as_bytes(),
-    })
+fn parse_unit_output(record: &str) -> Option<UnitOutputHash> {
+    let hash = record.strip_prefix("unit-output-v1 ")?;
+    Some(*blake3::Hash::from_hex(hash).ok()?.as_bytes())
 }
 
 /// Calculates the fingerprint of a unit thats contains no dep-info files.
@@ -2292,4 +2286,47 @@ where
         reference, reference_mtime
     );
     None
+}
+
+#[cfg(test)]
+mod unit_output_tests {
+    use super::*;
+
+    #[test]
+    fn unit_output_pointer_does_not_change_fingerprint() {
+        let fingerprint = Fingerprint::new();
+        let original_hash = fingerprint.hash_u64();
+        let original_json = serde_json::to_string(&fingerprint).unwrap();
+        let output = *blake3::hash(b"unit output").as_bytes();
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("fingerprint");
+        fingerprint.record_unit_output(&path, output).unwrap();
+        fingerprint.clear_memoized();
+
+        assert_eq!(fingerprint.hash_u64(), original_hash);
+        assert_eq!(serde_json::to_string(&fingerprint).unwrap(), original_json);
+        let record = paths::read(&path).unwrap();
+        let (hash, pointer) = record.split_once('\n').unwrap();
+        assert_eq!(hash, util::to_hex(original_hash));
+        assert_eq!(parse_unit_output(pointer), Some(output));
+        assert_eq!(fingerprint.unit_output(), Some(output));
+    }
+
+    #[test]
+    fn malformed_unit_output_pointer_is_ignored() {
+        assert_eq!(parse_unit_output(""), None);
+        assert_eq!(parse_unit_output("unit-output-v1 not-a-hash"), None);
+        assert_eq!(
+            parse_unit_output(&format!("unit-output-v1 {}", "a".repeat(63))),
+            None
+        );
+        assert_eq!(
+            parse_unit_output(&format!("unit-output-v2 {}", "a".repeat(64))),
+            None
+        );
+        assert_eq!(
+            parse_unit_output(&format!("unit-output-v1 {} trailing", "a".repeat(64))),
+            None
+        );
+    }
 }

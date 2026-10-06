@@ -793,6 +793,9 @@ Controls how often we display a notification to the terminal when a future incom
 
 The `[cache]` table defines settings for cargo's caches.
 
+The unstable [`shared-blob-storage`](unstable.md#remote-build-cache) feature also
+supports a `[cache.remote]` table for REAPI-compatible remote build caches.
+
 #### Global caches
 
 When running `cargo` commands, Cargo will automatically track which files you are using within the global cache.

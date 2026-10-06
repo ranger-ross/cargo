@@ -2081,7 +2081,7 @@ hint-msrv = true
 ## shared-blob-storage
 * Tracking Issue: [rust-lang/cargo#17453](https://github.com/rust-lang/cargo/issues/17453)
 
-Enables shared blob storage and a local build cache for non-local build units.
+Enables shared blob storage and local or remote build caching for non-local build units.
 Blob storage deduplicates output files by their BLAKE3 content hashes. It prefers
 reflinks, uses hardlinks where later compiler writes and artifact metadata permit,
 and otherwise copies. It requires the new build-directory layout.
@@ -2162,6 +2162,104 @@ invocation. Rustdoc output capture does not use hardlinks.
 Ordinary `cargo clean` removes build-directory outputs and leaves shared storage
 available for the next build. Cache writers must be trusted. Content hashes
 detect damaged bytes but do not authenticate their producer.
+
+### Remote build cache
+
+Configure `[cache.remote]` to share eligible library artifacts with
+[BuildBuddy](https://www.buildbuddy.io/) or another Bazel Remote Execution API
+(REAPI) cache. Cargo uses ActionCache for lookups and CAS/ByteStream for artifact
+transfer. It does not request remote execution.
+
+```toml
+[unstable]
+shared-blob-storage = true
+
+[cache.remote]
+url = "grpcs://remote.buildbuddy.io"
+instance-name = "cargo"
+api-key-env = "BUILDBUDDY_API_KEY"
+read-only = false
+timeout = 30
+```
+
+Set `BUILDBUDDY_API_KEY` in your environment to a BuildBuddy cache API key.
+Cargo sends its value as the `x-buildbuddy-api-key` gRPC header. Keep the key out
+of checked-in configuration.
+
+The remote configuration fields are:
+
+* `url` (required): a gRPC server origin. `grpcs://` and `https://` enable TLS
+  with system certificate roots. `grpc://` and `http://` use plaintext and are
+  suitable for a trusted local server. URLs cannot contain credentials, a path,
+  a query, or a fragment. Cargo's `[http]` options do not configure this transport.
+* `instance-name`: optional cache namespace, defaulting to the empty string.
+  Nested names such as `"organization/cargo"` are supported.
+* `api-key-env`: optional environment variable containing a BuildBuddy API key.
+  Omit it for a server that does not require authentication.
+* `read-only`: allows remote reads but prevents uploads, defaulting to `false`.
+* `timeout`: positive timeout in seconds, defaulting to `30`. It bounds connection
+  setup and each unary RPC. Streaming transfers apply it separately when waiting
+  for the next response chunk, handing off an upload chunk, or waiting for the
+  final upload acknowledgment. A progressing transfer or a unit's combined uploads
+  can take longer than this limit. Local file hashing does not count toward it.
+
+Local cache entries are tried first. A remote hit downloads and verifies the
+complete unit output before applying the existing fingerprint, source, and
+environment checks. SHA256 protects transfers through REAPI. Cargo also verifies
+the local BLAKE3 identities and rejects unexpected paths or metadata.
+
+Newly compiled eligible units can populate the remote cache. Local and remote
+cache hits are not republished. If a restored entry is rejected by the input
+checks and recompilation changes its inputs or outputs, the rebuilt entry can
+be published.
+
+Fresh builds do not contact the remote cache. Ordinary `cargo clean` retains the
+local shared cache, so rebuilding afterward can restore locally without any
+remote requests. It does not populate a newly configured remote cache from
+existing local hits. A remote-hit test needs both a clean build directory and an
+empty local shared cache.
+
+Enable cache diagnostics with:
+
+```sh
+CARGO_LOG=cargo::compiler::blob_storage=debug cargo build -Zshared-blob-storage -vv
+```
+
+Logs go to stderr. Initialization reports the local blob directory and whether
+the remote cache is enabled and read-only. Cache events distinguish:
+
+* `restored unit from local cache`: local artifacts satisfied the lookup, so no
+  remote request was needed. Ordinary `cargo clean` preserves this cache.
+* `remote cache miss`: the server had no action result for the unit's key.
+* `published unit to remote cache`: the unit's action result was published.
+  `FindMissingBlobs completed` reports how many blobs the server lacked.
+  Existing remote blobs do not need another upload.
+* `uploaded remote cache blob` and `downloaded remote cache blob`: completed
+  blob transfers, including their SHA256 digest and byte count.
+* `restored unit from remote cache`: the remote entry and its outputs were
+  downloaded or reused locally, verified, and restored.
+* `skipping remote publication of unchanged cache hit`: the restored unit is
+  still valid, so Cargo does not upload blobs or update its remote action result.
+
+For a fresh build, `-vv` shows `Fresh` packages. There are no cache lookups or
+transfers for those units. Uploads indicate newly compiled eligible units rather
+than accepted cache hits.
+
+Remote caching retains the local cache's eligibility and source-path checks.
+Use compatible toolchains, targets, flags, and source-cache layouts across
+machines. Cargo does not relocate embedded absolute paths. Incompatible entries
+fall back to compilation.
+
+`--offline`, `--frozen`, and `net.offline` disable all remote access. A remote
+failure emits a warning, disables further remote operations for that invocation,
+and leaves local caching and compilation available. Invalid remote configuration
+also disables only the remote cache.
+
+Remote cache writers must be trusted. Outputs can contain source paths, recorded
+environment values, and diagnostics. Content hashes detect corruption but do not
+authenticate the producer. Workspace history and build snapshots remain local.
+The server controls remote retention, and `cargo clean gc` only collects local
+storage.
 
 ### Garbage collection
 

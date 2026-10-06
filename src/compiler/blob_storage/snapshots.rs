@@ -42,15 +42,19 @@ impl<'a> SnapshotStore<'a> {
 
     pub fn publish_unit(&self, output: &UnitOutput) -> CargoResult<()> {
         self.check_directories()?;
-        publish_object(&self.root.join(UNITS).join(hex(&output.id)), &output.bytes)
+        publish_object(&self.unit_path(&output.id), &output.bytes)
     }
 
     pub fn read_unit(&self, id: &Digest) -> CargoResult<Option<Vec<Output>>> {
         self.check_directories()?;
-        let Some(bytes) = read_regular(&self.root.join(UNITS).join(hex(id)))? else {
+        let Some(bytes) = read_regular(&self.unit_path(id))? else {
             return Ok(None);
         };
         Ok(decode_native_unit(&bytes, id).ok())
+    }
+
+    pub fn unit_path(&self, id: &Digest) -> PathBuf {
+        self.root.join(UNITS).join(hex(id))
     }
 
     /// Validate the unit output and blob sizes, without rehashing immutable bytes.

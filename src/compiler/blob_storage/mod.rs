@@ -1,4 +1,6 @@
+mod exchange;
 mod format;
+mod remote;
 mod snapshots;
 
 use std::fs::{self, File};
@@ -12,11 +14,12 @@ use format::{
     CacheEntry, Digest, Output, OutputMetadata, UnitOutput, decode_output_path, encode_output_path,
 };
 use parking_lot::Mutex;
+use remote::RemoteCache;
 use tracing::instrument;
 
 use crate::ops::CleanContext;
 use crate::util::cache_lock::CacheLockMode;
-use crate::util::data_structures::HashSet;
+use crate::util::data_structures::{HashMap, HashSet};
 use crate::{CargoResult, GlobalContext};
 use snapshots::{SnapshotStore, check_directory, hex, regular_size};
 
@@ -26,6 +29,10 @@ pub struct BlobStorage {
     root: PathBuf,
     workspace_id: Digest,
     used: Mutex<HashSet<Digest>>,
+    remote: Option<RemoteCache>,
+    remote_error: Mutex<Option<String>>,
+    // Rejected hits can still publish if recompilation changes either identity.
+    restored_units: Mutex<HashMap<String, (u64, Digest)>>,
 }
 
 impl BlobStorage {
@@ -35,10 +42,27 @@ impl BlobStorage {
         create_dir_all(&root)?;
         let workspace_root = fs::canonicalize(workspace_root)?;
         let workspace_id = *blake3::hash(workspace_root.as_os_str().as_encoded_bytes()).as_bytes();
+        let remote = match RemoteCache::from_config(gctx) {
+            Ok(remote) => remote,
+            Err(error) => {
+                gctx.shell()
+                    .warn(format!("remote cache disabled: {error:#}"))?;
+                None
+            }
+        };
+        tracing::debug!(
+            root = %root.display(),
+            remote_enabled = remote.is_some(),
+            remote_read_only = remote.as_ref().is_some_and(RemoteCache::is_read_only),
+            "shared blob storage initialized"
+        );
         Ok(Self {
             root,
             workspace_id,
             used: Mutex::default(),
+            remote,
+            remote_error: Mutex::default(),
+            restored_units: Mutex::default(),
         })
     }
 
@@ -114,7 +138,7 @@ impl BlobStorage {
             .read_unit(&unit_output)?
             .context("missing captured unit output")?;
         let mut metadata = Vec::with_capacity(outputs.len());
-        for output in outputs {
+        for output in &outputs {
             let relative = restore_path(&output.path)?;
             let path = unit_dir.join(relative);
             let file = fs::symlink_metadata(&path)?;
@@ -130,14 +154,31 @@ impl BlobStorage {
                 mtime_nanos: mtime.nanoseconds(),
             });
         }
-        store.publish_cache_entry(
-            unit_hash,
-            &CacheEntry {
-                unit_output,
-                fingerprint,
-                outputs: metadata,
-            },
-        )
+        let entry = CacheEntry {
+            unit_output,
+            fingerprint,
+            outputs: metadata,
+        };
+        store.publish_cache_entry(unit_hash, &entry)?;
+        if let Some(remote) = self.remote()
+            && !remote.is_read_only()
+        {
+            let restored =
+                self.restored_units.lock().get(unit_hash) == Some(&(fingerprint, unit_output));
+            if restored {
+                tracing::debug!(
+                    unit_hash,
+                    "skipping remote publication of unchanged cache hit"
+                );
+            }
+            if !restored
+                && let Err(error) =
+                    exchange::publish(remote, &self.root, unit_hash, &entry, &outputs)
+            {
+                self.remote_failed(error);
+            }
+        }
+        Ok(())
     }
 
     /// Stage and verify all restored bytes before replacing the output tree.
@@ -150,20 +191,62 @@ impl BlobStorage {
         unit_dir: &Path,
     ) -> CargoResult<Option<UnitOutputHash>> {
         let store = SnapshotStore::new(&self.root);
-        let Some(entry) = store.read_cache_entry(unit_hash)? else {
+        if let Some(entry) = store.read_cache_entry(unit_hash)?
+            && entry.fingerprint == fingerprint
+        {
+            match self.restore_outputs(&store, &entry, unit_dir) {
+                Ok(()) => {
+                    if self.remote().is_some_and(|remote| !remote.is_read_only()) {
+                        self.restored_units
+                            .lock()
+                            .insert(unit_hash.to_owned(), (fingerprint, entry.unit_output));
+                    }
+                    tracing::debug!(unit_hash, "restored unit from local cache");
+                    return Ok(Some(entry.unit_output));
+                }
+                Err(error) => {
+                    tracing::debug!(?error, unit_hash, "discarding invalid local cache entry");
+                    store.evict_cache_entry(unit_hash)?;
+                }
+            }
+        }
+        tracing::debug!(unit_hash, "local cache miss");
+        let Some(remote) = self.remote() else {
+            tracing::debug!(unit_hash, "remote cache unavailable");
             return Ok(None);
         };
-        if entry.fingerprint != fingerprint {
-            return Ok(None);
-        }
-        match self.restore_outputs(&store, &entry, unit_dir) {
-            Ok(()) => Ok(Some(entry.unit_output)),
-            Err(error) => {
-                tracing::debug!(?error, unit_hash, "discarding invalid local cache entry");
+        let result = (|| {
+            let Some(entry) = exchange::fetch(remote, &self.root, unit_hash, fingerprint)? else {
+                return Ok(None);
+            };
+            if let Err(error) = self.restore_outputs(&store, &entry, unit_dir) {
                 store.evict_cache_entry(unit_hash)?;
+                return Err(error);
+            }
+            self.restored_units
+                .lock()
+                .insert(unit_hash.to_owned(), (fingerprint, entry.unit_output));
+            tracing::debug!(unit_hash, "restored unit from remote cache");
+            CargoResult::Ok(Some(entry.unit_output))
+        })();
+        match result {
+            Ok(output) => Ok(output),
+            Err(error) => {
+                self.remote_failed(error);
                 Ok(None)
             }
         }
+    }
+
+    fn remote(&self) -> Option<&RemoteCache> {
+        let remote = self.remote.as_ref()?;
+        self.remote_error.lock().is_none().then_some(remote)
+    }
+
+    fn remote_failed(&self, error: anyhow::Error) {
+        self.remote_error
+            .lock()
+            .get_or_insert_with(|| format!("{error:#}"));
     }
 
     fn restore_outputs(
@@ -233,6 +316,10 @@ impl BlobStorage {
 
     /// Only successful builds publish a snapshot and refresh workspace history.
     pub fn finish(&self, gctx: &GlobalContext, successful: bool) -> CargoResult<()> {
+        if let Some(error) = self.remote_error.lock().as_ref() {
+            gctx.shell()
+                .warn(format!("remote cache disabled for this build: {error}"))?;
+        }
         let used = self.used.lock();
         if !successful || used.is_empty() {
             return Ok(());
@@ -426,6 +513,9 @@ mod tests {
             root,
             workspace_id: [1; 32],
             used: Mutex::default(),
+            remote: None,
+            remote_error: Mutex::default(),
+            restored_units: Mutex::default(),
         }
     }
 

@@ -2,7 +2,7 @@
 
 ## Scope
 
-Blob storage deduplicates non-local compiler outputs and supplies the content-addressed data for a local build cache. Tracking uses unit outputs, build snapshots, and workspace history. Remote storage, remote cache lookup, and remote garbage collection are not implemented.
+Blob storage deduplicates non-local compiler outputs and supplies the content-addressed data for local and optional remote build caches. Tracking uses unit outputs, build snapshots, and workspace history. Remote caching uses REAPI ActionCache and CAS/ByteStream. Remote garbage collection remains the server's responsibility.
 
 Enable the implementation with `-Zshared-blob-storage` and the new build-directory layout. Local packages are not stored. Build-cache restoration has stricter eligibility than blob deduplication.
 
@@ -74,6 +74,22 @@ Missing, corrupt, or incompatible entries fall back to compilation. A clean buil
 Permissions and modification times are stored in the cache entry, separate from the unit-output identity. Restored compiler outputs receive the current invocation timestamp to preserve subsequent freshness. Restoration therefore uses private reflinks or copies rather than hardlinks.
 
 Cache entries are not independent garbage-collection roots. An entry remains available while a retained build snapshot references its unit output. A successful cache hit refreshes workspace history. This resolves cache-entry retention without adding a timestamp to each entry or changing build-snapshot identity.
+
+## Remote build cache
+
+The optional `[cache.remote]` configuration connects to a BuildBuddy-compatible REAPI cache. It supports TLS, instance names, environment-supplied API keys, read-only access, RPC deadlines, and streaming inactivity timeouts. Configuration details are in the [unstable feature reference](doc/book/src/reference/unstable.md#remote-build-cache).
+
+Local restoration is attempted first. Remote ActionCache keys hash a versioned Cargo namespace, host OS, unit hash, and input guard with SHA256. Each ActionResult lists the cache entry, unit output, and every referenced blob as an output file. This exposes the complete graph to server-side retention and missing-blob checks.
+
+Uploads hash files incrementally, query FindMissingBlobs, stream missing contents, and publish the action result last. A server can finish an upload early when another writer has already stored the blob. The client checks the complete committed size before accepting that response.
+
+The timeout bounds each unary RPC and each wait for streaming progress or the final upload acknowledgment. It does not cap local hashing, a progressing blob transfer, or the combined uploads for a unit. Timeout warnings identify the operation.
+
+Downloads stage files privately and validate REAPI SHA256 digests, BLAKE3 identities, native relative paths, metadata counts, and blob sizes. Graph metadata is published locally only after the referenced blobs have been verified. The existing output restoration and rustc input checks still decide whether a hit is usable. Absolute compiler paths are not relocated.
+
+Fresh builds make no remote requests. Only newly compiled eligible units can populate the remote cache. Local and remote hits are not republished. Restored input guards and output identities are tracked so that rejecting a hit does not suppress publication of changed artifacts after recompilation. Offline and frozen builds make no remote requests. Remote failures warn and disable further remote operations for that invocation without disabling local storage or compilation.
+
+Remote cache writers must be trusted. Compiler artifacts can contain diagnostics, source paths, and recorded environment values. Workspace history and build snapshots are never uploaded, and local garbage collection does not delete remote data.
 
 ## Deduplication and hardlink safety
 

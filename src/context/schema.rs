@@ -41,6 +41,19 @@ pub struct CargoCacheConfig {
     pub auto_clean_frequency: Option<String>,
     /// Settings for cleaning the global cache.
     pub global_clean: Option<GlobalCleanConfig>,
+    /// Remote compiler artifact cache.
+    pub remote: Option<CargoRemoteCacheConfig>,
+}
+
+#[derive(Debug, Deserialize, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub struct CargoRemoteCacheConfig {
+    pub url: String,
+    pub instance_name: Option<String>,
+    pub api_key_env: Option<String>,
+    pub read_only: Option<bool>,
+    /// RPC and stream inactivity timeout in seconds.
+    pub timeout: Option<u64>,
 }
 
 /// Cache cleaning settings from the `cache.global-clean` config table.

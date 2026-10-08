@@ -606,6 +606,8 @@ struct DepFingerprint {
     /// actually requires the rmeta from what we depend on, so when checking
     /// mtime information all files other than the rmeta can be ignored.
     only_requires_rmeta: bool,
+    /// Whether the dependency is cacheable in the shared build cache.
+    is_cacheable: bool,
     /// The dependency's fingerprint we recursively point to, containing all the
     /// other hash information we'd otherwise need.
     fingerprint: Arc<Fingerprint>,
@@ -787,10 +789,11 @@ impl<'de> Deserialize<'de> for DepFingerprint {
                 memoized_hash: Mutex::new(Some(hash)),
                 ..Fingerprint::new()
             }),
-            // This field is never read since it's only used in
+            // These fields are never read since they're only used in
             // `check_filesystem` which isn't used by fingerprints loaded from
             // disk.
             only_requires_rmeta: false,
+            is_cacheable: false,
         })
     }
 }
@@ -1297,6 +1300,10 @@ impl Fingerprint {
         );
 
         for dep in self.deps.iter() {
+            // We don't check cacheable units' mtimes as they are considered immutable.
+            if dep.is_cacheable {
+                continue;
+            }
             let dep_mtimes = match &dep.fingerprint.fs_status {
                 FsStatus::UpToDate { mtimes } => mtimes,
                 // If our dependency is stale, so are we, so bail out.
@@ -1422,6 +1429,7 @@ impl hash::Hash for Fingerprint {
             public,
             fingerprint,
             only_requires_rmeta: _, // static property, no need to hash
+            is_cacheable: _,
         } in deps
         {
             pkg_id.hash(h);
@@ -1439,7 +1447,6 @@ impl DepFingerprint {
         parent: &Unit,
         dep: &UnitDep,
     ) -> CargoResult<DepFingerprint> {
-        let fingerprint = calculate(build_runner, &dep.unit)?;
         // We need to be careful about what we hash here. We have a goal of
         // supporting renaming a project directory and not rebuilding
         // everything. To do that, however, we need to make sure that the cwd
@@ -1456,12 +1463,28 @@ impl DepFingerprint {
             util::hash_u64(dep.unit.pkg.package_id())
         };
 
+        if build_runner.is_cacheable(&dep.unit) {
+            let hash = util::hash_u64(&build_runner.files().unit_hash(&dep.unit));
+            let mut fingerprint = Fingerprint::new();
+            fingerprint.memoized_hash = Mutex::new(Some(hash));
+            return Ok(DepFingerprint {
+                pkg_id,
+                name: dep.extern_crate_name,
+                public: dep.public,
+                fingerprint: Arc::new(fingerprint),
+                only_requires_rmeta: false,
+                is_cacheable: true,
+            });
+        }
+
+        let fingerprint = calculate(build_runner, &dep.unit)?;
         Ok(DepFingerprint {
             pkg_id,
             name: dep.extern_crate_name,
             public: dep.public,
             fingerprint,
             only_requires_rmeta: build_runner.only_requires_rmeta(parent, &dep.unit),
+            is_cacheable: false,
         })
     }
 }

@@ -10,14 +10,28 @@ use cargo_test_support::{Project, paths, prelude::*, project, t};
 
 type Digest = [u8; 32];
 const UNIT_OUTPUT_MAGIC: &[u8] = b"cargo-shared-storage-unit-output-v1\0";
-const SNAPSHOT_MAGIC: &[u8] = b"cargo-shared-storage-snapshot-v1\0";
+const SNAPSHOT_MAGIC: &[u8] = b"cargo-shared-storage-snapshot-v2\0";
+const CACHE_ENTRY_MAGIC: &[u8] = b"cargo-shared-storage-cache-entry-v2\0";
 
-fn blob_root() -> PathBuf {
-    paths::cargo_home().join("blobs")
+/// A snapshot member. Cacheable units are tracked by cache entry and other
+/// non-local units by unit output.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum Member {
+    UnitOutput(Digest),
+    CacheEntry(String),
 }
 
 fn shared_storage() -> PathBuf {
     paths::cargo_home().join("shared-storage")
+}
+
+fn blob_root() -> PathBuf {
+    shared_storage().join("blobs")
+}
+
+fn blob_path(hash: &Digest) -> PathBuf {
+    let hex = blake3::Hash::from(*hash).to_hex();
+    blob_root().join(&hex[..2]).join(&hex[2..])
 }
 
 fn object_path(kind: &str, id: &Digest) -> PathBuf {
@@ -43,6 +57,17 @@ fn snapshot_project() -> Project {
             "#,
         )
         .publish();
+    // A build script makes this package deduplicated but not cacheable.
+    Package::new("scripted", "0.1.0")
+        .file(
+            "build.rs",
+            r#"fn main() { println!("cargo:rustc-env=SCRIPTED_ZERO=0"); }"#,
+        )
+        .file(
+            "src/lib.rs",
+            r#"pub fn zero() -> u32 { env!("SCRIPTED_ZERO").parse().unwrap() }"#,
+        )
+        .publish();
     project()
         .file(
             "Cargo.toml",
@@ -54,6 +79,7 @@ fn snapshot_project() -> Project {
                 [dependencies]
                 common = "0.1.0"
                 variant = "0.1.0"
+                scripted = "0.1.0"
                 [features]
                 foo = ["variant/foo"]
                 bar = ["variant/bar"]
@@ -61,7 +87,11 @@ fn snapshot_project() -> Project {
         )
         .file(
             "src/main.rs",
-            "fn main() { println!(\"{}\", common::value() + variant::value()); }",
+            r#"
+                fn main() {
+                    println!("{}", common::value() + variant::value() + scripted::zero());
+                }
+            "#,
         )
         .build()
 }
@@ -94,7 +124,7 @@ fn build_fresh_snapshot(p: &Project, feature: &str) {
         .collect();
     assert_eq!(
         artifacts,
-        ["app", "common", "variant"]
+        ["app", "build-script-build", "common", "scripted", "variant"]
             .into_iter()
             .map(|name| (name.to_owned(), true))
             .collect()
@@ -107,8 +137,9 @@ fn snapshot_ids() -> BTreeSet<Digest> {
         return BTreeSet::new();
     }
     t!(fs::read_dir(dir))
+        .map(|entry| t!(entry))
+        .filter(|entry| t!(entry.file_type()).is_file())
         .map(|entry| {
-            let entry = t!(entry);
             let bytes = t!(fs::read(entry.path()));
             let hash = blake3::hash(&bytes);
             assert_eq!(entry.file_name().to_str().unwrap(), hash.to_hex().as_str());
@@ -135,59 +166,84 @@ fn object_bytes(kind: &str, id: &Digest) -> Vec<u8> {
     bytes
 }
 
-fn snapshot_unit_outputs(id: &Digest) -> BTreeSet<Digest> {
+fn snapshot_members(id: &Digest) -> BTreeSet<Member> {
     let data = object_bytes("snapshots", id);
     let mut bytes = data.strip_prefix(SNAPSHOT_MAGIC).unwrap();
-    let count = take_u64(&mut bytes);
-    let unit_outputs = (0..count).map(|_| take_digest(&mut bytes)).collect();
+    let mut members = BTreeSet::new();
+    for _ in 0..take_u64(&mut bytes) {
+        members.insert(Member::UnitOutput(take_digest(&mut bytes)));
+    }
+    for _ in 0..take_u64(&mut bytes) {
+        let len = take_u64(&mut bytes) as usize;
+        let (name, rest) = bytes.split_at(len);
+        bytes = rest;
+        members.insert(Member::CacheEntry(
+            std::str::from_utf8(name).unwrap().to_owned(),
+        ));
+    }
     assert!(bytes.is_empty());
-    unit_outputs
+    members
+}
+
+fn member_path(member: &Member) -> PathBuf {
+    match member {
+        Member::UnitOutput(id) => object_path("unit-output", id),
+        Member::CacheEntry(name) => shared_storage().join("cache-entries").join(name),
+    }
+}
+
+/// Blob hashes and sizes referenced by a unit output or cache entry.
+fn member_blobs(member: &Member) -> Vec<(Digest, u64)> {
+    let (data, magic, header, trailer) = match member {
+        Member::UnitOutput(id) => (object_bytes("unit-output", id), UNIT_OUTPUT_MAGIC, 0, 0),
+        // Cache entries add an input guard and per-file mode and mtime.
+        Member::CacheEntry(_) => (t!(fs::read(member_path(member))), CACHE_ENTRY_MAGIC, 8, 16),
+    };
+    let mut bytes = data.strip_prefix(magic).unwrap();
+    assert!(matches!(bytes[0], 1..=3));
+    bytes = &bytes[1 + header..];
+    let mut blobs = Vec::new();
+    for _ in 0..take_u64(&mut bytes) {
+        let path_len = take_u64(&mut bytes) as usize;
+        bytes = &bytes[path_len..];
+        let hash = take_digest(&mut bytes);
+        let size = take_u64(&mut bytes);
+        bytes = &bytes[trailer..];
+        blobs.push((hash, size));
+    }
+    assert!(bytes.is_empty());
+    blobs
 }
 
 fn snapshot_blobs(id: &Digest) -> BTreeSet<PathBuf> {
     let mut blobs = BTreeSet::new();
-    for unit_output in snapshot_unit_outputs(id) {
-        let data = object_bytes("unit-output", &unit_output);
-        let mut bytes = data.strip_prefix(UNIT_OUTPUT_MAGIC).unwrap();
-        assert!(matches!(bytes[0], 1..=3));
-        bytes = &bytes[1..];
-        for _ in 0..take_u64(&mut bytes) {
-            let path_len = take_u64(&mut bytes) as usize;
-            bytes = &bytes[path_len..];
-            let hash = take_digest(&mut bytes);
-            let size = take_u64(&mut bytes);
-            let path = blob_root().join(blake3::Hash::from(hash).to_hex().as_str());
+    for member in snapshot_members(id) {
+        for (hash, size) in member_blobs(&member) {
+            let path = blob_path(&hash);
             let contents = t!(fs::read(&path));
             assert_eq!(contents.len() as u64, size);
             assert_eq!(blake3::hash(&contents).as_bytes(), &hash);
             blobs.insert(path);
         }
-        assert!(bytes.is_empty());
     }
     blobs
 }
 
-fn workspace_histories() -> Vec<PathBuf> {
-    t!(fs::read_dir(shared_storage().join("workspace-history")))
-        .map(|entry| t!(entry).path())
-        .collect()
-}
-
-fn history_file(id: &Digest) -> PathBuf {
-    let histories = workspace_histories();
-    assert_eq!(histories.len(), 1);
-    histories[0].join(blake3::Hash::from(*id).to_hex().as_str())
+fn usage_file(id: &Digest) -> PathBuf {
+    shared_storage()
+        .join("snapshots/usage")
+        .join(blake3::Hash::from(*id).to_hex().as_str())
 }
 
 fn usage_time(id: &Digest) -> u64 {
-    t!(fs::read_to_string(history_file(id)))
+    t!(fs::read_to_string(usage_file(id)))
         .trim()
         .parse()
         .unwrap()
 }
 
 fn backdate_snapshot(id: &Digest, timestamp: u64) {
-    t!(fs::write(history_file(id), format!("{timestamp}\n")));
+    t!(fs::write(usage_file(id), format!("{timestamp}\n")));
 }
 
 fn cache_files() -> BTreeMap<PathBuf, Vec<u8>> {
@@ -208,7 +264,6 @@ fn cache_files() -> BTreeMap<PathBuf, Vec<u8>> {
         }
     }
     let mut files = BTreeMap::new();
-    collect(&paths::cargo_home(), &blob_root(), &mut files);
     collect(&paths::cargo_home(), &shared_storage(), &mut files);
     files
 }
@@ -232,10 +287,21 @@ fn fingerprint_file(p: &Project, name: &str) -> PathBuf {
     files.into_iter().next().unwrap()
 }
 
-fn unit_output_hash(path: &Path) -> Digest {
-    let data = t!(fs::read_to_string(path));
-    let (_, hash) = data.split_once("\nunit-output-v1 ").unwrap();
-    *t!(blake3::Hash::from_hex(hash)).as_bytes()
+/// Cache entries are keyed by the unit hash, which names the unit directory.
+fn cache_entry_member(fingerprint: &Path) -> Member {
+    let unit_dir = fingerprint.parent().unwrap().parent().unwrap();
+    Member::CacheEntry(unit_dir.file_name().unwrap().to_str().unwrap().to_owned())
+}
+
+/// The member a fingerprint points at.
+fn tracked_member(fingerprint: &Path) -> Member {
+    let data = t!(fs::read_to_string(fingerprint));
+    let (_, pointer) = data.split_once('\n').unwrap();
+    if pointer == "cache-entry-v1" {
+        return cache_entry_member(fingerprint);
+    }
+    let hash = pointer.strip_prefix("unit-output-v1 ").unwrap();
+    Member::UnitOutput(*t!(blake3::Hash::from_hex(hash)).as_bytes())
 }
 
 fn compiled(stderr: &[u8], name: &str) -> bool {
@@ -249,7 +315,6 @@ fn compiled(stderr: &[u8], name: &str) -> bool {
 fn disabled_without_unstable_flag() {
     let p = snapshot_project();
     p.cargo("build --features foo").run();
-    assert!(!blob_root().exists());
     assert!(!shared_storage().exists());
 }
 
@@ -262,19 +327,25 @@ fn stores_dependency_artifact_by_content_hash() {
         .next()
         .unwrap());
     let contents = t!(fs::read(artifact));
-    let blob = blob_root().join(blake3::hash(&contents).to_hex().as_str());
+    let blob = blob_path(blake3::hash(&contents).as_bytes());
     assert_eq!(t!(fs::read(&blob)), contents);
     let id = snapshot_ids().pop_first().unwrap();
     assert!(snapshot_blobs(&id).contains(&blob));
-    assert!(
-        snapshot_unit_outputs(&id).contains(&unit_output_hash(&fingerprint_file(&p, "common")))
-    );
+    // Cacheable units, including consumers of build scripts, appear as cache
+    // entries. The build script itself is only deduplicated, as a unit output.
+    let members = snapshot_members(&id);
+    let common = tracked_member(&fingerprint_file(&p, "common"));
+    assert!(matches!(common, Member::CacheEntry(_)), "{common:?}");
+    let scripted = tracked_member(&fingerprint_file(&p, "scripted"));
+    assert!(matches!(scripted, Member::CacheEntry(_)), "{scripted:?}");
+    assert!(members.contains(&common) && members.contains(&scripted));
+    let entries = members
+        .iter()
+        .filter(|member| matches!(member, Member::CacheEntry(_)))
+        .count();
+    assert_eq!((entries, members.len() - entries), (3, 1), "{members:?}");
     let local = t!(fs::read(p.bin("app")));
-    assert!(
-        !blob_root()
-            .join(blake3::hash(&local).to_hex().as_str())
-            .exists()
-    );
+    assert!(!blob_path(blake3::hash(&local).as_bytes()).exists());
 }
 
 #[cargo_test]
@@ -287,7 +358,7 @@ fn readonly_cargo_home_still_works() {
 }
 
 #[cargo_test]
-fn identical_build_snapshot_refreshes_only_its_workspace_history() {
+fn identical_build_snapshot_refreshes_only_its_usage() {
     let p = snapshot_project();
     build_snapshot(&p, "foo");
     let ids = snapshot_ids();
@@ -295,7 +366,7 @@ fn identical_build_snapshot_refreshes_only_its_workspace_history() {
     let blobs = snapshot_blobs(id);
     let before: BTreeMap<_, _> = cache_files()
         .into_iter()
-        .filter(|(path, _)| !path.starts_with("shared-storage/workspace-history"))
+        .filter(|(path, _)| !path.starts_with("shared-storage/snapshots/usage"))
         .collect();
     let now = t!(SystemTime::now().duration_since(UNIX_EPOCH)).as_secs();
     backdate_snapshot(id, now - 60);
@@ -305,7 +376,7 @@ fn identical_build_snapshot_refreshes_only_its_workspace_history() {
     assert_eq!(snapshot_blobs(id), blobs);
     let after: BTreeMap<_, _> = cache_files()
         .into_iter()
-        .filter(|(path, _)| !path.starts_with("shared-storage/workspace-history"))
+        .filter(|(path, _)| !path.starts_with("shared-storage/snapshots/usage"))
         .collect();
     assert_eq!(after, before);
 }
@@ -424,28 +495,31 @@ fn disabled_rebuild_preserves_blobs_and_reenabled_tracking_captures_new_outputs(
         assert_eq!(t!(fs::read(path)), bytes);
     }
     let fingerprint = fingerprint_file(&p, "changing");
-    assert!(!t!(fs::read_to_string(&fingerprint)).contains("unit-output"));
+    let data = t!(fs::read_to_string(&fingerprint));
+    assert!(!data.contains('\n'), "{data}");
+    let entry = cache_entry_member(&fingerprint);
+    let original = t!(fs::read(member_path(&entry)));
     p.cargo("run -Zshared-blob-storage")
         .env("BLOB_STORAGE_TEST_VALUE", "replacement")
         .masquerade_as_nightly_cargo(&["shared-blob-storage"])
         .with_stdout_data("replacement\n")
         .run();
-    let ids = snapshot_ids();
-    assert_eq!(ids.len(), 2);
-    let new_id = ids.iter().find(|other| **other != id).unwrap();
-    assert!(snapshot_unit_outputs(new_id).contains(&unit_output_hash(&fingerprint)));
-    snapshot_blobs(new_id);
+    // The snapshot names the same cache entry, whose contents now describe the
+    // recaptured outputs.
+    assert_eq!(snapshot_ids(), BTreeSet::from([id]));
+    assert_eq!(tracked_member(&fingerprint), entry);
+    assert!(snapshot_members(&id).contains(&entry));
+    assert_ne!(t!(fs::read(member_path(&entry))), original);
+    snapshot_blobs(&id);
 }
 
 #[cargo_test]
-fn snapshots_without_workspace_history_do_not_retain_blobs() {
+fn snapshots_without_usage_do_not_retain_blobs() {
     let p = snapshot_project();
     build_snapshot(&p, "foo");
     let id = snapshot_ids().pop_first().unwrap();
     let blobs = snapshot_blobs(&id);
-    t!(fs::remove_dir_all(
-        shared_storage().join("workspace-history")
-    ));
+    t!(fs::remove_dir_all(shared_storage().join("snapshots/usage")));
     clean_blobs(&p, "1GiB", false);
     assert!(snapshot_ids().is_empty());
     for blob in blobs {
@@ -455,101 +529,64 @@ fn snapshots_without_workspace_history_do_not_retain_blobs() {
 }
 
 #[cargo_test]
-fn workspace_history_is_independent_of_build_directory() {
-    let p = snapshot_project();
-    build_snapshot(&p, "foo");
-    let first = workspace_histories();
-    p.cargo("build --features foo --target-dir other-target -Zshared-blob-storage")
-        .args(&["--config", "build.build-dir=\"other-build\""])
-        .masquerade_as_nightly_cargo(&["shared-blob-storage"])
-        .run();
-    assert_eq!(workspace_histories(), first);
-    let expected = blake3::hash(
-        t!(fs::canonicalize(p.root()))
-            .as_os_str()
-            .as_encoded_bytes(),
-    );
-    assert_eq!(
-        first[0].file_name().unwrap().to_str().unwrap(),
-        expected.to_hex().as_str()
-    );
-    for id in snapshot_ids() {
-        assert!(usage_time(&id) > 1);
-    }
+fn snapshot_usage_is_shared_across_workspaces() {
+    // Every dependency is cacheable, so both workspaces track the same members.
+    Package::new("common", "0.1.0")
+        .file("src/lib.rs", "pub fn value() -> u32 { 10 }")
+        .publish();
+    let workspace = |name: &str| {
+        project()
+            .at(name)
+            .file(
+                "Cargo.toml",
+                r#"
+                    [package]
+                    name = "app"
+                    version = "0.1.0"
+                    edition = "2021"
+                    [dependencies]
+                    common = "0.1.0"
+                "#,
+            )
+            .file(
+                "src/main.rs",
+                "fn main() { println!(\"{}\", common::value()); }",
+            )
+            .build()
+    };
+    let build = |p: &Project| {
+        p.cargo("build -Zshared-blob-storage")
+            .masquerade_as_nightly_cargo(&["shared-blob-storage"])
+            .run();
+    };
+    build(&workspace("first"));
+    let ids = snapshot_ids();
+    let id = ids.first().unwrap();
+    backdate_snapshot(id, 1);
+    build(&workspace("second"));
+    assert_eq!(snapshot_ids(), ids);
+    assert!(usage_time(id) > 1);
 }
 
-#[cargo_test]
-fn different_workspaces_keep_independent_history() {
-    let p = snapshot_project();
-    build_snapshot(&p, "foo");
-    let first_id = snapshot_ids().pop_first().unwrap();
-    let first_history = history_file(&first_id);
-    let first_blobs = snapshot_blobs(&first_id);
-    t!(fs::write(&first_history, "1\n"));
-    let second = project()
-        .at("second")
-        .file(
-            "Cargo.toml",
-            &t!(fs::read_to_string(p.root().join("Cargo.toml"))),
-        )
-        .file(
-            "src/main.rs",
-            &t!(fs::read_to_string(p.root().join("src/main.rs"))),
-        )
-        .build();
-    build_snapshot(&second, "foo");
-    assert_eq!(workspace_histories().len(), 2);
-    assert_eq!(t!(fs::read_to_string(&first_history)), "1\n");
-    let second_history = workspace_histories()
-        .into_iter()
-        .find(|path| *path != first_history.parent().unwrap())
-        .unwrap();
-    let second_ids: BTreeSet<_> = t!(fs::read_dir(&second_history))
-        .map(|entry| {
-            *t!(blake3::Hash::from_hex(
-                t!(entry).file_name().to_str().unwrap()
-            ))
-            .as_bytes()
-        })
-        .collect();
-    let second_blobs: BTreeSet<_> = second_ids.iter().flat_map(snapshot_blobs).collect();
-    assert!(first_blobs.intersection(&second_blobs).next().is_some());
-    clean_blobs(&p, "1GiB", false);
-    assert_eq!(snapshot_ids(), second_ids);
-    for id in &second_ids {
-        snapshot_blobs(id);
-    }
-    for entry in t!(fs::read_dir(second_history)) {
-        t!(fs::write(t!(entry).path(), "1\n"));
-    }
-    clean_blobs(&p, "1GiB", false);
-    for blob in first_blobs.union(&second_blobs) {
-        assert!(!blob.exists());
-    }
-}
-
-fn incomplete_unit_output_preserves_other_snapshot(damage: &str) {
+fn incomplete_cache_entry_preserves_other_snapshot(damage: &str) {
     let p = snapshot_project();
     build_snapshot(&p, "foo");
     let foo_id = snapshot_ids().pop_first().unwrap();
     let foo_blobs = snapshot_blobs(&foo_id);
-    let foo_outputs = snapshot_unit_outputs(&foo_id);
+    let foo_members = snapshot_members(&foo_id);
     build_snapshot(&p, "bar");
     let bar_id = *snapshot_ids().iter().find(|id| **id != foo_id).unwrap();
     let bar_blobs = snapshot_blobs(&bar_id);
-    let bar_outputs = snapshot_unit_outputs(&bar_id);
-    let broken = foo_outputs.difference(&bar_outputs).next().unwrap();
-    let path = object_path("unit-output", broken);
+    let bar_members = snapshot_members(&bar_id);
+    // Only the `variant` cache entry differs between the feature sets.
+    let broken: Vec<_> = foo_members.difference(&bar_members).collect();
+    assert!(matches!(broken[..], [Member::CacheEntry(_)]), "{broken:?}");
+    let path = member_path(broken[0]);
     match damage {
         "missing" => t!(fs::remove_file(&path)),
         "truncated" => {
             let bytes = t!(fs::read(&path));
             t!(fs::write(&path, &bytes[..bytes.len() / 2]));
-        }
-        "wrong-hash" => {
-            let mut bytes = t!(fs::read(&path));
-            *bytes.last_mut().unwrap() ^= 1;
-            t!(fs::write(&path, bytes));
         }
         _ => unreachable!(),
     }
@@ -565,16 +602,32 @@ fn incomplete_unit_output_preserves_other_snapshot(damage: &str) {
 }
 
 #[cargo_test]
-fn missing_unit_output_preserves_shared_blobs() {
-    incomplete_unit_output_preserves_other_snapshot("missing");
+fn missing_cache_entry_preserves_shared_blobs() {
+    incomplete_cache_entry_preserves_other_snapshot("missing");
 }
 #[cargo_test]
-fn truncated_unit_output_preserves_shared_blobs() {
-    incomplete_unit_output_preserves_other_snapshot("truncated");
+fn truncated_cache_entry_preserves_shared_blobs() {
+    incomplete_cache_entry_preserves_other_snapshot("truncated");
 }
+
 #[cargo_test]
-fn unit_output_hash_mismatch_preserves_shared_blobs() {
-    incomplete_unit_output_preserves_other_snapshot("wrong-hash");
+fn cache_entry_replaced_by_another_workspace_is_not_recaptured() {
+    let p = snapshot_project();
+    build_snapshot(&p, "foo");
+    let id = snapshot_ids().pop_first().unwrap();
+    let fingerprint = fingerprint_file(&p, "common");
+    let entry = tracked_member(&fingerprint);
+    let path = member_path(&entry);
+    // Another workspace can publish the same unit hash with a different input
+    // guard. Fresh builds keep using the entry rather than rewriting it.
+    let mut replaced = t!(fs::read(&path));
+    replaced[CACHE_ENTRY_MAGIC.len() + 1] ^= 1;
+    t!(fs::write(&path, &replaced));
+    build_fresh_snapshot(&p, "foo");
+    assert_eq!(t!(fs::read(&path)), replaced);
+    assert_eq!(tracked_member(&fingerprint), entry);
+    assert_eq!(snapshot_ids(), BTreeSet::from([id]));
+    assert!(snapshot_members(&id).contains(&entry));
 }
 
 #[cargo_test]
@@ -583,7 +636,6 @@ fn fresh_outputs_repopulate_deleted_storage() {
     build_snapshot(&p, "foo");
     let id = snapshot_ids().pop_first().unwrap();
     let blobs = snapshot_blobs(&id);
-    t!(fs::remove_dir_all(blob_root()));
     t!(fs::remove_dir_all(shared_storage()));
     build_fresh_snapshot(&p, "foo");
     assert_eq!(snapshot_ids(), BTreeSet::from([id]));
@@ -597,21 +649,23 @@ fn malformed_optional_hash_recaptures_without_recompiling() {
     build_snapshot(&p, "foo");
     let id = snapshot_ids().pop_first().unwrap();
     let fingerprint = fingerprint_file(&p, "common");
-    let hash = unit_output_hash(&fingerprint);
+    let entry = tracked_member(&fingerprint);
+    let original = t!(fs::read(member_path(&entry)));
     let record = t!(fs::read_to_string(&fingerprint));
     let base = record.split_once('\n').unwrap().0;
     t!(fs::write(
         &fingerprint,
-        format!("{base}\nunit-output-v1 invalid")
+        format!("{base}\ncache-entry-v1 invalid")
     ));
-    t!(fs::remove_file(object_path("unit-output", &hash)));
+    t!(fs::remove_file(member_path(&entry)));
     build_fresh_snapshot(&p, "foo");
-    assert_eq!(unit_output_hash(&fingerprint), hash);
+    assert_eq!(tracked_member(&fingerprint), entry);
+    assert_eq!(t!(fs::read(member_path(&entry))), original);
     snapshot_blobs(&id);
 }
 
 #[cargo_test]
-fn failed_build_does_not_refresh_workspace_history() {
+fn failed_build_does_not_refresh_snapshot_usage() {
     let p = changing_project();
     p.cargo("build -Zshared-blob-storage")
         .env("BLOB_STORAGE_TEST_VALUE", "original")
@@ -632,10 +686,10 @@ fn failed_build_does_not_refresh_workspace_history() {
         .run();
     assert_eq!(snapshot_ids(), ids);
     assert_eq!(usage_time(id), 1);
-    let completed = unit_output_hash(&fingerprint_file(&p, "changing"));
-    assert!(object_path("unit-output", &completed).is_file());
+    let completed = tracked_member(&fingerprint_file(&p, "changing"));
+    assert!(member_path(&completed).is_file());
     clean_blobs(&p, "0", false);
-    assert!(!object_path("unit-output", &completed).exists());
+    assert!(!member_path(&completed).exists());
     p.change_file(
         "src/main.rs",
         "fn main() { println!(\"{}\", changing::value()); }",
@@ -645,7 +699,7 @@ fn failed_build_does_not_refresh_workspace_history() {
         .masquerade_as_nightly_cargo(&["shared-blob-storage"])
         .with_stdout_data("replacement\n")
         .run();
-    assert!(snapshot_unit_outputs(snapshot_ids().first().unwrap()).contains(&completed));
+    assert!(snapshot_members(snapshot_ids().first().unwrap()).contains(&completed));
 }
 
 fn restores_immutable_dependencies(mode: &str) {
@@ -720,7 +774,7 @@ fn corrupt_cache_blob_falls_back_to_compilation() {
         .next()
         .unwrap());
     let original = t!(fs::read(&artifact));
-    let blob = blob_root().join(blake3::hash(&original).to_hex().as_str());
+    let blob = blob_path(blake3::hash(&original).as_bytes());
     let mut wrong = original.clone();
     wrong[0] ^= 1;
     let replacement = blob_root().join("replacement");
@@ -730,7 +784,7 @@ fn corrupt_cache_blob_falls_back_to_compilation() {
     let output = p
         .cargo("run -vv --features foo -Zshared-blob-storage")
         .masquerade_as_nightly_cargo(&["shared-blob-storage"])
-        .with_stdout_data("11\n")
+        .with_stdout_contains("11")
         .run();
     assert!(compiled(&output.stderr, "common"));
     assert_eq!(t!(fs::read(blob)), original);
@@ -744,7 +798,7 @@ fn changed_features_do_not_restore_another_unit() {
     let output = p
         .cargo("run -vv --features bar -Zshared-blob-storage")
         .masquerade_as_nightly_cargo(&["shared-blob-storage"])
-        .with_stdout_data("12\n")
+        .with_stdout_contains("12")
         .run();
     assert!(
         !compiled(&output.stderr, "common"),
@@ -804,7 +858,7 @@ fn changed_environment_invalidates_cached_transitive_consumers() {
 }
 
 #[cargo_test]
-fn build_scripts_proc_macros_and_their_consumers_are_not_restored() {
+fn consumers_of_build_scripts_and_proc_macros_are_restored() {
     Package::new("scripted", "0.1.0")
         .file(
             "build.rs",
@@ -868,25 +922,124 @@ fn build_scripts_proc_macros_and_their_consumers_are_not_restored() {
         .masquerade_as_nightly_cargo(&["shared-blob-storage"])
         .with_stdout_contains("42 42")
         .run();
-    for name in ["scripted", "macro_dep", "consumer", "app"] {
-        assert!(
-            compiled(&output.stderr, name),
-            "unexpected cache hit for {name}"
-        );
+    // Build scripts and proc-macros still compile. Their consumers restore.
+    for (name, expected) in [
+        ("build_script_build", true),
+        ("macro_dep", true),
+        ("scripted", false),
+        ("consumer", false),
+        ("app", true),
+    ] {
+        assert_eq!(compiled(&output.stderr, name), expected, "{name}");
     }
 }
 
+/// Build scripts that read untracked inputs. A clean build reruns them without
+/// changing any fingerprint, so only the cache key can notice new output.
+fn untracked_script_project() -> Project {
+    Package::new("generated", "0.1.0")
+        .file(
+            "build.rs",
+            r#"
+            fn main() {
+                let value = std::env::var("GENERATED_VALUE").unwrap();
+                let out = std::env::var("OUT_DIR").unwrap();
+                std::fs::write(
+                    format!("{out}/value.rs"),
+                    format!("pub const VALUE: &str = {value:?};"),
+                )
+                .unwrap();
+            }
+        "#,
+        )
+        .file(
+            "src/lib.rs",
+            r#"include!(concat!(env!("OUT_DIR"), "/value.rs"));"#,
+        )
+        .publish();
+    Package::new("configured", "0.1.0")
+        .file(
+            "build.rs",
+            r#"
+            fn main() {
+                println!("cargo::rustc-check-cfg=cfg(flavor, values(\"one\", \"two\"))");
+                let value = std::env::var("CONFIGURED_VALUE").unwrap();
+                println!("cargo::rustc-cfg=flavor=\"{value}\"");
+            }
+        "#,
+        )
+        .file(
+            "src/lib.rs",
+            r#"
+            #[cfg(flavor = "one")]
+            pub const VALUE: &str = "one";
+            #[cfg(flavor = "two")]
+            pub const VALUE: &str = "two";
+        "#,
+        )
+        .publish();
+    project()
+        .file(
+            "Cargo.toml",
+            r#"
+        [package]
+        name = "app"
+        version = "0.1.0"
+        edition = "2021"
+        [dependencies]
+        generated = "0.1.0"
+        configured = "0.1.0"
+    "#,
+        )
+        .file(
+            "src/main.rs",
+            r#"fn main() { println!("{} {}", generated::VALUE, configured::VALUE); }"#,
+        )
+        .build()
+}
+
+fn run_untracked(p: &Project, generated: &str, configured: &str) -> Vec<u8> {
+    p.cargo("clean").run();
+    p.cargo("run -vv -Zshared-blob-storage")
+        .env("GENERATED_VALUE", generated)
+        .env("CONFIGURED_VALUE", configured)
+        .masquerade_as_nightly_cargo(&["shared-blob-storage"])
+        .with_stdout_contains(format!("{generated} {configured}"))
+        .run()
+        .stderr
+}
+
 #[cargo_test]
-fn corrupt_workspace_history_stops_collection_before_deleting_blobs() {
+fn generated_out_dir_inputs_are_part_of_the_cache_key() {
+    let p = untracked_script_project();
+    run_untracked(&p, "one", "one");
+    let same = run_untracked(&p, "one", "one");
+    assert!(!compiled(&same, "generated"));
+    let changed = run_untracked(&p, "two", "one");
+    assert!(compiled(&changed, "generated"));
+    assert!(!compiled(&changed, "configured"));
+}
+
+#[cargo_test]
+fn build_script_cfgs_are_part_of_the_cache_key() {
+    let p = untracked_script_project();
+    run_untracked(&p, "one", "one");
+    let changed = run_untracked(&p, "one", "two");
+    assert!(compiled(&changed, "configured"));
+    assert!(!compiled(&changed, "generated"));
+}
+
+#[cargo_test]
+fn corrupt_snapshot_usage_stops_collection_before_deleting_blobs() {
     let p = snapshot_project();
     build_snapshot(&p, "foo");
     let id = snapshot_ids().pop_first().unwrap();
-    t!(fs::write(history_file(&id), "not a timestamp\n"));
+    t!(fs::write(usage_file(&id), "not a timestamp\n"));
     let before = cache_files();
     p.cargo("clean gc --max-blob-size 0 -Zgc -Zshared-blob-storage")
         .masquerade_as_nightly_cargo(&["gc", "shared-blob-storage"])
         .with_status(101)
-        .with_stderr_contains("[ERROR] invalid workspace history timestamp: [..]")
+        .with_stderr_contains("[ERROR] invalid snapshot usage timestamp: [..]")
         .run();
     assert_eq!(cache_files(), before);
     p.process(&p.bin("app")).with_stdout_data("11\n").run();

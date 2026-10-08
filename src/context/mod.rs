@@ -823,12 +823,12 @@ impl GlobalContext {
         Ok(Filesystem::new(path))
     }
 
-    pub fn blob_storage_dir(&self) -> Option<PathBuf> {
+    pub fn shared_storage_dir(&self) -> Option<PathBuf> {
         if !self.cli_unstable().shared_blob_storage || !self.cli_unstable().build_dir_new_layout {
             return None;
         }
 
-        return Some(self.home_path.as_path_unlocked().join("blobs"));
+        Some(self.home_path.as_path_unlocked().join("shared-storage"))
     }
 
     /// Get a configuration value by key.

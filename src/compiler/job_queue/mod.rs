@@ -392,6 +392,8 @@ enum Message {
     /// Peak resident set size (in bytes) of a unit's process, for `--timings`.
     PeakMemory(JobId, u64),
     UnusedExterns(JobId, std::collections::BTreeSet<InternedString>),
+    /// A deferred job may be ready to start.
+    Wake,
 }
 
 impl<'gctx> JobQueue<'gctx> {
@@ -537,6 +539,12 @@ impl<'gctx> JobQueue<'gctx> {
             })
             .context("failed to create helper thread for jobserver management")?;
 
+        // Restore jobs deferred behind a remote prefetch start once it finishes.
+        if let Some(storage) = build_runner.files().blob_storage() {
+            let messages = state.messages.clone();
+            storage.set_waker(Box::new(move || messages.push(Message::Wake)));
+        }
+
         // Create a helper thread to manage the diagnostics for rustfix if
         // necessary.
         let messages = state.messages.clone();
@@ -589,9 +597,16 @@ impl<'gctx> DrainState<'gctx> {
         // we're able to perform some parallel work.
         // The `pending_queue` is sorted in ascending priority order, and we
         // remove items from its end to schedule the highest priority items
-        // sooner.
-        while self.has_extra_tokens() && !self.pending_queue.is_empty() {
-            let (unit, job, _) = self.pending_queue.pop().unwrap();
+        // sooner. Deferred jobs are skipped until they are ready.
+        while self.has_extra_tokens() {
+            let Some(idx) = self
+                .pending_queue
+                .iter()
+                .rposition(|(_, job, _)| !job.deferred())
+            else {
+                break;
+            };
+            let (unit, job, _) = self.pending_queue.remove(idx);
             *self.counts.get_mut(&unit.pkg.package_id()).unwrap() -= 1;
             // Print out some nice progress information.
             // NOTE: An error here will drop the job without starting it.
@@ -764,6 +779,7 @@ impl<'gctx> DrainState<'gctx> {
             Message::SectionTiming(id, section) => {
                 self.timings.unit_section_timing(build_runner, id, &section);
             }
+            Message::Wake => {}
             Message::PeakMemory(id, bytes) => {
                 self.timings.unit_peak_memory(build_runner, id, bytes);
             }
@@ -784,7 +800,10 @@ impl<'gctx> DrainState<'gctx> {
         if events.is_empty() {
             loop {
                 self.tick_progress();
-                self.tokens.truncate(self.active.len() - 1);
+                // Deferred jobs keep their tokens for when they become ready.
+                if self.pending_queue.is_empty() {
+                    self.tokens.truncate(self.active.len().saturating_sub(1));
+                }
                 match self.messages.pop(Duration::from_millis(500)) {
                     Some(message) => {
                         events.push(message);
@@ -827,15 +846,16 @@ impl<'gctx> DrainState<'gctx> {
         // must be handled in such a way that the loop is still allowed to
         // drain event messages.
         loop {
-            if errors.count == 0 || build_runner.bcx.build_config.keep_going {
+            let spawning = errors.count == 0 || build_runner.bcx.build_config.keep_going;
+            if spawning {
                 if let Err(e) = self.spawn_work_if_possible(build_runner, jobserver_helper, scope) {
                     self.handle_error(&mut build_runner.bcx.gctx.shell(), &mut errors, e);
                 }
             }
 
             // If after all that we're not actually running anything then we're
-            // done!
-            if self.active.is_empty() {
+            // done! Jobs left pending are deferred and wait for a wakeup.
+            if self.active.is_empty() && (self.pending_queue.is_empty() || !spawning) {
                 break;
             }
 

@@ -1,4 +1,4 @@
-//! Immutable unit outputs rooted only by local, per-snapshot workspace history.
+//! Unit outputs and cache entries rooted only by per-snapshot usage timestamps.
 //!
 //! Builds hold a package-cache Shared lock for the storage lifetime. Snapshot
 //! commits also hold DownloadExclusive; collection requires MutateExclusive.
@@ -11,33 +11,27 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, ensure};
 
 use super::format::{
-    CacheEntry, Digest, Output, UnitOutput, decode_native_unit, decode_snapshot, decode_unit,
-    digest_filename, encode_snapshot, snapshot_id,
+    CacheEntry, Digest, Output, Snapshot, UnitOutput, decode_native_unit, decode_unit,
+    digest_filename, valid_unit_hash,
 };
 use crate::CargoResult;
 use crate::ops::CleanContext;
 use crate::util::data_structures::HashMap;
 
 const RETENTION: u64 = 30 * 24 * 60 * 60;
+const BLOBS: &str = "blobs";
 const UNITS: &str = "unit-output";
 const SNAPSHOTS: &str = "snapshots";
-const HISTORY: &str = "workspace-history";
+const USAGE: &str = "usage";
 const CACHE: &str = "cache-entries";
 
 pub(super) struct SnapshotStore<'a> {
-    blobs: &'a Path,
-    root: PathBuf,
+    root: &'a Path,
 }
 
 impl<'a> SnapshotStore<'a> {
-    pub fn new(blobs: &'a Path) -> Self {
-        Self {
-            blobs,
-            root: blobs
-                .parent()
-                .expect("blob directory has a parent")
-                .join("shared-storage"),
-        }
+    pub fn new(root: &'a Path) -> Self {
+        Self { root }
     }
 
     pub fn publish_unit(&self, output: &UnitOutput) -> CargoResult<()> {
@@ -57,28 +51,30 @@ impl<'a> SnapshotStore<'a> {
         self.root.join(UNITS).join(hex(id))
     }
 
-    /// Validate the unit output and blob sizes, without rehashing immutable bytes.
-    pub fn unit_is_complete(&self, id: &Digest) -> CargoResult<bool> {
+    /// The unit output's files when it and every referenced blob are present.
+    /// Blob sizes are validated without rehashing immutable bytes.
+    pub fn complete_unit(&self, id: &Digest) -> CargoResult<Option<Vec<Output>>> {
         let Some(outputs) = self.read_unit(id)? else {
-            return Ok(false);
+            return Ok(None);
         };
-        for output in outputs {
-            if regular_size(&self.blobs.join(hex(&output.hash)))? != Some(output.size) {
-                return Ok(false);
+        for output in &outputs {
+            if regular_size(&blob_path(self.root, &output.hash))? != Some(output.size) {
+                return Ok(None);
             }
         }
-        Ok(true)
+        Ok(Some(outputs))
     }
 
-    pub fn read_cache_entry(&self, unit_hash: &str) -> CargoResult<Option<CacheEntry>> {
+    /// Returns the entry with the BLAKE3 digest of its encoded bytes.
+    pub fn read_cache_entry(&self, unit_hash: &str) -> CargoResult<Option<(Digest, CacheEntry)>> {
         self.check_directories()?;
         let path = self.cache_path(unit_hash)?;
         let Some(bytes) = read_regular(&path)? else {
             self.evict_cache_entry(unit_hash)?;
             return Ok(None);
         };
-        match CacheEntry::decode(&bytes) {
-            Ok(entry) => Ok(Some(entry)),
+        match CacheEntry::decode_native(&bytes) {
+            Ok(entry) => Ok(Some((*blake3::hash(&bytes).as_bytes(), entry))),
             Err(_) => {
                 self.evict_cache_entry(unit_hash)?;
                 Ok(None)
@@ -86,9 +82,30 @@ impl<'a> SnapshotStore<'a> {
         }
     }
 
-    pub fn publish_cache_entry(&self, unit_hash: &str, entry: &CacheEntry) -> CargoResult<()> {
+    /// The entry when it decodes natively and every referenced blob is present.
+    /// Blob sizes are validated without rehashing blob contents.
+    pub fn complete_cache_entry(&self, unit_hash: &str) -> CargoResult<Option<CacheEntry>> {
         self.check_directories()?;
-        atomic_replace(&self.cache_path(unit_hash)?, &entry.encode())
+        let Some(bytes) = read_regular(&self.cache_path(unit_hash)?)? else {
+            return Ok(None);
+        };
+        let Ok(entry) = CacheEntry::decode_native(&bytes) else {
+            return Ok(None);
+        };
+        for output in &entry.outputs {
+            if regular_size(&blob_path(self.root, &output.hash))? != Some(output.size) {
+                return Ok(None);
+            }
+        }
+        Ok(Some(entry))
+    }
+
+    /// Returns the BLAKE3 digest of the encoded entry.
+    pub fn publish_cache_entry(&self, unit_hash: &str, entry: &CacheEntry) -> CargoResult<Digest> {
+        self.check_directories()?;
+        let bytes = entry.encode();
+        atomic_replace(&self.cache_path(unit_hash)?, &bytes)?;
+        Ok(*blake3::hash(&bytes).as_bytes())
     }
 
     pub fn evict_cache_entry(&self, unit_hash: &str) -> CargoResult<()> {
@@ -111,16 +128,24 @@ impl<'a> SnapshotStore<'a> {
     }
 
     /// Refresh every successful use, even when the graph has not changed.
-    pub fn save(&self, workspace: &Digest, mut outputs: Vec<Digest>, now: u64) -> CargoResult<()> {
+    pub fn save(
+        &self,
+        unit_outputs: Vec<Digest>,
+        cache_entries: Vec<String>,
+        now: u64,
+    ) -> CargoResult<()> {
         self.check_directories()?;
-        let id = snapshot_id(&mut outputs);
+        let bytes = Snapshot::new(unit_outputs, cache_entries).encode();
+        let id = *blake3::hash(&bytes).as_bytes();
         let manifest = self.root.join(SNAPSHOTS).join(hex(&id));
-        if !read_regular(&manifest)?.is_some_and(|bytes| blake3::hash(&bytes).as_bytes() == &id) {
-            atomic_replace(&manifest, &encode_snapshot(&outputs))?;
+        if !read_regular(&manifest)?.is_some_and(|existing| existing == bytes) {
+            atomic_replace(&manifest, &bytes)?;
         }
-        let workspace_dir = self.root.join(HISTORY).join(hex(workspace));
-        check_directory(&workspace_dir)?;
-        atomic_replace(&workspace_dir.join(hex(&id)), format!("{now}\n").as_bytes())
+        atomic_replace(&self.usage_path(&id), format!("{now}\n").as_bytes())
+    }
+
+    fn usage_path(&self, id: &Digest) -> PathBuf {
+        self.root.join(SNAPSHOTS).join(USAGE).join(hex(id))
     }
 
     pub fn clean(
@@ -137,31 +162,42 @@ impl<'a> SnapshotStore<'a> {
     }
 
     fn check_directories(&self) -> CargoResult<()> {
-        check_directory(self.blobs)?;
-        check_directory(&self.root)?;
-        for directory in [UNITS, SNAPSHOTS, HISTORY, CACHE] {
+        check_directory(self.root)?;
+        for directory in [BLOBS, UNITS, SNAPSHOTS, CACHE] {
             check_directory(&self.root.join(directory))?;
         }
+        check_directory(&self.root.join(SNAPSHOTS).join(USAGE))?;
         Ok(())
     }
 
     /// Read and plan the complete graph before mutation. Unreadable or malformed
-    /// history can hide a live root, so it aborts collection rather than pruning.
+    /// usage can hide a live root, so it aborts collection rather than pruning.
     fn plan_collection(&self, max_size: Option<u64>, now: u64) -> CargoResult<Collection> {
         self.check_directories()?;
         let mut blobs = HashMap::default();
         let mut invalid = Vec::new();
-        for (id, path) in object_files(self.blobs)? {
+        for (id, path) in blob_files(&self.root.join(BLOBS))? {
             if let Some(size) = regular_size(&path)? {
                 blobs.insert(id, (path, size));
             } else {
                 invalid.push(path);
             }
         }
+        // Every complete unit output and cache entry, with its distinct blobs.
+        let references = |outputs: Vec<(Digest, u64)>| -> Option<Vec<Digest>> {
+            let mut references = Vec::with_capacity(outputs.len());
+            for (hash, size) in outputs {
+                if blobs.get(&hash).is_none_or(|(_, stored)| *stored != size) {
+                    return None;
+                }
+                references.push(hash);
+            }
+            references.sort_unstable();
+            references.dedup();
+            Some(references)
+        };
+        let mut members = HashMap::default();
         let unit_files = object_files(&self.root.join(UNITS))?;
-        let snapshot_files = object_files(&self.root.join(SNAPSHOTS))?;
-        let mut units = HashMap::default();
-        let mut output_counts = HashMap::default();
         for (id, path) in &unit_files {
             let Some(bytes) = read_regular(path)? else {
                 continue;
@@ -169,87 +205,94 @@ impl<'a> SnapshotStore<'a> {
             let Ok(outputs) = decode_unit(&bytes, id) else {
                 continue;
             };
-            if outputs.iter().all(|output| {
-                blobs
-                    .get(&output.hash)
-                    .is_some_and(|(_, size)| *size == output.size)
-            }) {
-                output_counts.insert(*id, outputs.len());
-                let mut references: Vec<_> =
-                    outputs.into_iter().map(|output| output.hash).collect();
-                references.sort_unstable();
-                references.dedup();
-                units.insert(*id, references);
+            let outputs = outputs.iter().map(|output| (output.hash, output.size));
+            if let Some(references) = references(outputs.collect()) {
+                members.insert(Member::UnitOutput(*id), references);
             }
         }
+        let mut cache_files = Vec::new();
+        for entry in entries(&self.root.join(CACHE))? {
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            if !valid_unit_hash(&name) {
+                continue;
+            }
+            let path = entry.path();
+            // Entries are decoded in any path encoding. Invalid ones are disposable.
+            if let Some(entry) =
+                read_regular(&path)?.and_then(|bytes| CacheEntry::decode(&bytes).ok())
+                && let Some(references) = references(
+                    entry
+                        .outputs
+                        .iter()
+                        .map(|output| (output.hash, output.size))
+                        .collect(),
+                )
+            {
+                members.insert(Member::CacheEntry(name.clone()), references);
+            }
+            cache_files.push((Member::CacheEntry(name), path));
+        }
+        let snapshot_files = object_files(&self.root.join(SNAPSHOTS))?;
         let mut snapshots = HashMap::default();
         for (id, path) in &snapshot_files {
             let Some(bytes) = read_regular(path)? else {
                 continue;
             };
-            let Ok(outputs) = decode_snapshot(&bytes, id) else {
+            let Ok(snapshot) = Snapshot::decode(&bytes, id) else {
                 continue;
             };
-            if outputs.iter().all(|output| units.contains_key(output)) {
-                snapshots.insert(*id, outputs);
+            let snapshot_members: Vec<_> = snapshot
+                .unit_outputs
+                .into_iter()
+                .map(Member::UnitOutput)
+                .chain(snapshot.cache_entries.into_iter().map(Member::CacheEntry))
+                .collect();
+            if snapshot_members
+                .iter()
+                .all(|member| members.contains_key(member))
+            {
+                snapshots.insert(*id, snapshot_members);
             }
         }
 
         let cutoff = now.saturating_sub(RETENTION);
-        let mut histories = Vec::new();
+        let mut usages = Vec::new();
         let mut recency = HashMap::<Digest, u64>::default();
-        for workspace in entries(&self.root.join(HISTORY))? {
-            if workspace
-                .file_name()
-                .to_str()
-                .and_then(digest_filename)
-                .is_none()
-            {
+        for entry in entries(&self.root.join(SNAPSHOTS).join(USAGE))? {
+            let path = entry.path();
+            let Some(id) = entry.file_name().to_str().and_then(digest_filename) else {
                 continue;
-            }
-            let path = workspace.path();
+            };
+            let bytes = read_regular(&path)?
+                .with_context(|| format!("unreadable snapshot usage: {}", path.display()))?;
+            let timestamp = std::str::from_utf8(&bytes)?;
+            let timestamp = timestamp.strip_suffix('\n').unwrap_or(timestamp);
             ensure!(
-                workspace.file_type()?.is_dir(),
-                "invalid workspace history directory: {}",
+                !timestamp.is_empty() && timestamp.bytes().all(|b| b.is_ascii_digit()),
+                "invalid snapshot usage timestamp: {}",
                 path.display()
             );
-            for entry in entries(&path)? {
-                let path = entry.path();
-                let Some(id) = entry.file_name().to_str().and_then(digest_filename) else {
-                    continue;
-                };
-                let bytes = read_regular(&path)?
-                    .with_context(|| format!("unreadable workspace history: {}", path.display()))?;
-                let timestamp = std::str::from_utf8(&bytes)?;
-                let timestamp = timestamp.strip_suffix('\n').unwrap_or(timestamp);
-                ensure!(
-                    !timestamp.is_empty() && timestamp.bytes().all(|b| b.is_ascii_digit()),
-                    "invalid workspace history timestamp: {}",
-                    path.display()
-                );
-                let time: u64 = timestamp.parse().with_context(|| {
-                    format!("invalid workspace history timestamp: {}", path.display())
-                })?;
-                if time >= cutoff && snapshots.contains_key(&id) {
-                    recency
-                        .entry(id)
-                        .and_modify(|last| *last = (*last).max(time))
-                        .or_insert(time);
-                }
-                histories.push((path, id, time));
+            let time: u64 = timestamp
+                .parse()
+                .with_context(|| format!("invalid snapshot usage timestamp: {}", path.display()))?;
+            if time >= cutoff && snapshots.contains_key(&id) {
+                recency.insert(id, time);
             }
+            usages.push((path, id, time));
         }
 
         // Reference counts count unique physical blobs across all retained roots.
-        let mut unit_refs = HashMap::<Digest, usize>::default();
+        let mut member_refs = HashMap::<&Member, usize>::default();
         let mut blob_refs = HashMap::<Digest, usize>::default();
         let mut size = 0_u128;
         for id in recency.keys() {
-            for unit in &snapshots[id] {
-                let count = unit_refs.entry(*unit).or_default();
+            for member in &snapshots[id] {
+                let count = member_refs.entry(member).or_default();
                 *count += 1;
                 if *count == 1 {
-                    for blob in &units[unit] {
+                    for blob in &members[member] {
                         let count = blob_refs.entry(*blob).or_default();
                         *count += 1;
                         if *count == 1 {
@@ -267,11 +310,11 @@ impl<'a> SnapshotStore<'a> {
                     break;
                 }
                 recency.remove(&id);
-                for unit in &snapshots[&id] {
-                    let count = unit_refs.get_mut(unit).unwrap();
+                for member in &snapshots[&id] {
+                    let count = member_refs.get_mut(member).unwrap();
                     *count -= 1;
                     if *count == 0 {
-                        for blob in &units[unit] {
+                        for blob in &members[member] {
                             let count = blob_refs.get_mut(blob).unwrap();
                             *count -= 1;
                             if *count == 0 {
@@ -283,27 +326,15 @@ impl<'a> SnapshotStore<'a> {
             }
         }
 
+        let retained = |member: &Member| member_refs.get(member).is_some_and(|count| *count > 0);
         let mut plan = Collection::default();
-        for (path, id, time) in histories {
-            if time < cutoff || !recency.contains_key(&id) {
+        for (path, id, _) in usages {
+            if !recency.contains_key(&id) {
                 plan.removals.push(path);
             }
         }
-        // Cache entries are edges, never roots. Invalid entries are disposable.
-        for entry in entries(&self.root.join(CACHE))? {
-            let path = entry.path();
-            if !entry.file_name().to_str().is_some_and(valid_unit_hash) {
-                continue;
-            }
-            let valid = read_regular(&path)?
-                .and_then(|bytes| CacheEntry::decode(&bytes).ok())
-                .is_some_and(|entry| {
-                    unit_refs
-                        .get(&entry.unit_output)
-                        .is_some_and(|count| *count > 0)
-                        && output_counts.get(&entry.unit_output) == Some(&entry.outputs.len())
-                });
-            if !valid {
+        for (member, path) in cache_files {
+            if !retained(&member) {
                 plan.removals.push(path);
             }
         }
@@ -313,7 +344,7 @@ impl<'a> SnapshotStore<'a> {
             }
         }
         for (id, path) in unit_files {
-            if !unit_refs.get(&id).is_some_and(|count| *count > 0) {
+            if !retained(&Member::UnitOutput(id)) {
                 plan.removals.push(path);
             }
         }
@@ -327,6 +358,13 @@ impl<'a> SnapshotStore<'a> {
     }
 }
 
+/// A snapshot member that references blobs.
+#[derive(PartialEq, Eq, Hash)]
+enum Member {
+    UnitOutput(Digest),
+    CacheEntry(String),
+}
+
 #[derive(Default)]
 struct Collection {
     removals: Vec<PathBuf>,
@@ -336,12 +374,20 @@ pub(super) fn hex(id: &Digest) -> String {
     blake3::Hash::from_bytes(*id).to_hex().to_string()
 }
 
-fn valid_unit_hash(value: &str) -> bool {
-    !value.is_empty()
-        && value.len() <= 64
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+/// Blobs are sharded as `blobs/<hash[..2]>/<hash[2..]>`.
+pub(super) fn blob_path(root: &Path, id: &Digest) -> PathBuf {
+    let hex = hex(id);
+    root.join(BLOBS).join(&hex[..2]).join(&hex[2..])
+}
+
+/// Move a verified staged file into its blob path, creating the shard directory.
+pub(super) fn publish_blob(staged: &Path, blob: &Path) -> CargoResult<()> {
+    let shard = blob.parent().expect("blob has a shard directory");
+    check_directory(shard.parent().expect("shard has a blob directory"))?;
+    check_directory(shard)?;
+    fs::create_dir_all(shard)?;
+    fs::rename(staged, blob)?;
+    Ok(())
 }
 
 fn entries(path: &Path) -> CargoResult<Vec<fs::DirEntry>> {
@@ -357,6 +403,27 @@ fn object_files(path: &Path) -> CargoResult<HashMap<Digest, PathBuf>> {
     for entry in entries(path)? {
         if let Some(id) = entry.file_name().to_str().and_then(digest_filename) {
             files.insert(id, entry.path());
+        }
+    }
+    Ok(files)
+}
+
+fn blob_files(path: &Path) -> CargoResult<HashMap<Digest, PathBuf>> {
+    let mut files = HashMap::default();
+    for shard in entries(path)? {
+        let Some(prefix) = shard.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if prefix.len() != 2 || !shard.file_type()?.is_dir() {
+            continue;
+        }
+        for entry in entries(&shard.path())? {
+            let Some(rest) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            if let Some(id) = digest_filename(&format!("{prefix}{rest}")) {
+                files.insert(id, entry.path());
+            }
         }
     }
     Ok(files)
@@ -415,29 +482,53 @@ fn atomic_replace(path: &Path, bytes: &[u8]) -> CargoResult<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::format::{OutputMetadata, encode_output_path};
+    use super::super::format::{CachedOutput, encode_output_path};
     use super::*;
 
-    fn output(store: &SnapshotStore<'_>, contents: &[u8]) -> UnitOutput {
-        fs::create_dir_all(store.blobs).unwrap();
+    fn blob(store: &SnapshotStore<'_>, contents: &[u8]) -> (Digest, u64) {
         let hash = *blake3::hash(contents).as_bytes();
-        fs::write(store.blobs.join(hex(&hash)), contents).unwrap();
+        let blob = blob_path(store.root, &hash);
+        fs::create_dir_all(blob.parent().unwrap()).unwrap();
+        fs::write(blob, contents).unwrap();
+        (hash, contents.len() as u64)
+    }
+
+    fn output(store: &SnapshotStore<'_>, contents: &[u8]) -> UnitOutput {
+        let (hash, size) = blob(store, contents);
         UnitOutput::new(vec![Output {
             path: encode_output_path(Path::new("out/artifact")).unwrap(),
             hash,
-            size: contents.len() as u64,
+            size,
         }])
     }
 
-    fn save(
-        store: &SnapshotStore<'_>,
-        workspace: &Digest,
-        output: &UnitOutput,
-        now: u64,
-    ) -> Digest {
+    fn entry(store: &SnapshotStore<'_>, contents: &[u8]) -> CacheEntry {
+        let (hash, size) = blob(store, contents);
+        CacheEntry::new(
+            42,
+            vec![CachedOutput {
+                path: encode_output_path(Path::new("out/artifact")).unwrap(),
+                hash,
+                size,
+                mode: 0o644,
+                mtime_seconds: 0,
+                mtime_nanos: 0,
+            }],
+        )
+    }
+
+    fn snapshot_id(unit_outputs: Vec<Digest>, cache_entries: &[&str]) -> Digest {
+        let cache_entries = cache_entries
+            .iter()
+            .map(|name| (*name).to_owned())
+            .collect();
+        *blake3::hash(&Snapshot::new(unit_outputs, cache_entries).encode()).as_bytes()
+    }
+
+    fn save(store: &SnapshotStore<'_>, output: &UnitOutput, now: u64) -> Digest {
         store.publish_unit(output).unwrap();
-        store.save(workspace, vec![output.id], now).unwrap();
-        snapshot_id(&mut vec![output.id])
+        store.save(vec![output.id], Vec::new(), now).unwrap();
+        snapshot_id(vec![output.id], &[])
     }
 
     fn clean(
@@ -448,8 +539,8 @@ mod tests {
     ) -> CargoResult<()> {
         let gctx = crate::util::GlobalContext::new(
             cargo_util_terminal::Shell::from_write(Box::new(Vec::new())),
-            store.blobs.to_path_buf(),
-            store.blobs.join("cargo-home"),
+            store.root.to_path_buf(),
+            store.root.join("cargo-home"),
         );
         let mut clean_ctx = CleanContext::new(&gctx);
         clean_ctx.dry_run = dry_run;
@@ -457,102 +548,109 @@ mod tests {
     }
 
     #[test]
-    fn history_refreshes_every_use_and_shares_snapshot_identity() {
+    fn usage_refreshes_every_use_and_shares_snapshot_identity() {
         let dir = tempfile::tempdir().unwrap();
-        let blobs = dir.path().join("blobs");
-        let store = SnapshotStore::new(&blobs);
+        let store = SnapshotStore::new(dir.path());
         let output = output(&store, b"shared");
-        let snapshot = save(&store, &[1; 32], &output, 10);
-        save(&store, &[1; 32], &output, 11);
-        save(&store, &[2; 32], &output, RETENTION + 10);
-        let first = store
-            .root
-            .join(HISTORY)
-            .join(hex(&[1; 32]))
-            .join(hex(&snapshot));
-        assert_eq!(fs::read(&first).unwrap(), b"11\n");
+        let snapshot = save(&store, &output, 10);
+        save(&store, &output, 11);
+        let usage = store.usage_path(&snapshot);
+        assert_eq!(fs::read(&usage).unwrap(), b"11\n");
+        save(&store, &output, RETENTION + 10);
         clean(&store, None, RETENTION + 12, false).unwrap();
-        assert!(!first.exists());
-        assert!(store.unit_is_complete(&output.id).unwrap());
+        assert!(usage.exists());
+        assert!(store.complete_unit(&output.id).unwrap().is_some());
         clean(&store, None, 2 * RETENTION + 11, false).unwrap();
-        assert!(!store.unit_is_complete(&output.id).unwrap());
+        assert!(!usage.exists());
+        assert!(store.complete_unit(&output.id).unwrap().is_none());
     }
 
     #[test]
     fn unreferenced_snapshots_never_gain_retention() {
         let dir = tempfile::tempdir().unwrap();
-        let blobs = dir.path().join("blobs");
-        let store = SnapshotStore::new(&blobs);
+        let store = SnapshotStore::new(dir.path());
         let output = output(&store, b"orphan");
-        let snapshot = save(&store, &[1; 32], &output, 1);
-        fs::remove_dir_all(store.root.join(HISTORY)).unwrap();
+        let snapshot = save(&store, &output, 1);
+        fs::remove_dir_all(store.root.join(SNAPSHOTS).join(USAGE)).unwrap();
         clean(&store, None, 2, false).unwrap();
         assert!(!store.root.join(SNAPSHOTS).join(hex(&snapshot)).exists());
-        assert!(!store.unit_is_complete(&output.id).unwrap());
-        assert!(entries(&blobs).unwrap().is_empty());
+        assert!(store.complete_unit(&output.id).unwrap().is_none());
+        assert!(blob_files(&store.root.join(BLOBS)).unwrap().is_empty());
     }
 
     #[test]
-    fn size_pressure_preserves_shared_blobs_and_evicts_cache_edges() {
+    fn size_pressure_preserves_blobs_shared_across_member_kinds() {
         let dir = tempfile::tempdir().unwrap();
-        let blobs = dir.path().join("blobs");
-        let store = SnapshotStore::new(&blobs);
+        let store = SnapshotStore::new(dir.path());
         let shared = output(&store, b"shared");
-        let old = output(&store, b"old");
         store.publish_unit(&shared).unwrap();
-        store.publish_unit(&old).unwrap();
-        store.save(&[1; 32], vec![shared.id, old.id], 1).unwrap();
-        store.save(&[2; 32], vec![shared.id], 2).unwrap();
-        for (key, output) in [("aa", &shared), ("bb", &old)] {
-            store
-                .publish_cache_entry(
-                    key,
-                    &CacheEntry {
-                        unit_output: output.id,
-                        fingerprint: 42,
-                        outputs: vec![OutputMetadata {
-                            mode: 0o644,
-                            mtime_seconds: 0,
-                            mtime_nanos: 0,
-                        }],
-                    },
-                )
-                .unwrap();
-        }
+        store
+            .publish_cache_entry("aa", &entry(&store, b"shared"))
+            .unwrap();
+        store
+            .publish_cache_entry("bb", &entry(&store, b"old"))
+            .unwrap();
+        store
+            .save(vec![shared.id], vec!["bb".to_owned()], 1)
+            .unwrap();
+        store.save(Vec::new(), vec!["aa".to_owned()], 2).unwrap();
+        let shared_blob = blob_path(store.root, blake3::hash(b"shared").as_bytes());
+        let old_blob = blob_path(store.root, blake3::hash(b"old").as_bytes());
         clean(&store, Some(6), 3, true).unwrap();
-        assert!(store.unit_is_complete(&old.id).unwrap());
+        assert!(store.read_cache_entry("bb").unwrap().is_some());
+        assert!(old_blob.exists());
+        // Evicting the oldest snapshot drops its members, but not a blob that the
+        // newer snapshot reaches through a cache entry.
         clean(&store, Some(6), 3, false).unwrap();
-        assert!(store.unit_is_complete(&shared.id).unwrap());
-        assert!(!store.unit_is_complete(&old.id).unwrap());
         assert!(store.read_cache_entry("aa").unwrap().is_some());
         assert!(store.read_cache_entry("bb").unwrap().is_none());
+        assert!(!store.unit_path(&shared.id).exists());
+        assert!(shared_blob.exists());
+        assert!(!old_blob.exists());
     }
 
     #[test]
-    fn invalid_history_prevents_any_collection_mutation() {
+    fn cache_entries_are_retained_only_through_snapshots() {
         let dir = tempfile::tempdir().unwrap();
-        let blobs = dir.path().join("blobs");
-        let store = SnapshotStore::new(&blobs);
+        let store = SnapshotStore::new(dir.path());
+        store
+            .publish_cache_entry("aa", &entry(&store, b"unreferenced"))
+            .unwrap();
+        store
+            .publish_cache_entry("bb", &entry(&store, b"referenced"))
+            .unwrap();
+        store.save(Vec::new(), vec!["bb".to_owned()], 1).unwrap();
+        clean(&store, None, 2, false).unwrap();
+        assert!(store.read_cache_entry("aa").unwrap().is_none());
+        assert!(!blob_path(store.root, blake3::hash(b"unreferenced").as_bytes()).exists());
+        assert!(store.complete_cache_entry("bb").unwrap().is_some());
+        fs::remove_file(blob_path(
+            store.root,
+            blake3::hash(b"referenced").as_bytes(),
+        ))
+        .unwrap();
+        assert!(store.complete_cache_entry("bb").unwrap().is_none());
+    }
+
+    #[test]
+    fn invalid_usage_prevents_any_collection_mutation() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SnapshotStore::new(dir.path());
         let output = output(&store, b"protected");
-        let snapshot = save(&store, &[1; 32], &output, 0);
-        let history = store
-            .root
-            .join(HISTORY)
-            .join(hex(&[1; 32]))
-            .join(hex(&snapshot));
-        fs::write(&history, b"corrupt").unwrap();
+        let snapshot = save(&store, &output, 0);
+        let usage = store.usage_path(&snapshot);
+        fs::write(&usage, b"corrupt").unwrap();
         assert!(clean(&store, Some(0), RETENTION + 1, false).is_err());
-        assert!(store.unit_is_complete(&output.id).unwrap());
-        assert_eq!(fs::read(history).unwrap(), b"corrupt");
+        assert!(store.complete_unit(&output.id).unwrap().is_some());
+        assert_eq!(fs::read(usage).unwrap(), b"corrupt");
     }
 
     #[test]
     fn invalid_cache_entries_are_disposable_not_roots() {
         let dir = tempfile::tempdir().unwrap();
-        let blobs = dir.path().join("blobs");
-        let store = SnapshotStore::new(&blobs);
+        let store = SnapshotStore::new(dir.path());
         let output = output(&store, b"live");
-        save(&store, &[1; 32], &output, 1);
+        save(&store, &output, 1);
         fs::create_dir_all(store.root.join(CACHE)).unwrap();
         let corrupt = store.root.join(CACHE).join("aa");
         fs::write(&corrupt, b"invalid").unwrap();
@@ -560,31 +658,30 @@ mod tests {
         assert!(corrupt.exists());
         clean(&store, None, 2, false).unwrap();
         assert!(!corrupt.exists());
-        assert!(store.unit_is_complete(&output.id).unwrap());
+        assert!(store.complete_unit(&output.id).unwrap().is_some());
     }
 
     #[test]
     fn unrelated_files_and_interrupted_publications_do_not_block_collection() {
         let dir = tempfile::tempdir().unwrap();
-        let blobs = dir.path().join("blobs");
-        let store = SnapshotStore::new(&blobs);
+        let store = SnapshotStore::new(dir.path());
         let output = output(&store, b"expired");
-        save(&store, &[1; 32], &output, 0);
-        fs::create_dir_all(store.root.join(CACHE)).unwrap();
+        save(&store, &output, 0);
+        let usage = store.root.join(SNAPSHOTS).join(USAGE);
         let leftovers = [
-            store.root.join(HISTORY).join("unrelated"),
-            store
-                .root
-                .join(HISTORY)
-                .join(hex(&[1; 32]))
-                .join(".tmp-interrupted"),
+            usage.join("unrelated"),
+            usage.join(".tmp-interrupted"),
             store.root.join(CACHE).join("unrelated"),
+            store.root.join(BLOBS).join("unrelated"),
+            store.root.join(BLOBS).join("zz").join("unrelated"),
+            blob_path(store.root, &[0xab; 32]).with_file_name("unrelated"),
         ];
         for path in &leftovers {
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
             fs::write(path, b"leave alone").unwrap();
         }
         clean(&store, None, RETENTION + 1, false).unwrap();
-        assert!(!store.unit_is_complete(&output.id).unwrap());
+        assert!(store.complete_unit(&output.id).unwrap().is_none());
         for path in leftovers {
             assert_eq!(fs::read(path).unwrap(), b"leave alone");
         }

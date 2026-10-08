@@ -1,17 +1,20 @@
 mod exchange;
 mod format;
+mod prefetch;
 mod remote;
 mod snapshots;
+mod upload;
 
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, ensure};
 use cargo_util::paths::create_dir_all;
 use filetime::FileTime;
 use format::{
-    CacheEntry, Digest, Output, OutputMetadata, UnitOutput, decode_output_path, encode_output_path,
+    CacheEntry, CachedOutput, Digest, UnitOutput, decode_output_path, encode_output_path,
 };
 use parking_lot::Mutex;
 use remote::RemoteCache;
@@ -21,27 +24,51 @@ use crate::ops::CleanContext;
 use crate::util::cache_lock::CacheLockMode;
 use crate::util::data_structures::{HashMap, HashSet};
 use crate::{CargoResult, GlobalContext};
-use snapshots::{SnapshotStore, check_directory, hex, regular_size};
+use prefetch::{Prefetched, Prefetcher};
+use snapshots::{SnapshotStore, blob_path, check_directory, publish_blob, regular_size};
+use upload::{Remote, Uploader};
 
-pub(super) type UnitOutputHash = [u8; 32];
+pub(super) use format::Output;
+pub(super) use prefetch::{DependencyArtifact, PrefetchSource};
+
+/// Encode a path relative to a unit directory as stored in cache metadata.
+pub(super) fn output_path_key(relative: &Path) -> CargoResult<Vec<u8>> {
+    encode_output_path(relative)
+}
+
+/// The tracking object recorded in a unit's fingerprint. Cacheable units are
+/// tracked by their cache entry and other non-local units by a unit output.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum TrackedOutput {
+    UnitOutput(Digest),
+    /// The entry named by the unit hash. Its contents are not pinned because
+    /// workspaces sharing a unit hash can each publish it.
+    CacheEntry,
+}
+
+#[derive(Default)]
+struct Used {
+    unit_outputs: HashSet<Digest>,
+    cache_entries: HashSet<String>,
+}
 
 pub struct BlobStorage {
     root: PathBuf,
-    workspace_id: Digest,
-    used: Mutex<HashSet<Digest>>,
-    remote: Option<RemoteCache>,
-    remote_error: Mutex<Option<String>>,
+    used: Mutex<Used>,
+    remote: Option<Arc<Remote>>,
+    /// Started on the first remote publication.
+    uploader: Mutex<Option<Uploader>>,
+    /// Fetches remote entries ahead of the job queue.
+    prefetcher: Option<Prefetcher>,
     // Rejected hits can still publish if recompilation changes either identity.
     restored_units: Mutex<HashMap<String, (u64, Digest)>>,
 }
 
 impl BlobStorage {
-    pub fn new(root: PathBuf, workspace_root: &Path, gctx: &GlobalContext) -> CargoResult<Self> {
+    pub fn new(root: PathBuf, gctx: &GlobalContext) -> CargoResult<Self> {
         let _lock = gctx.acquire_package_cache_lock(CacheLockMode::DownloadExclusive)?;
         check_directory(&root)?;
         create_dir_all(&root)?;
-        let workspace_root = fs::canonicalize(workspace_root)?;
-        let workspace_id = *blake3::hash(workspace_root.as_os_str().as_encoded_bytes()).as_bytes();
         let remote = match RemoteCache::from_config(gctx) {
             Ok(remote) => remote,
             Err(error) => {
@@ -56,41 +83,106 @@ impl BlobStorage {
             remote_read_only = remote.as_ref().is_some_and(RemoteCache::is_read_only),
             "shared blob storage initialized"
         );
+        let remote = remote.map(|cache| Arc::new(Remote::new(cache)));
+        let prefetcher = remote
+            .as_ref()
+            .map(|remote| Prefetcher::new(Arc::clone(remote), root.clone()));
         Ok(Self {
             root,
-            workspace_id,
             used: Mutex::default(),
             remote,
-            remote_error: Mutex::default(),
+            uploader: Mutex::default(),
+            prefetcher,
             restored_units: Mutex::default(),
         })
     }
 
-    /// Validate the immutable unit output before reusing a fingerprint pointer.
+    /// Validate a fingerprint's tracking pointer before reusing it. `cache_key`
+    /// is the unit hash when the unit is cacheable in this invocation. A pointer
+    /// of the other kind is not reused, so the unit is recaptured as that kind.
     pub(super) fn prepare_unit(
         &self,
-        unit_output: Option<UnitOutputHash>,
-    ) -> CargoResult<Option<UnitOutputHash>> {
-        let Some(id) = unit_output else {
-            return Ok(None);
-        };
-        if !SnapshotStore::new(&self.root).unit_is_complete(&id)? {
-            return Ok(None);
+        tracked: Option<TrackedOutput>,
+        cache_key: Option<&str>,
+        unit_dir: &Path,
+    ) -> CargoResult<Option<TrackedOutput>> {
+        let store = SnapshotStore::new(&self.root);
+        match (tracked, cache_key) {
+            (Some(TrackedOutput::UnitOutput(id)), None) => {
+                let Some(outputs) = store.complete_unit(&id)? else {
+                    return Ok(None);
+                };
+                self.record_outputs(
+                    unit_dir,
+                    outputs
+                        .iter()
+                        .map(|output| (output.path.as_slice(), output.hash)),
+                );
+                self.used.lock().unit_outputs.insert(id);
+                Ok(tracked)
+            }
+            (Some(TrackedOutput::CacheEntry), Some(unit_hash)) => {
+                let Some(entry) = store.complete_cache_entry(unit_hash)? else {
+                    return Ok(None);
+                };
+                self.record_outputs(
+                    unit_dir,
+                    entry
+                        .outputs
+                        .iter()
+                        .map(|output| (output.path.as_slice(), output.hash)),
+                );
+                self.used.lock().cache_entries.insert(unit_hash.to_owned());
+                Ok(tracked)
+            }
+            _ => Ok(None),
         }
-        self.used.lock().insert(id);
-        Ok(Some(id))
+    }
+
+    /// Queue a dirty cacheable unit for remote prefetching.
+    pub(super) fn prefetch(&self, source: Arc<dyn PrefetchSource>) {
+        if let Some(prefetcher) = &self.prefetcher
+            && self.remote().is_some()
+        {
+            prefetcher.register(source);
+        }
+    }
+
+    /// Called when a prefetch finishes, so deferred jobs can start.
+    pub fn set_waker(&self, waker: Box<dyn Fn() + Send + Sync>) {
+        if let Some(prefetcher) = &self.prefetcher {
+            prefetcher.set_waker(waker);
+        }
+    }
+
+    /// Whether a remote prefetch for this unit is running.
+    pub(super) fn prefetching(&self, unit_hash: &str) -> bool {
+        self.prefetcher
+            .as_ref()
+            .is_some_and(|prefetcher| prefetcher.in_flight(unit_hash))
+    }
+
+    /// Make a finished unit's blob hashes available to prefetching dependents.
+    fn record_outputs<'a>(
+        &self,
+        unit_dir: &Path,
+        outputs: impl IntoIterator<Item = (&'a [u8], Digest)>,
+    ) {
+        if let Some(prefetcher) = &self.prefetcher {
+            prefetcher.record_outputs(unit_dir, outputs);
+        }
     }
 
     /// Capture all regular compiler outputs, including raw rustc dep-info.
     /// Hardlinks are allowed only when the compiler detaches the output tree
     /// before every dirty run, including builds with tracking disabled.
     #[instrument(skip_all)]
-    pub(super) fn capture_unit(
+    pub(super) fn capture_outputs(
         &self,
         unit_dir: &Path,
         out_dir: &Path,
         hardlink_allowed: bool,
-    ) -> CargoResult<UnitOutputHash> {
+    ) -> CargoResult<Vec<Output>> {
         ensure!(
             out_dir == unit_dir.join("out"),
             "unexpected unit output directory"
@@ -110,7 +202,7 @@ impl BlobStorage {
             let path = entry.path();
             let size = entry.metadata()?.len();
             let hash = Self::hash(path)?;
-            let storage_path = self.root.join(hex(&hash));
+            let storage_path = blob_path(&self.root, &hash);
             if !self.insert(path, &storage_path, &hash, false, hardlink_allowed)? {
                 self.dedup(path, &storage_path, &hash, hardlink_allowed)?;
             }
@@ -120,27 +212,34 @@ impl BlobStorage {
                 size,
             });
         }
-        let output = UnitOutput::new(outputs);
-        SnapshotStore::new(&self.root).publish_unit(&output)?;
-        self.used.lock().insert(output.id);
-        Ok(output.id)
+        self.record_outputs(
+            unit_dir,
+            outputs
+                .iter()
+                .map(|output| (output.path.as_slice(), output.hash)),
+        );
+        Ok(outputs)
     }
 
+    /// Track a non-cacheable unit by its content-addressed unit output.
+    pub(super) fn publish_unit_output(&self, outputs: Vec<Output>) -> CargoResult<TrackedOutput> {
+        let output = UnitOutput::new(outputs);
+        SnapshotStore::new(&self.root).publish_unit(&output)?;
+        self.used.lock().unit_outputs.insert(output.id);
+        Ok(TrackedOutput::UnitOutput(output.id))
+    }
+
+    /// Track a cacheable unit by a cache entry that also records restore metadata.
     pub(super) fn publish_cache_entry(
         &self,
         unit_hash: &str,
         fingerprint: u64,
-        unit_output: UnitOutputHash,
+        outputs: Vec<Output>,
         unit_dir: &Path,
-    ) -> CargoResult<()> {
-        let store = SnapshotStore::new(&self.root);
-        let outputs = store
-            .read_unit(&unit_output)?
-            .context("missing captured unit output")?;
-        let mut metadata = Vec::with_capacity(outputs.len());
-        for output in &outputs {
-            let relative = restore_path(&output.path)?;
-            let path = unit_dir.join(relative);
+    ) -> CargoResult<TrackedOutput> {
+        let mut cached = Vec::with_capacity(outputs.len());
+        for output in outputs {
+            let path = unit_dir.join(restore_path(&output.path)?);
             let file = fs::symlink_metadata(&path)?;
             ensure!(
                 file.is_file() && file.len() == output.size,
@@ -148,61 +247,63 @@ impl BlobStorage {
                 path.display()
             );
             let mtime = FileTime::from_last_modification_time(&file);
-            metadata.push(OutputMetadata {
+            cached.push(CachedOutput {
+                path: output.path,
+                hash: output.hash,
+                size: output.size,
                 mode: permission_mode(&file),
                 mtime_seconds: mtime.unix_seconds(),
                 mtime_nanos: mtime.nanoseconds(),
             });
         }
-        let entry = CacheEntry {
-            unit_output,
-            fingerprint,
-            outputs: metadata,
-        };
-        store.publish_cache_entry(unit_hash, &entry)?;
-        if let Some(remote) = self.remote()
-            && !remote.is_read_only()
+        let entry = CacheEntry::new(fingerprint, cached);
+        let digest = SnapshotStore::new(&self.root).publish_cache_entry(unit_hash, &entry)?;
+        self.used.lock().cache_entries.insert(unit_hash.to_owned());
+        if let Some(remote) = &self.remote
+            && remote.usable()
+            && !remote.cache.is_read_only()
         {
             let restored =
-                self.restored_units.lock().get(unit_hash) == Some(&(fingerprint, unit_output));
+                self.restored_units.lock().get(unit_hash) == Some(&(fingerprint, digest));
             if restored {
                 tracing::debug!(
                     unit_hash,
                     "skipping remote publication of unchanged cache hit"
                 );
-            }
-            if !restored
-                && let Err(error) =
-                    exchange::publish(remote, &self.root, unit_hash, &entry, &outputs)
-            {
-                self.remote_failed(error);
+            } else {
+                self.enqueue_upload(remote, unit_hash, entry);
             }
         }
-        Ok(())
+        Ok(TrackedOutput::CacheEntry)
     }
 
     /// Stage and verify all restored bytes before replacing the output tree.
-    /// The compiler calls `prepare_unit` after accepting dep-info/environment
+    /// The compiler calls `accept_cache_entry` after dep-info and environment
     /// validation, so a rejected hit cannot become a successful snapshot member.
     pub(super) fn restore_cache_entry(
         &self,
         unit_hash: &str,
         fingerprint: u64,
         unit_dir: &Path,
-    ) -> CargoResult<Option<UnitOutputHash>> {
+    ) -> CargoResult<bool> {
+        // Waits for an in-flight prefetch. A prefetched hit is a local entry.
+        let prefetched = self
+            .prefetcher
+            .as_ref()
+            .and_then(|prefetcher| prefetcher.claim(unit_hash));
         let store = SnapshotStore::new(&self.root);
-        if let Some(entry) = store.read_cache_entry(unit_hash)?
+        if let Some((digest, entry)) = store.read_cache_entry(unit_hash)?
             && entry.fingerprint == fingerprint
         {
-            match self.restore_outputs(&store, &entry, unit_dir) {
+            match self.restore_outputs(&entry, unit_dir) {
                 Ok(()) => {
                     if self.remote().is_some_and(|remote| !remote.is_read_only()) {
                         self.restored_units
                             .lock()
-                            .insert(unit_hash.to_owned(), (fingerprint, entry.unit_output));
+                            .insert(unit_hash.to_owned(), (fingerprint, digest));
                     }
                     tracing::debug!(unit_hash, "restored unit from local cache");
-                    return Ok(Some(entry.unit_output));
+                    return Ok(true);
                 }
                 Err(error) => {
                     tracing::debug!(?error, unit_hash, "discarding invalid local cache entry");
@@ -211,57 +312,89 @@ impl BlobStorage {
             }
         }
         tracing::debug!(unit_hash, "local cache miss");
+        match prefetched {
+            Some(Prefetched::Miss(key)) if key == fingerprint => {
+                tracing::debug!(unit_hash, "remote cache miss already seen by prefetch");
+                return Ok(false);
+            }
+            Some(Prefetched::Hit(key) | Prefetched::Miss(key)) if key != fingerprint => {
+                tracing::debug!(unit_hash, "prefetch used a different input guard");
+            }
+            _ => {}
+        }
         let Some(remote) = self.remote() else {
             tracing::debug!(unit_hash, "remote cache unavailable");
-            return Ok(None);
+            return Ok(false);
         };
         let result = (|| {
-            let Some(entry) = exchange::fetch(remote, &self.root, unit_hash, fingerprint)? else {
-                return Ok(None);
+            let Some((digest, entry)) =
+                exchange::fetch(remote, &self.root, unit_hash, fingerprint)?
+            else {
+                return Ok(false);
             };
-            if let Err(error) = self.restore_outputs(&store, &entry, unit_dir) {
+            if let Err(error) = self.restore_outputs(&entry, unit_dir) {
                 store.evict_cache_entry(unit_hash)?;
                 return Err(error);
             }
             self.restored_units
                 .lock()
-                .insert(unit_hash.to_owned(), (fingerprint, entry.unit_output));
+                .insert(unit_hash.to_owned(), (fingerprint, digest));
             tracing::debug!(unit_hash, "restored unit from remote cache");
-            CargoResult::Ok(Some(entry.unit_output))
+            CargoResult::Ok(true)
         })();
         match result {
-            Ok(output) => Ok(output),
+            Ok(restored) => Ok(restored),
             Err(error) => {
                 self.remote_failed(error);
-                Ok(None)
+                Ok(false)
             }
+        }
+    }
+
+    /// Record an accepted cache hit as a snapshot member.
+    pub(super) fn accept_cache_entry(&self, unit_hash: &str, unit_dir: &Path) -> CargoResult<()> {
+        let entry = SnapshotStore::new(&self.root)
+            .complete_cache_entry(unit_hash)?
+            .context("restored cache entry disappeared from shared storage")?;
+        self.record_outputs(
+            unit_dir,
+            entry
+                .outputs
+                .iter()
+                .map(|output| (output.path.as_slice(), output.hash)),
+        );
+        self.used.lock().cache_entries.insert(unit_hash.to_owned());
+        Ok(())
+    }
+
+    fn enqueue_upload(&self, remote: &Arc<Remote>, unit_hash: &str, entry: CacheEntry) {
+        let mut uploader = self.uploader.lock();
+        if uploader.is_none() {
+            match Uploader::start(Arc::clone(remote), self.root.clone()) {
+                Ok(started) => *uploader = Some(started),
+                Err(error) => {
+                    remote.failed(error);
+                    return;
+                }
+            }
+        }
+        if let Some(uploader) = uploader.as_ref() {
+            uploader.enqueue(unit_hash, entry);
         }
     }
 
     fn remote(&self) -> Option<&RemoteCache> {
         let remote = self.remote.as_ref()?;
-        self.remote_error.lock().is_none().then_some(remote)
+        remote.usable().then_some(&remote.cache)
     }
 
     fn remote_failed(&self, error: anyhow::Error) {
-        self.remote_error
-            .lock()
-            .get_or_insert_with(|| format!("{error:#}"));
+        if let Some(remote) = &self.remote {
+            remote.failed(error);
+        }
     }
 
-    fn restore_outputs(
-        &self,
-        store: &SnapshotStore<'_>,
-        entry: &CacheEntry,
-        unit_dir: &Path,
-    ) -> CargoResult<()> {
-        let outputs = store
-            .read_unit(&entry.unit_output)?
-            .context("missing cached unit output")?;
-        ensure!(
-            outputs.len() == entry.outputs.len(),
-            "cached output metadata count mismatch"
-        );
+    fn restore_outputs(&self, entry: &CacheEntry, unit_dir: &Path) -> CargoResult<()> {
         check_directory(unit_dir)?;
         fs::create_dir_all(unit_dir)?;
         let staging = tempfile::Builder::new()
@@ -269,9 +402,9 @@ impl BlobStorage {
             .tempdir_in(unit_dir)?;
         let staged_out = staging.path().join("out");
         fs::create_dir(&staged_out)?;
-        for (output, metadata) in outputs.iter().zip(&entry.outputs) {
+        for output in &entry.outputs {
             let relative = restore_path(&output.path)?;
-            let source = self.root.join(hex(&output.hash));
+            let source = blob_path(&self.root, &output.hash);
             ensure!(
                 regular_size(&source)? == Some(output.size),
                 "missing or invalid cached blob"
@@ -283,8 +416,8 @@ impl BlobStorage {
                 Self::hash(&dest)? == output.hash,
                 "cached blob digest mismatch"
             );
-            set_permission_mode(&dest, metadata.mode)?;
-            let mtime = FileTime::from_unix_time(metadata.mtime_seconds, metadata.mtime_nanos);
+            set_permission_mode(&dest, output.mode)?;
+            let mtime = FileTime::from_unix_time(output.mtime_seconds, output.mtime_nanos);
             filetime::set_file_times(&dest, mtime, mtime)?;
             #[cfg(target_os = "linux")]
             ensure_no_writers(&dest)?;
@@ -314,19 +447,36 @@ impl BlobStorage {
         Ok(())
     }
 
-    /// Only successful builds publish a snapshot and refresh workspace history.
+    /// Waits for background uploads. Only successful builds publish a snapshot
+    /// and refresh its usage timestamp.
     pub fn finish(&self, gctx: &GlobalContext, successful: bool) -> CargoResult<()> {
-        if let Some(error) = self.remote_error.lock().as_ref() {
+        if let Some(prefetcher) = &self.prefetcher {
+            prefetcher.shutdown();
+        }
+        let uploader = self.uploader.lock().take();
+        if let Some(uploader) = uploader {
+            let pending = uploader.pending();
+            if pending > 0 {
+                let units = if pending == 1 { "unit" } else { "units" };
+                gctx.shell().status(
+                    "Uploading",
+                    format!("{pending} {units} to the remote cache"),
+                )?;
+            }
+            uploader.finish();
+        }
+        if let Some(error) = self.remote.as_ref().and_then(|remote| remote.error()) {
             gctx.shell()
                 .warn(format!("remote cache disabled for this build: {error}"))?;
         }
         let used = self.used.lock();
-        if !successful || used.is_empty() {
+        if !successful || (used.unit_outputs.is_empty() && used.cache_entries.is_empty()) {
             return Ok(());
         }
-        let outputs = used.iter().copied().collect();
+        let unit_outputs = used.unit_outputs.iter().copied().collect();
+        let cache_entries = used.cache_entries.iter().cloned().collect();
         let _lock = gctx.acquire_package_cache_lock(CacheLockMode::DownloadExclusive)?;
-        SnapshotStore::new(&self.root).save(&self.workspace_id, outputs, now())
+        SnapshotStore::new(&self.root).save(unit_outputs, cache_entries, now())
     }
 
     pub fn clean(
@@ -363,7 +513,7 @@ impl BlobStorage {
         );
         #[cfg(target_os = "linux")]
         ensure_no_writers(&staged)?;
-        fs::rename(&staged, blob)?;
+        publish_blob(&staged, blob)?;
         Ok(true)
     }
 
@@ -507,29 +657,31 @@ mod tests {
     use super::*;
 
     fn storage(root: &Path) -> BlobStorage {
-        let root = root.join("blobs");
+        let root = root.join("shared-storage");
         fs::create_dir(&root).unwrap();
         BlobStorage {
             root,
-            workspace_id: [1; 32],
             used: Mutex::default(),
             remote: None,
-            remote_error: Mutex::default(),
+            uploader: Mutex::default(),
+            prefetcher: None,
             restored_units: Mutex::default(),
         }
     }
 
-    fn capture(storage: &BlobStorage, unit: &Path, hardlink_allowed: bool) -> UnitOutputHash {
+    fn capture(storage: &BlobStorage, unit: &Path, hardlink_allowed: bool) {
         fs::create_dir_all(unit.join("out")).unwrap();
         fs::write(unit.join("out/artifact"), b"compiled bytes").unwrap();
         fs::write(unit.join("out/artifact.d"), b"artifact: input.rs\n").unwrap();
-        let output = storage
-            .capture_unit(unit, &unit.join("out"), hardlink_allowed)
+        let outputs = storage
+            .capture_outputs(unit, &unit.join("out"), hardlink_allowed)
             .unwrap();
-        storage
-            .publish_cache_entry("1234", 42, output, unit)
-            .unwrap();
-        output
+        assert_eq!(
+            storage
+                .publish_cache_entry("1234", 42, outputs, unit)
+                .unwrap(),
+            TrackedOutput::CacheEntry
+        );
     }
 
     #[test]
@@ -537,18 +689,12 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let storage = storage(root.path());
         let unit = root.path().join("unit");
-        let output = capture(&storage, &unit, true);
-        storage.used.lock().clear();
+        capture(&storage, &unit, true);
+        storage.used.lock().cache_entries.clear();
         fs::remove_dir_all(unit.join("out")).unwrap();
-        assert_eq!(
-            storage.restore_cache_entry("1234", 41, &unit).unwrap(),
-            None
-        );
+        assert!(!storage.restore_cache_entry("1234", 41, &unit).unwrap());
         assert!(!unit.join("out").exists());
-        assert_eq!(
-            storage.restore_cache_entry("1234", 42, &unit).unwrap(),
-            Some(output)
-        );
+        assert!(storage.restore_cache_entry("1234", 42, &unit).unwrap());
         assert_eq!(
             fs::read(unit.join("out/artifact")).unwrap(),
             b"compiled bytes"
@@ -557,9 +703,16 @@ mod tests {
             fs::read(unit.join("out/artifact.d")).unwrap(),
             b"artifact: input.rs\n"
         );
-        assert!(storage.used.lock().is_empty());
-        assert_eq!(storage.prepare_unit(Some(output)).unwrap(), Some(output));
-        assert!(storage.used.lock().contains(&output));
+        assert!(storage.used.lock().cache_entries.is_empty());
+        storage.accept_cache_entry("1234", &unit).unwrap();
+        assert!(storage.used.lock().cache_entries.contains("1234"));
+        let tracked = Some(TrackedOutput::CacheEntry);
+        assert_eq!(
+            storage.prepare_unit(tracked, Some("1234"), &unit).unwrap(),
+            tracked
+        );
+        // Units that are no longer cacheable are recaptured as unit outputs.
+        assert_eq!(storage.prepare_unit(tracked, None, &unit).unwrap(), None);
     }
 
     #[test]
@@ -568,16 +721,11 @@ mod tests {
         let storage = storage(root.path());
         let unit = root.path().join("unit");
         capture(&storage, &unit, true);
-        let blob = storage
-            .root
-            .join(blake3::hash(b"compiled bytes").to_hex().as_str());
+        let blob = blob_path(&storage.root, blake3::hash(b"compiled bytes").as_bytes());
         fs::write(blob, b"corrupted data").unwrap();
         fs::write(unit.join("out/artifact"), b"keep original").unwrap();
         fs::write(unit.join("out/artifact.d"), b"keep dep-info").unwrap();
-        assert_eq!(
-            storage.restore_cache_entry("1234", 42, &unit).unwrap(),
-            None
-        );
+        assert!(!storage.restore_cache_entry("1234", 42, &unit).unwrap());
         assert_eq!(
             fs::read(unit.join("out/artifact")).unwrap(),
             b"keep original"
@@ -601,12 +749,10 @@ mod tests {
         let unit = root.path().join("unit");
         capture(&storage, &unit, false);
         storage
-            .capture_unit(&unit, &unit.join("out"), false)
+            .capture_outputs(&unit, &unit.join("out"), false)
             .unwrap();
         fs::write(unit.join("out/artifact"), b"later compiler output").unwrap();
-        let blob = storage
-            .root
-            .join(blake3::hash(b"compiled bytes").to_hex().as_str());
+        let blob = blob_path(&storage.root, blake3::hash(b"compiled bytes").as_bytes());
         assert_eq!(fs::read(blob).unwrap(), b"compiled bytes");
     }
 
@@ -645,21 +791,21 @@ mod tests {
         fs::set_permissions(&artifact, fs::Permissions::from_mode(0o755)).unwrap();
         let compiled = FileTime::from_unix_time(1_600_000_100, 0);
         filetime::set_file_mtime(&artifact, compiled).unwrap();
-        let output = storage
-            .capture_unit(&unit, &unit.join("out"), true)
+        let outputs = storage
+            .capture_outputs(&unit, &unit.join("out"), true)
             .unwrap();
-        storage
-            .publish_cache_entry("1234", 42, output, &unit)
-            .unwrap();
-        let blob = storage.root.join(blake3::hash(contents).to_hex().as_str());
+        assert_eq!(
+            storage
+                .publish_cache_entry("1234", 42, outputs, &unit)
+                .unwrap(),
+            TrackedOutput::CacheEntry
+        );
+        let blob = blob_path(&storage.root, blake3::hash(contents).as_bytes());
         fs::set_permissions(&blob, fs::Permissions::from_mode(0o444)).unwrap();
         let downloaded = FileTime::from_unix_time(1_600_000_000, 0);
         filetime::set_file_mtime(&blob, downloaded).unwrap();
         fs::remove_dir_all(unit.join("out")).unwrap();
-        assert_eq!(
-            storage.restore_cache_entry("1234", 42, &unit).unwrap(),
-            Some(output)
-        );
+        assert!(storage.restore_cache_entry("1234", 42, &unit).unwrap());
         let metadata = artifact.metadata().unwrap();
         assert_eq!(FileTime::from_last_modification_time(&metadata), compiled);
         assert_eq!(metadata.permissions().mode() & 0o777, 0o755);
@@ -682,7 +828,8 @@ mod tests {
         let contents = b"compiled output";
         fs::write(&artifact, contents).unwrap();
         let hash = *blake3::hash(contents).as_bytes();
-        let blob = storage.root.join(hex(&hash));
+        let blob = blob_path(&storage.root, &hash);
+        fs::create_dir_all(blob.parent().unwrap()).unwrap();
         std::os::unix::fs::symlink(&artifact, &blob).unwrap();
         storage.dedup(&artifact, &blob, &hash, true).unwrap();
         assert!(fs::symlink_metadata(&artifact).unwrap().is_file());

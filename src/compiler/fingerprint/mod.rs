@@ -126,7 +126,7 @@
 //! separate directory. Each Unit directory contains:
 //!
 //! - A file with a 16 hex-digit hash, used for quick loading and comparison.
-//!   Shared storage can append an optional unit-output hash to this record.
+//!   Shared storage can append an optional unit-output or cache-entry pointer.
 //!   This pointer does not participate in the fingerprint hash.
 //! - A `.json` file that contains details about the Fingerprint. This is only
 //!   used to log details about *why* a fingerprint is considered dirty.
@@ -403,7 +403,7 @@ use serde::ser;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info};
 
-use crate::compiler::blob_storage::UnitOutputHash;
+use crate::compiler::blob_storage::TrackedOutput;
 use crate::compiler::unit_graph::UnitDep;
 use crate::context::FingerprintMethod;
 use crate::util;
@@ -507,7 +507,7 @@ pub fn prepare_target(
     let Some(dirty_reason) = dirty_reason else {
         return Ok(Job::new_fresh());
     };
-    *fingerprint.unit_output.lock() = None;
+    *fingerprint.tracked.lock() = None;
 
     // We're going to rebuild, so ensure the source of the crate passes all
     // verification checks before we build it.
@@ -673,9 +673,9 @@ pub struct Fingerprint {
     /// for hashing.
     #[serde(skip)]
     memoized_hash: Mutex<Option<u64>>,
-    /// Published unit output, excluded from fingerprint propagation.
+    /// Published unit output or cache entry, excluded from fingerprint propagation.
     #[serde(skip)]
-    unit_output: parking_lot::Mutex<Option<UnitOutputHash>>,
+    tracked: parking_lot::Mutex<Option<TrackedOutput>>,
     /// RUSTFLAGS/RUSTDOCFLAGS environment variable value (or config value).
     rustflags: Vec<String>,
     /// Hash of various config settings that change how things are compiled.
@@ -1060,7 +1060,7 @@ impl Fingerprint {
             deps: Vec::new(),
             local: Mutex::new(Vec::new()),
             memoized_hash: Mutex::new(None),
-            unit_output: parking_lot::Mutex::new(None),
+            tracked: parking_lot::Mutex::new(None),
             rustflags: Vec::new(),
             config: 0,
             compile_kind: 0,
@@ -1080,27 +1080,29 @@ impl Fingerprint {
         *self.memoized_hash.lock().unwrap() = None;
     }
 
-    pub(super) fn unit_output(&self) -> Option<UnitOutputHash> {
-        *self.unit_output.lock()
+    pub(super) fn tracked(&self) -> Option<TrackedOutput> {
+        *self.tracked.lock()
     }
 
-    /// Attach a pointer only after its immutable unit output has been published.
-    pub(super) fn record_unit_output(
-        &self,
-        loc: &Path,
-        unit_output: UnitOutputHash,
-    ) -> CargoResult<()> {
+    /// Attach a pointer only after its unit output or cache entry has been published.
+    pub(super) fn record_tracked(&self, loc: &Path, tracked: TrackedOutput) -> CargoResult<()> {
         let hash = util::to_hex(self.hash_u64());
-        let output = blake3::Hash::from(unit_output).to_hex();
+        let digest;
+        let pointer: [&[u8]; 2] = match tracked {
+            TrackedOutput::UnitOutput(id) => {
+                digest = blake3::Hash::from(id).to_hex();
+                [UNIT_OUTPUT_PREFIX.as_bytes(), digest.as_bytes()]
+            }
+            TrackedOutput::CacheEntry => [CACHE_ENTRY_MARKER.as_bytes(), b""],
+        };
         let mut bytes = [0; 96];
-        let mut remaining = bytes.as_mut_slice();
-        for part in [hash.as_bytes(), b"\nunit-output-v1 ", output.as_bytes()] {
-            let (destination, rest) = remaining.split_at_mut(part.len());
-            destination.copy_from_slice(part);
-            remaining = rest;
+        let mut len = 0;
+        for part in [hash.as_bytes(), b"\n"].into_iter().chain(pointer) {
+            bytes[len..len + part.len()].copy_from_slice(part);
+            len += part.len();
         }
-        paths::write_atomic(loc, bytes)?;
-        *self.unit_output.lock() = Some(unit_output);
+        paths::write_atomic(loc, &bytes[..len])?;
+        *self.tracked.lock() = Some(tracked);
         Ok(())
     }
 
@@ -1754,7 +1756,7 @@ fn calculate_normal(
         deps,
         local: Mutex::new(local),
         memoized_hash: Mutex::new(None),
-        unit_output: parking_lot::Mutex::new(None),
+        tracked: parking_lot::Mutex::new(None),
         config: Hasher::finish(&config),
         compile_kind,
         index: build_runner.bcx.unit_to_index[unit],
@@ -2107,7 +2109,7 @@ fn _compare_old_fingerprint(
     track_blobs: bool,
 ) -> CargoResult<FingerprintComparison> {
     let old_fingerprint_short = paths::read(old_hash_path)?;
-    let (old_hash, unit_output) = old_fingerprint_short
+    let (old_hash, tracked) = old_fingerprint_short
         .split_once('\n')
         .unwrap_or((&old_fingerprint_short, ""));
 
@@ -2115,7 +2117,7 @@ fn _compare_old_fingerprint(
 
     if util::to_hex(new_hash) == old_hash && new_fingerprint.fs_status.up_to_date() {
         if track_blobs {
-            *new_fingerprint.unit_output.lock() = parse_unit_output(unit_output);
+            *new_fingerprint.tracked.lock() = parse_tracked(tracked);
         }
         return Ok(FingerprintComparison::Fresh);
     }
@@ -2132,9 +2134,18 @@ fn _compare_old_fingerprint(
     Ok(FingerprintComparison::Dirty { reason })
 }
 
-fn parse_unit_output(record: &str) -> Option<UnitOutputHash> {
-    let hash = record.strip_prefix("unit-output-v1 ")?;
-    Some(*blake3::Hash::from_hex(hash).ok()?.as_bytes())
+const UNIT_OUTPUT_PREFIX: &str = "unit-output-v1 ";
+/// Cache entries are named by the unit hash, so the pointer only records the kind.
+const CACHE_ENTRY_MARKER: &str = "cache-entry-v1";
+
+fn parse_tracked(record: &str) -> Option<TrackedOutput> {
+    if record == CACHE_ENTRY_MARKER {
+        return Some(TrackedOutput::CacheEntry);
+    }
+    let hash = record.strip_prefix(UNIT_OUTPUT_PREFIX)?;
+    Some(TrackedOutput::UnitOutput(
+        *blake3::Hash::from_hex(hash).ok()?.as_bytes(),
+    ))
 }
 
 /// Calculates the fingerprint of a unit thats contains no dep-info files.
@@ -2289,44 +2300,45 @@ where
 }
 
 #[cfg(test)]
-mod unit_output_tests {
+mod tracked_output_tests {
     use super::*;
 
     #[test]
-    fn unit_output_pointer_does_not_change_fingerprint() {
-        let fingerprint = Fingerprint::new();
-        let original_hash = fingerprint.hash_u64();
-        let original_json = serde_json::to_string(&fingerprint).unwrap();
-        let output = *blake3::hash(b"unit output").as_bytes();
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("fingerprint");
-        fingerprint.record_unit_output(&path, output).unwrap();
-        fingerprint.clear_memoized();
+    fn tracking_pointer_does_not_change_fingerprint() {
+        let digest = *blake3::hash(b"tracked").as_bytes();
+        for tracked in [TrackedOutput::UnitOutput(digest), TrackedOutput::CacheEntry] {
+            let fingerprint = Fingerprint::new();
+            let original_hash = fingerprint.hash_u64();
+            let original_json = serde_json::to_string(&fingerprint).unwrap();
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("fingerprint");
+            fingerprint.record_tracked(&path, tracked).unwrap();
+            fingerprint.clear_memoized();
 
-        assert_eq!(fingerprint.hash_u64(), original_hash);
-        assert_eq!(serde_json::to_string(&fingerprint).unwrap(), original_json);
-        let record = paths::read(&path).unwrap();
-        let (hash, pointer) = record.split_once('\n').unwrap();
-        assert_eq!(hash, util::to_hex(original_hash));
-        assert_eq!(parse_unit_output(pointer), Some(output));
-        assert_eq!(fingerprint.unit_output(), Some(output));
+            assert_eq!(fingerprint.hash_u64(), original_hash);
+            assert_eq!(serde_json::to_string(&fingerprint).unwrap(), original_json);
+            let record = paths::read(&path).unwrap();
+            let (hash, pointer) = record.split_once('\n').unwrap();
+            assert_eq!(hash, util::to_hex(original_hash));
+            assert_eq!(parse_tracked(pointer), Some(tracked));
+            assert_eq!(fingerprint.tracked(), Some(tracked));
+        }
     }
 
     #[test]
-    fn malformed_unit_output_pointer_is_ignored() {
-        assert_eq!(parse_unit_output(""), None);
-        assert_eq!(parse_unit_output("unit-output-v1 not-a-hash"), None);
+    fn malformed_tracking_pointer_is_ignored() {
+        let hash = "a".repeat(64);
+        assert_eq!(parse_tracked(""), None);
+        assert_eq!(parse_tracked("unit-output-v1 not-a-hash"), None);
         assert_eq!(
-            parse_unit_output(&format!("unit-output-v1 {}", "a".repeat(63))),
+            parse_tracked(&format!("unit-output-v1 {}", &hash[1..])),
             None
         );
+        assert_eq!(parse_tracked(&format!("unit-output-v2 {hash}")), None);
         assert_eq!(
-            parse_unit_output(&format!("unit-output-v2 {}", "a".repeat(64))),
+            parse_tracked(&format!("unit-output-v1 {hash} trailing")),
             None
         );
-        assert_eq!(
-            parse_unit_output(&format!("unit-output-v1 {} trailing", "a".repeat(64))),
-            None
-        );
+        assert_eq!(parse_tracked(&format!("cache-entry-v1 {hash}")), None);
     }
 }

@@ -252,8 +252,19 @@ fn compile<'gctx>(
             let blob_storage = should_dedup_out_dir(build_runner, unit)
                 .then(|| build_runner.files().blob_storage())
                 .flatten();
+            let local_cache = match &blob_storage {
+                Some(_) => local_cache::LocalCache::new(build_runner, unit, exec, force)?,
+                None => None,
+            };
+            // Cacheable units are tracked by cache entry, others by unit output.
             let retained = blob_storage.as_ref().and_then(|storage| {
-                match storage.prepare_unit(build_runner.fingerprints[unit].unit_output()) {
+                let cache_key = local_cache.as_ref().map(|cache| cache.unit_hash());
+                let unit_dir = build_runner.files().build_unit_dir(unit);
+                match storage.prepare_unit(
+                    build_runner.fingerprints[unit].tracked(),
+                    cache_key,
+                    &unit_dir,
+                ) {
                     Ok(retained) => retained,
                     Err(err) => {
                         debug!(?unit, ?err, "failed to track unit output");
@@ -261,11 +272,13 @@ fn compile<'gctx>(
                     }
                 }
             });
-            let local_cache = if blob_storage.is_some() && retained.is_none() {
-                local_cache::LocalCache::new(build_runner, unit, exec, force)?
-            } else {
-                None
-            };
+            if job.freshness().is_dirty()
+                && let Some(cache) = &local_cache
+            {
+                cache.prefetch();
+                let cache = Arc::clone(cache);
+                job.defer_while(move || cache.prefetching());
+            }
             job.before(if job.freshness().is_dirty() {
                 let work = if unit.mode.is_doc() || unit.mode.is_doc_scrape() {
                     rustdoc(build_runner, unit)?
@@ -298,20 +311,30 @@ fn compile<'gctx>(
                 let hardlink_allowed = !unit.mode.is_doc() && !unit.mode.is_doc_scrape();
                 job.after(Work::new(move |_state| {
                     let result = (|| {
-                        let restored = local_cache.as_ref().and_then(|cache| cache.restored());
-                        let unit_output = match restored {
-                            Some(unit_output) => unit_output,
-                            None => {
-                                if local_cache.is_some() && messages.is_file() {
+                        let tracked = match &local_cache {
+                            Some(cache) if cache.restored() => {
+                                blob_storage::TrackedOutput::CacheEntry
+                            }
+                            Some(cache) => {
+                                if messages.is_file() {
                                     paths::copy(&messages, &out_dir.join(".cargo-output"))?;
                                 }
-                                blob_storage.capture_unit(&unit_dir, &out_dir, hardlink_allowed)?
+                                let outputs = blob_storage.capture_outputs(
+                                    &unit_dir,
+                                    &out_dir,
+                                    hardlink_allowed,
+                                )?;
+                                cache.publish(outputs)?
+                            }
+                            None => {
+                                blob_storage.publish_unit_output(blob_storage.capture_outputs(
+                                    &unit_dir,
+                                    &out_dir,
+                                    hardlink_allowed,
+                                )?)?
                             }
                         };
-                        fingerprint.record_unit_output(&loc, unit_output)?;
-                        if let Some(cache) = &local_cache {
-                            cache.publish(unit_output)?;
-                        }
+                        fingerprint.record_tracked(&loc, tracked)?;
                         CargoResult::Ok(())
                     })();
                     if let Err(err) = result {
@@ -514,10 +537,10 @@ fn rustc(
 
         if let Some(cache) = &local_cache {
             let restored = (|| {
-                let Some(unit_output) = cache.restore()? else {
+                if !cache.restore()? {
                     return CargoResult::Ok(false);
-                };
-                local_cache::validate_dep_info(&rustc_dep_info_loc, &rustc, &cwd, &pkg_root)?;
+                }
+                cache.validate_dep_info(&rustc_dep_info_loc, &rustc, &cwd, &pkg_root)?;
                 for output in outputs.iter().filter(|output| {
                     !matches!(output.flavor, FileFlavor::DebugInfo | FileFlavor::Auxiliary)
                 }) {
@@ -550,7 +573,7 @@ fn rustc(
                     .take()
                     .expect("cache replay work")
                     .call(state)?;
-                cache.accept(unit_output)?;
+                cache.accept()?;
                 Ok(true)
             })();
             match restored {

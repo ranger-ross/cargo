@@ -1,14 +1,17 @@
+use std::fmt;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, anyhow, ensure};
+use anyhow::{Context, anyhow, bail, ensure};
 use bazel_remote_apis::build::bazel::remote::execution::v2 as reapi;
 use bazel_remote_apis::google::bytestream;
 use cargo_util::Sha256;
-use futures::{TryFutureExt, stream};
+use futures::{StreamExt, TryFutureExt, TryStreamExt, stream};
 use parking_lot::Mutex;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncReadExt;
 use tokio::runtime::{Builder, Runtime};
 use tonic::metadata::{Ascii, MetadataValue};
 use tonic::transport::{Channel, ClientTlsConfig, Endpoint};
@@ -21,6 +24,18 @@ use crate::{CargoResult, GlobalContext};
 const CHUNK_SIZE: usize = 64 * 1024;
 const FIND_MISSING_BATCH: usize = 512;
 const MAX_MESSAGE_SIZE: usize = 4 * 1024 * 1024;
+// Batches stay below the default 4 MiB gRPC message limit on both ends.
+const BATCH_BLOB_LIMIT: i64 = 1024 * 1024;
+const BATCH_TOTAL_LIMIT: i64 = 3 * 1024 * 1024;
+const BATCH_BLOB_OVERHEAD: i64 = 128;
+const TRANSFER_CONCURRENCY: usize = 4;
+/// Connections for blob transfers. Lookups and other small RPCs use their own
+/// connection so they do not queue behind large transfers.
+const BULK_CONNECTIONS: usize = 2;
+/// Attempts for operations that fail with a transient error.
+const ATTEMPTS: u32 = 3;
+const RETRY_DELAY: Duration = Duration::from_millis(250);
+const ZSTD_LEVEL: i32 = 3;
 const API_KEY_HEADER: &str = "x-buildbuddy-api-key";
 
 // Deliberately not Debug: configuration and metadata may contain credentials.
@@ -32,11 +47,22 @@ pub(super) struct RemoteCache {
     read_only: bool,
     timeout: Duration,
     transport: Mutex<Option<Arc<Transport>>>,
+    /// Learned from GetCapabilities before the first transfer. Concurrent
+    /// transfers wait for a single request.
+    compression: tokio::sync::OnceCell<Compression>,
+}
+
+/// zstd support advertised by the server.
+#[derive(Clone, Copy, Default)]
+struct Compression {
+    /// `compressed-blobs` ByteStream resources and BatchReadBlobs responses.
+    stream: bool,
+    batch_update: bool,
 }
 
 struct Transport {
     runtime: Option<Runtime>,
-    channel: Channel,
+    channels: Channels,
 }
 
 impl Drop for Transport {
@@ -47,6 +73,32 @@ impl Drop for Transport {
         }
     }
 }
+
+#[derive(Clone)]
+struct Channels {
+    control: Channel,
+    bulk: Arc<[Channel]>,
+    next: Arc<AtomicUsize>,
+}
+
+impl Channels {
+    fn bulk(&self) -> Channel {
+        let index = self.next.fetch_add(1, Ordering::Relaxed);
+        self.bulk[index % self.bulk.len()].clone()
+    }
+}
+
+/// A failure worth retrying, such as an unavailable server or a timeout.
+#[derive(Debug)]
+struct Transient(String);
+
+impl fmt::Display for Transient {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Transient {}
 
 impl RemoteCache {
     pub(super) fn from_config(gctx: &GlobalContext) -> CargoResult<Option<Self>> {
@@ -79,9 +131,13 @@ impl RemoteCache {
         );
         let url = endpoint_url(&config.url)?;
         let tls = url.starts_with("https://");
+        // Hyper's default 5 MiB connection window caps throughput near 5 MiB per
+        // round trip.
         let endpoint = Endpoint::from_shared(url)
             .map_err(|_| anyhow!("invalid cache.remote.url endpoint"))?
-            .connect_timeout(timeout);
+            .connect_timeout(timeout)
+            .initial_connection_window_size(64 * 1024 * 1024)
+            .initial_stream_window_size(16 * 1024 * 1024);
         let instance_name = config.instance_name.unwrap_or_default();
         validate_instance(&instance_name)?;
         Ok(Some(Self {
@@ -92,6 +148,7 @@ impl RemoteCache {
             read_only: config.read_only.unwrap_or(false),
             timeout,
             transport: Mutex::new(None),
+            compression: tokio::sync::OnceCell::new(),
         }))
     }
 
@@ -99,23 +156,36 @@ impl RemoteCache {
         self.read_only
     }
 
-    pub(super) fn get_action(&self, key: &[u8]) -> CargoResult<Option<reapi::ActionResult>> {
+    /// `inline_output_files` is a hint. Servers may omit the contents of any path.
+    pub(super) fn get_action(
+        &self,
+        key: &[u8],
+        inline_output_files: &[&str],
+    ) -> CargoResult<Option<reapi::ActionResult>> {
         let action_digest = digest_bytes(key)?;
-        self.run(|channel| {
-            self.deadline("GetActionResult", async move {
-                let mut client = reapi::action_cache_client::ActionCacheClient::new(channel)
-                    .max_decoding_message_size(MAX_MESSAGE_SIZE);
+        let inline_output_files: Vec<_> = inline_output_files
+            .iter()
+            .map(|path| (*path).to_owned())
+            .collect();
+        self.run(|channels| {
+            self.retry(move || {
+                let channel = channels.control.clone();
                 let request = self.unary_request(reapi::GetActionResultRequest {
                     instance_name: self.instance_name.clone(),
-                    action_digest: Some(action_digest),
+                    action_digest: Some(action_digest.clone()),
+                    inline_output_files: inline_output_files.clone(),
                     digest_function: reapi::digest_function::Value::Sha256 as i32,
                     ..Default::default()
                 });
-                match client.get_action_result(request).await {
-                    Ok(response) => Ok(Some(response.into_inner())),
-                    Err(status) if status.code() == Code::NotFound => Ok(None),
-                    Err(status) => Err(rpc_error("GetActionResult", status)),
-                }
+                self.deadline("GetActionResult", async move {
+                    let mut client = reapi::action_cache_client::ActionCacheClient::new(channel)
+                        .max_decoding_message_size(MAX_MESSAGE_SIZE);
+                    match client.get_action_result(request).await {
+                        Ok(response) => Ok(Some(response.into_inner())),
+                        Err(status) if status.code() == Code::NotFound => Ok(None),
+                        Err(status) => Err(rpc_error("GetActionResult", status)),
+                    }
+                })
             })
         })
     }
@@ -123,22 +193,26 @@ impl RemoteCache {
     pub(super) fn update_action(&self, key: &[u8], result: reapi::ActionResult) -> CargoResult<()> {
         ensure!(!self.read_only, "remote cache is read-only");
         let action_digest = digest_bytes(key)?;
-        self.run(|channel| {
-            self.deadline("UpdateActionResult", async move {
-                let mut client = reapi::action_cache_client::ActionCacheClient::new(channel)
-                    .max_decoding_message_size(MAX_MESSAGE_SIZE)
-                    .max_encoding_message_size(MAX_MESSAGE_SIZE);
-                client
-                    .update_action_result(self.unary_request(reapi::UpdateActionResultRequest {
-                        instance_name: self.instance_name.clone(),
-                        action_digest: Some(action_digest),
-                        action_result: Some(result),
-                        digest_function: reapi::digest_function::Value::Sha256 as i32,
-                        ..Default::default()
-                    }))
-                    .await
-                    .map_err(|status| rpc_error("UpdateActionResult", status))?;
-                Ok(())
+        self.run(|channels| {
+            self.retry(move || {
+                let channel = channels.control.clone();
+                let request = self.unary_request(reapi::UpdateActionResultRequest {
+                    instance_name: self.instance_name.clone(),
+                    action_digest: Some(action_digest.clone()),
+                    action_result: Some(result.clone()),
+                    digest_function: reapi::digest_function::Value::Sha256 as i32,
+                    ..Default::default()
+                });
+                self.deadline("UpdateActionResult", async move {
+                    let mut client = reapi::action_cache_client::ActionCacheClient::new(channel)
+                        .max_decoding_message_size(MAX_MESSAGE_SIZE)
+                        .max_encoding_message_size(MAX_MESSAGE_SIZE);
+                    client
+                        .update_action_result(request)
+                        .await
+                        .map_err(|status| rpc_error("UpdateActionResult", status))?;
+                    Ok(())
+                })
             })
         })
     }
@@ -148,7 +222,7 @@ impl RemoteCache {
         if paths.is_empty() {
             return Ok(Vec::new());
         }
-        self.run(|channel| async move {
+        self.run(|channels| async move {
             let mut digests = Vec::with_capacity(paths.len());
             let mut buffer = vec![0; CHUNK_SIZE];
             for path in paths {
@@ -159,26 +233,30 @@ impl RemoteCache {
                 unique.entry(digest).or_insert(path);
             }
             let unique: Vec<_> = unique.into_iter().collect();
-            let mut client =
-                reapi::content_addressable_storage_client::ContentAddressableStorageClient::new(
-                    channel.clone(),
-                )
-                .max_decoding_message_size(MAX_MESSAGE_SIZE);
+            let mut missing = Vec::new();
+            let mut seen = HashSet::default();
             for batch in unique.chunks(FIND_MISSING_BATCH) {
+                let blob_digests: Vec<_> =
+                    batch.iter().map(|(digest, _)| (*digest).clone()).collect();
                 let response = self
-                    .deadline(
-                        "FindMissingBlobs",
-                        client
-                            .find_missing_blobs(self.unary_request(
-                                reapi::FindMissingBlobsRequest {
-                                    instance_name: self.instance_name.clone(),
-                                    blob_digests:
-                                        batch.iter().map(|(digest, _)| (*digest).clone()).collect(),
-                                    digest_function: reapi::digest_function::Value::Sha256 as i32,
-                                },
-                            ))
-                            .map_err(|status| rpc_error("FindMissingBlobs", status)),
-                    )
+                    .retry(|| {
+                        let channel = channels.control.clone();
+                        let request = self.unary_request(reapi::FindMissingBlobsRequest {
+                            instance_name: self.instance_name.clone(),
+                            blob_digests: blob_digests.clone(),
+                            digest_function: reapi::digest_function::Value::Sha256 as i32,
+                        });
+                        self.deadline(
+                            "FindMissingBlobs",
+                            async move {
+                                reapi::content_addressable_storage_client::ContentAddressableStorageClient::new(channel)
+                                    .max_decoding_message_size(MAX_MESSAGE_SIZE)
+                                    .find_missing_blobs(request)
+                                    .await
+                                    .map_err(|status| rpc_error("FindMissingBlobs", status))
+                            },
+                        )
+                    })
                     .await?
                     .into_inner();
                 tracing::debug!(
@@ -187,57 +265,330 @@ impl RemoteCache {
                     "FindMissingBlobs completed"
                 );
                 let requested: HashMap<_, _> = batch.iter().copied().collect();
-                let mut seen = HashSet::default();
-                for digest in &response.missing_blob_digests {
-                    validate_digest(digest)?;
-                    let path = requested
-                        .get(digest)
+                for digest in response.missing_blob_digests {
+                    validate_digest(&digest)?;
+                    let path = *requested
+                        .get(&digest)
                         .context("FindMissingBlobs returned an unrequested digest")?;
-                    if seen.insert(digest) {
-                        tracing::debug!(
-                            digest = %digest.hash,
-                            bytes = digest.size_bytes,
-                            "uploading remote cache blob"
-                        );
-                        // Sequential uploads bound memory regardless of artifact count or size.
-                        self.upload_file(channel.clone(), path, digest)
-                            .await
-                            .with_context(|| {
-                                format!("uploading remote cache blob ({} bytes)", digest.size_bytes)
-                            })?;
-                        tracing::debug!(
-                            digest = %digest.hash,
-                            bytes = digest.size_bytes,
-                            "uploaded remote cache blob"
-                        );
+                    if seen.insert(digest.clone()) {
+                        missing.push((digest, path.as_path()));
                     }
                 }
             }
+            if missing.is_empty() {
+                return Ok(digests);
+            }
+            let compression = self.compression(&channels).await;
+            // Batch and concurrency limits bound memory regardless of artifact count or size.
+            stream::iter(plan_transfers(missing))
+                .map(|transfer| {
+                    let channels = &channels;
+                    async move {
+                        match transfer {
+                            Transfer::Batch(blobs) => {
+                                self.retry(|| self.write_batch(channels.bulk(), &blobs, compression))
+                                    .await
+                            }
+                            Transfer::Stream(digest, path) => {
+                                tracing::debug!(
+                                    digest = %digest.hash,
+                                    bytes = digest.size_bytes,
+                                    "uploading remote cache blob"
+                                );
+                                self.retry(|| {
+                                    self.upload_file(channels.bulk(), path, &digest, compression)
+                                })
+                                .await
+                                .with_context(|| {
+                                    format!(
+                                        "uploading remote cache blob ({} bytes)",
+                                        digest.size_bytes
+                                    )
+                                })?;
+                                tracing::debug!(
+                                    digest = %digest.hash,
+                                    bytes = digest.size_bytes,
+                                    "uploaded remote cache blob"
+                                );
+                                Ok(())
+                            }
+                        }
+                    }
+                })
+                .buffer_unordered(TRANSFER_CONCURRENCY)
+                .try_collect::<Vec<()>>()
+                .await?;
             Ok(digests)
         })
     }
 
-    pub(super) fn download_file(
+    /// Download blobs to their destinations after verifying size and SHA256.
+    /// Small blobs share BatchReadBlobs requests. Large blobs stream concurrently.
+    pub(super) fn download_files(&self, files: Vec<(reapi::Digest, PathBuf)>) -> CargoResult<()> {
+        for (digest, _) in &files {
+            validate_digest(digest)?;
+        }
+        if files.is_empty() {
+            return Ok(());
+        }
+        self.run(|channels| async move {
+            let compression = self.compression(&channels).await;
+            stream::iter(plan_transfers(files))
+                .map(|transfer| {
+                    let channels = &channels;
+                    async move {
+                        match transfer {
+                            Transfer::Batch(blobs) => {
+                                self.retry(|| self.read_batch(channels.bulk(), &blobs, compression))
+                                    .await
+                            }
+                            Transfer::Stream(digest, path) => {
+                                self.retry(|| {
+                                    self.read_stream(channels.bulk(), &digest, &path, compression)
+                                })
+                                .await
+                            }
+                        }
+                    }
+                })
+                .buffer_unordered(TRANSFER_CONCURRENCY)
+                .try_collect::<Vec<()>>()
+                .await?;
+            Ok(())
+        })
+    }
+
+    /// Ask the server once whether it accepts zstd. Failures fall back to
+    /// uncompressed transfers.
+    async fn compression(&self, channels: &Channels) -> Compression {
+        *self
+            .compression
+            .get_or_init(|| async {
+                let channel = channels.control.clone();
+                let request = self.unary_request(reapi::GetCapabilitiesRequest {
+                    instance_name: self.instance_name.clone(),
+                });
+                let result = self
+                    .deadline("GetCapabilities", async move {
+                        reapi::capabilities_client::CapabilitiesClient::new(channel)
+                            .max_decoding_message_size(MAX_MESSAGE_SIZE)
+                            .get_capabilities(request)
+                            .await
+                            .map_err(|status| rpc_error("GetCapabilities", status))
+                    })
+                    .await;
+                let zstd = reapi::compressor::Value::Zstd as i32;
+                let compression = match result {
+                    Ok(response) => {
+                        let cache = response.into_inner().cache_capabilities.unwrap_or_default();
+                        Compression {
+                            stream: cache.supported_compressors.contains(&zstd),
+                            batch_update: cache.supported_batch_update_compressors.contains(&zstd),
+                        }
+                    }
+                    Err(error) => {
+                        tracing::debug!(%error, "remote cache capabilities unavailable");
+                        Compression::default()
+                    }
+                };
+                tracing::debug!(
+                    stream = compression.stream,
+                    batch_update = compression.batch_update,
+                    "remote cache zstd support"
+                );
+                compression
+            })
+            .await
+    }
+
+    async fn read_batch(
         &self,
+        channel: Channel,
+        blobs: &[(reapi::Digest, PathBuf)],
+        compression: Compression,
+    ) -> CargoResult<()> {
+        let bytes: i64 = blobs.iter().map(|(digest, _)| digest.size_bytes).sum();
+        tracing::debug!(blobs = blobs.len(), bytes, "downloading remote cache batch");
+        let mut client =
+            reapi::content_addressable_storage_client::ContentAddressableStorageClient::new(
+                channel,
+            )
+            .max_decoding_message_size(MAX_MESSAGE_SIZE);
+        let acceptable_compressors = if compression.stream {
+            vec![reapi::compressor::Value::Zstd as i32]
+        } else {
+            Vec::new()
+        };
+        let response = self
+            .deadline(
+                "BatchReadBlobs",
+                client
+                    .batch_read_blobs(self.unary_request(reapi::BatchReadBlobsRequest {
+                        instance_name: self.instance_name.clone(),
+                        digests: blobs.iter().map(|(digest, _)| digest.clone()).collect(),
+                        acceptable_compressors,
+                        digest_function: reapi::digest_function::Value::Sha256 as i32,
+                    }))
+                    .map_err(|status| rpc_error("BatchReadBlobs", status)),
+            )
+            .await?
+            .into_inner();
+        let mut pending: HashMap<_, _> = blobs
+            .iter()
+            .map(|(digest, path)| (digest.hash.as_str(), (digest, path)))
+            .collect();
+        ensure!(
+            pending.len() == blobs.len(),
+            "duplicate remote cache download"
+        );
+        let mut wire = 0;
+        for blob in response.responses {
+            let digest = blob
+                .digest
+                .context("BatchReadBlobs response without digest")?;
+            let (expected, path) = pending
+                .remove(digest.hash.as_str())
+                .context("BatchReadBlobs returned an unrequested blob")?;
+            ensure!(
+                digest.size_bytes == expected.size_bytes,
+                "BatchReadBlobs returned a different blob size"
+            );
+            check_blob_status("BatchReadBlobs", blob.status)?;
+            wire += blob.data.len();
+            let data = if blob.compressor == reapi::compressor::Value::Identity as i32 {
+                blob.data
+            } else if blob.compressor == reapi::compressor::Value::Zstd as i32 && compression.stream
+            {
+                let capacity = usize::try_from(expected.size_bytes)?;
+                zstd::bulk::decompress(&blob.data, capacity)
+                    .context("invalid zstd data from BatchReadBlobs")?
+            } else {
+                bail!("BatchReadBlobs returned an unrequested compressor");
+            };
+            verify_contents(expected, &data)?;
+            tokio::fs::write(path, &data)
+                .await
+                .context("failed to write remote cache staging file")?;
+        }
+        ensure!(
+            pending.is_empty(),
+            "BatchReadBlobs omitted a requested blob"
+        );
+        tracing::debug!(
+            blobs = blobs.len(),
+            bytes,
+            wire,
+            "downloaded remote cache batch"
+        );
+        Ok(())
+    }
+
+    async fn write_batch(
+        &self,
+        channel: Channel,
+        blobs: &[(reapi::Digest, &Path)],
+        compression: Compression,
+    ) -> CargoResult<()> {
+        let mut requests = Vec::with_capacity(blobs.len());
+        let mut bytes = 0;
+        let mut wire = 0;
+        for (digest, path) in blobs {
+            let data = tokio::fs::read(path)
+                .await
+                .context("failed to read remote cache upload")?;
+            verify_contents(digest, &data).context("remote cache upload changed contents")?;
+            bytes += digest.size_bytes;
+            let compressed = compression
+                .batch_update
+                .then(|| zstd::bulk::compress(&data, ZSTD_LEVEL))
+                .transpose()
+                .context("failed to compress remote cache upload")?
+                .filter(|compressed| compressed.len() < data.len());
+            let (data, compressor) = match compressed {
+                Some(compressed) => (compressed, reapi::compressor::Value::Zstd),
+                None => (data, reapi::compressor::Value::Identity),
+            };
+            wire += data.len();
+            requests.push(reapi::batch_update_blobs_request::Request {
+                digest: Some(digest.clone()),
+                data,
+                compressor: compressor as i32,
+            });
+        }
+        tracing::debug!(
+            blobs = blobs.len(),
+            bytes,
+            wire,
+            "uploading remote cache batch"
+        );
+        let mut client =
+            reapi::content_addressable_storage_client::ContentAddressableStorageClient::new(
+                channel,
+            )
+            .max_decoding_message_size(MAX_MESSAGE_SIZE);
+        let response = self
+            .deadline(
+                "BatchUpdateBlobs",
+                client
+                    .batch_update_blobs(self.unary_request(reapi::BatchUpdateBlobsRequest {
+                        instance_name: self.instance_name.clone(),
+                        requests,
+                        digest_function: reapi::digest_function::Value::Sha256 as i32,
+                    }))
+                    .map_err(|status| rpc_error("BatchUpdateBlobs", status)),
+            )
+            .await?
+            .into_inner();
+        let mut pending: HashSet<_> = blobs
+            .iter()
+            .map(|(digest, _)| digest.hash.as_str())
+            .collect();
+        for blob in response.responses {
+            let digest = blob
+                .digest
+                .context("BatchUpdateBlobs response without digest")?;
+            ensure!(
+                pending.remove(digest.hash.as_str()),
+                "BatchUpdateBlobs returned an unrequested blob"
+            );
+            check_blob_status("BatchUpdateBlobs", blob.status)?;
+        }
+        ensure!(
+            pending.is_empty(),
+            "BatchUpdateBlobs omitted a requested blob"
+        );
+        tracing::debug!(blobs = blobs.len(), bytes, "uploaded remote cache batch");
+        Ok(())
+    }
+
+    async fn read_stream(
+        &self,
+        channel: Channel,
         digest: &reapi::Digest,
         destination: &Path,
+        compression: Compression,
     ) -> CargoResult<()> {
-        validate_digest(digest)?;
         tracing::debug!(
             digest = %digest.hash,
             bytes = digest.size_bytes,
+            compressed = compression.stream,
             "downloading remote cache blob"
         );
-        self.run(|channel| async move {
+        async {
             let mut client = bytestream::byte_stream_client::ByteStreamClient::new(channel)
                 .max_decoding_message_size(MAX_MESSAGE_SIZE);
+            let kind = if compression.stream {
+                "compressed-blobs/zstd"
+            } else {
+                "blobs"
+            };
             let mut response = self
                 .deadline(
                     "ByteStream.Read",
                     client
                         .read(self.request(bytestream::ReadRequest {
                             resource_name: self.resource_name(&format!(
-                                "blobs/{}/{}",
+                                "{kind}/{}/{}",
                                 digest.hash, digest.size_bytes
                             )),
                             read_offset: 0,
@@ -248,11 +599,22 @@ impl RemoteCache {
                 )
                 .await?
                 .into_inner();
-            let mut file = tokio::fs::File::create(destination)
-                .await
+            let file = std::fs::File::create(destination)
                 .context("failed to create remote cache staging file")?;
-            let mut hasher = Sha256::new();
-            let mut size = 0_i64;
+            let writer = VerifyingWriter {
+                file: std::io::BufWriter::new(file),
+                hasher: Sha256::new(),
+                size: 0,
+                limit: digest.size_bytes,
+            };
+            let mut sink = if compression.stream {
+                Sink::Zstd(Box::new(
+                    zstd::stream::write::Decoder::new(writer)
+                        .context("failed to start zstd decoder")?,
+                ))
+            } else {
+                Sink::Identity(writer)
+            };
             while let Some(message) = self
                 .deadline(
                     "ByteStream.Read",
@@ -262,37 +624,37 @@ impl RemoteCache {
                 )
                 .await?
             {
-                size = checked_size(size, message.data.len())?;
-                ensure!(
-                    size <= digest.size_bytes,
-                    "remote cache blob exceeds its digest size"
-                );
-                hasher.update(&message.data);
-                file.write_all(&message.data)
-                    .await
+                sink.write_all(&message.data)
                     .context("failed to write remote cache staging file")?;
             }
-            ensure!(size == digest.size_bytes, "remote cache blob is truncated");
+            let mut writer = sink.finish()?;
             ensure!(
-                hasher.finish_hex() == digest.hash,
+                writer.size == digest.size_bytes,
+                "remote cache blob is truncated"
+            );
+            ensure!(
+                writer.hasher.finish_hex() == digest.hash,
                 "remote cache blob SHA256 mismatch"
             );
-            file.flush()
-                .await
+            writer
+                .file
+                .flush()
                 .context("failed to flush remote cache staging file")?;
-            tracing::debug!(
-                digest = %digest.hash,
-                bytes = digest.size_bytes,
-                "downloaded remote cache blob"
-            );
-            Ok(())
-        })
+            CargoResult::Ok(())
+        }
+        .await
         .with_context(|| {
             format!(
                 "downloading remote cache blob ({} bytes)",
                 digest.size_bytes
             )
-        })
+        })?;
+        tracing::debug!(
+            digest = %digest.hash,
+            bytes = digest.size_bytes,
+            "downloaded remote cache blob"
+        );
+        Ok(())
     }
 
     async fn upload_file(
@@ -300,6 +662,7 @@ impl RemoteCache {
         channel: Channel,
         path: &Path,
         digest: &reapi::Digest,
+        compression: Compression,
     ) -> CargoResult<()> {
         validate_digest(digest)?;
         let mut file = tokio::fs::File::open(path)
@@ -310,8 +673,13 @@ impl RemoteCache {
         id[6] = (id[6] & 0x0f) | 0x40;
         id[8] = (id[8] & 0x3f) | 0x80;
         let id = u128::from_be_bytes(id);
+        let kind = if compression.stream {
+            "compressed-blobs/zstd"
+        } else {
+            "blobs"
+        };
         let resource_name = self.resource_name(&format!(
-            "uploads/{:08x}-{:04x}-{:04x}-{:04x}-{:012x}/blobs/{}/{}",
+            "uploads/{:08x}-{:04x}-{:04x}-{:04x}-{:012x}/{kind}/{}/{}",
             id >> 96,
             (id >> 80) & 0xffff,
             (id >> 64) & 0xffff,
@@ -320,31 +688,40 @@ impl RemoteCache {
             digest.hash,
             digest.size_bytes,
         ));
+        let mut encoder = compression
+            .stream
+            .then(|| zstd::stream::write::Encoder::new(Vec::new(), ZSTD_LEVEL))
+            .transpose()
+            .context("failed to start zstd encoder")?;
         let (sender, receiver) = tokio::sync::mpsc::channel(2);
         let messages = stream::unfold(receiver, |mut receiver| async move {
             receiver.recv().await.map(|message| (message, receiver))
         });
+        // Compressed uploads report offsets in compressed bytes after the first message.
+        let sent_bytes = Arc::new(AtomicUsize::new(0));
+        let producer_sent = Arc::clone(&sent_bytes);
         let producer = async move {
             let mut hasher = Sha256::new();
+            let mut size = 0_i64;
             let mut offset = 0_i64;
             let mut name = resource_name;
             loop {
-                let mut data = vec![0; CHUNK_SIZE];
+                let mut chunk = vec![0; CHUNK_SIZE];
                 let count = file
-                    .read(&mut data)
+                    .read(&mut chunk)
                     .await
                     .context("failed to read remote cache upload")?;
-                data.truncate(count);
-                let next_offset = checked_size(offset, count)?;
+                chunk.truncate(count);
+                size = checked_size(size, count)?;
                 ensure!(
-                    next_offset <= digest.size_bytes,
+                    size <= digest.size_bytes,
                     "remote cache upload changed size"
                 );
-                hasher.update(&data);
+                hasher.update(&chunk);
                 let finish_write = count == 0;
                 if finish_write {
                     ensure!(
-                        offset == digest.size_bytes,
+                        size == digest.size_bytes,
                         "remote cache upload was truncated"
                     );
                     ensure!(
@@ -352,6 +729,26 @@ impl RemoteCache {
                         "remote cache upload changed contents"
                     );
                 }
+                let data = match encoder.as_mut() {
+                    None => chunk,
+                    Some(encoder) if finish_write => std::mem::replace(
+                        encoder,
+                        zstd::stream::write::Encoder::new(Vec::new(), ZSTD_LEVEL)?,
+                    )
+                    .finish()
+                    .context("failed to compress remote cache upload")?,
+                    Some(encoder) => {
+                        encoder
+                            .write_all(&chunk)
+                            .context("failed to compress remote cache upload")?;
+                        std::mem::take(encoder.get_mut())
+                    }
+                };
+                // The compressor buffers input. Skip empty messages before the last.
+                if data.is_empty() && !finish_write {
+                    continue;
+                }
+                let len = data.len();
                 let sent = self
                     .deadline("ByteStream.Write", async {
                         Ok(sender
@@ -369,7 +766,8 @@ impl RemoteCache {
                     // The server can finish early if another writer stored the blob.
                     return CargoResult::Ok(());
                 }
-                offset = next_offset;
+                offset = checked_size(offset, len)?;
+                producer_sent.fetch_add(len, Ordering::Relaxed);
                 if finish_write {
                     return CargoResult::Ok(());
                 }
@@ -390,10 +788,20 @@ impl RemoteCache {
                     self.deadline("ByteStream.Write (commit)", upload).await?
                 }
             };
-        ensure!(
-            response.into_inner().committed_size == digest.size_bytes,
-            "remote cache upload committed size mismatch"
-        );
+        let committed = response.into_inner().committed_size;
+        if compression.stream {
+            // Compressed uploads report -1 when another writer completed the blob.
+            let sent = i64::try_from(sent_bytes.load(Ordering::Relaxed))?;
+            ensure!(
+                committed == -1 || committed == sent || committed == digest.size_bytes,
+                "remote cache upload committed size mismatch"
+            );
+        } else {
+            ensure!(
+                committed == digest.size_bytes,
+                "remote cache upload committed size mismatch"
+            );
+        }
         Ok(())
     }
 
@@ -427,14 +835,34 @@ impl RemoteCache {
         tokio::time::timeout(self.timeout, future)
             .await
             .map_err(|_| {
-                anyhow!(
+                anyhow::Error::new(Transient(format!(
                     "remote cache {operation} timed out after {}s",
                     self.timeout.as_secs()
-                )
+                )))
             })?
     }
 
-    fn run<T, F>(&self, operation: impl FnOnce(Channel) -> F) -> CargoResult<T>
+    /// Retry transient failures with backoff. Integrity failures are not retried.
+    async fn retry<T, F, Fut>(&self, mut attempt: F) -> CargoResult<T>
+    where
+        F: FnMut() -> Fut,
+        Fut: Future<Output = CargoResult<T>>,
+    {
+        let mut delay = RETRY_DELAY;
+        for _ in 1..ATTEMPTS {
+            match attempt().await {
+                Err(error) if error.downcast_ref::<Transient>().is_some() => {
+                    tracing::debug!(%error, "retrying remote cache operation");
+                    tokio::time::sleep(delay).await;
+                    delay *= 4;
+                }
+                result => return result,
+            }
+        }
+        attempt().await
+    }
+
+    fn run<T, F>(&self, operation: impl FnOnce(Channels) -> F) -> CargoResult<T>
     where
         F: Future<Output = CargoResult<T>>,
     {
@@ -453,13 +881,20 @@ impl RemoteCache {
                     .enable_all()
                     .build()
                     .context("failed to start remote cache runtime")?;
-                let channel = {
+                // Each lazily connected channel owns its own HTTP/2 connection.
+                let channels = {
                     let _entered = runtime.enter();
-                    endpoint.connect_lazy()
+                    Channels {
+                        control: endpoint.connect_lazy(),
+                        bulk: (0..BULK_CONNECTIONS)
+                            .map(|_| endpoint.connect_lazy())
+                            .collect(),
+                        next: Arc::default(),
+                    }
                 };
                 *slot = Some(Arc::new(Transport {
                     runtime: Some(runtime),
-                    channel,
+                    channels,
                 }));
             }
             Arc::clone(slot.as_ref().unwrap())
@@ -467,7 +902,64 @@ impl RemoteCache {
         // Worker threads keep HTTP/2 IO alive between synchronous Cargo operations.
         // Unlike Runtime::block_on, this also permits callers inside a Tokio context.
         let _entered = transport.runtime.as_ref().unwrap().enter();
-        futures::executor::block_on(operation(transport.channel.clone()))
+        futures::executor::block_on(operation(transport.channels.clone()))
+    }
+}
+
+/// Writes downloaded bytes while checking their size and SHA256.
+struct VerifyingWriter {
+    file: std::io::BufWriter<std::fs::File>,
+    hasher: Sha256,
+    size: i64,
+    limit: i64,
+}
+
+impl std::io::Write for VerifyingWriter {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        let size = i64::try_from(data.len())
+            .ok()
+            .and_then(|len| self.size.checked_add(len))
+            .filter(|size| *size <= self.limit)
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "remote cache blob exceeds its digest size",
+                )
+            })?;
+        self.file.write_all(data)?;
+        self.hasher.update(data);
+        self.size = size;
+        Ok(data.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.file.flush()
+    }
+}
+
+enum Sink {
+    Identity(VerifyingWriter),
+    Zstd(Box<zstd::stream::write::Decoder<'static, VerifyingWriter>>),
+}
+
+impl Sink {
+    fn write_all(&mut self, data: &[u8]) -> std::io::Result<()> {
+        match self {
+            Sink::Identity(writer) => writer.write_all(data),
+            Sink::Zstd(decoder) => decoder.write_all(data),
+        }
+    }
+
+    fn finish(self) -> CargoResult<VerifyingWriter> {
+        match self {
+            Sink::Identity(writer) => Ok(writer),
+            Sink::Zstd(mut decoder) => {
+                decoder
+                    .flush()
+                    .context("invalid zstd data from ByteStream.Read")?;
+                Ok(decoder.into_inner())
+            }
+        }
     }
 }
 
@@ -544,6 +1036,62 @@ fn validate_digest(digest: &reapi::Digest) -> CargoResult<()> {
     Ok(())
 }
 
+/// Verify inlined or batched contents against their REAPI digest.
+pub(super) fn verify_contents(digest: &reapi::Digest, contents: &[u8]) -> CargoResult<()> {
+    validate_digest(digest)?;
+    ensure!(
+        i64::try_from(contents.len()).ok() == Some(digest.size_bytes),
+        "remote cache contents size mismatch"
+    );
+    ensure!(
+        Sha256::new().update(contents).finish_hex() == digest.hash,
+        "remote cache contents SHA256 mismatch"
+    );
+    Ok(())
+}
+
+enum Transfer<T> {
+    Batch(Vec<(reapi::Digest, T)>),
+    Stream(reapi::Digest, T),
+}
+
+/// Pack small blobs into batches below the gRPC message limit. Large blobs stream alone.
+fn plan_transfers<T>(blobs: Vec<(reapi::Digest, T)>) -> Vec<Transfer<T>> {
+    let mut transfers = Vec::new();
+    let mut batch = Vec::new();
+    let mut batch_size = 0;
+    for (digest, item) in blobs {
+        if digest.size_bytes > BATCH_BLOB_LIMIT {
+            transfers.push(Transfer::Stream(digest, item));
+            continue;
+        }
+        let size = digest.size_bytes + BATCH_BLOB_OVERHEAD;
+        if !batch.is_empty() && batch_size + size > BATCH_TOTAL_LIMIT {
+            transfers.push(Transfer::Batch(std::mem::take(&mut batch)));
+            batch_size = 0;
+        }
+        batch_size += size;
+        batch.push((digest, item));
+    }
+    if !batch.is_empty() {
+        transfers.push(Transfer::Batch(batch));
+    }
+    transfers
+}
+
+fn check_blob_status(
+    operation: &str,
+    status: Option<bazel_remote_apis::google::rpc::Status>,
+) -> CargoResult<()> {
+    let code = Code::from(status.map_or(0, |status| status.code));
+    // Like `rpc_error`, omit the server-provided message.
+    ensure!(
+        code == Code::Ok,
+        "remote cache {operation} failed for a blob ({code:?})"
+    );
+    Ok(())
+}
+
 fn digest_bytes(bytes: &[u8]) -> CargoResult<reapi::Digest> {
     Ok(reapi::Digest {
         hash: Sha256::new().update(bytes).finish_hex(),
@@ -585,12 +1133,68 @@ fn checked_size(size: i64, count: usize) -> CargoResult<i64> {
 
 fn rpc_error(operation: &str, status: Status) -> anyhow::Error {
     // A server may echo request headers in its status message or metadata.
-    anyhow!("remote cache {operation} failed ({:?})", status.code())
+    let message = format!("remote cache {operation} failed ({:?})", status.code());
+    match status.code() {
+        Code::Unavailable
+        | Code::DeadlineExceeded
+        | Code::Cancelled
+        | Code::ResourceExhausted
+        | Code::Aborted
+        | Code::Internal
+        | Code::Unknown => Transient(message).into(),
+        _ => anyhow!(message),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transfer_plans_respect_batch_limits() {
+        let digest = |size| reapi::Digest {
+            hash: "0".repeat(64),
+            size_bytes: size,
+        };
+        let sizes = [
+            0,
+            1,
+            BATCH_BLOB_LIMIT,
+            BATCH_BLOB_LIMIT + 1,
+            BATCH_BLOB_LIMIT,
+            BATCH_BLOB_LIMIT,
+            BATCH_BLOB_LIMIT - BATCH_BLOB_OVERHEAD,
+            10 * BATCH_BLOB_LIMIT,
+        ];
+        let blobs = sizes
+            .iter()
+            .enumerate()
+            .map(|(i, size)| (digest(*size), i))
+            .collect();
+        let mut planned = Vec::new();
+        for transfer in plan_transfers(blobs) {
+            match transfer {
+                Transfer::Batch(batch) => {
+                    assert!(!batch.is_empty());
+                    let total: i64 = batch
+                        .iter()
+                        .map(|(digest, _)| digest.size_bytes + BATCH_BLOB_OVERHEAD)
+                        .sum();
+                    assert!(total <= BATCH_TOTAL_LIMIT, "{total}");
+                    for (digest, i) in batch {
+                        assert!(digest.size_bytes <= BATCH_BLOB_LIMIT);
+                        planned.push(i);
+                    }
+                }
+                Transfer::Stream(digest, i) => {
+                    assert!(digest.size_bytes > BATCH_BLOB_LIMIT);
+                    planned.push(i);
+                }
+            }
+        }
+        planned.sort_unstable();
+        assert_eq!(planned, (0..sizes.len()).collect::<Vec<_>>());
+    }
 
     #[test]
     fn endpoints_accept_origins_and_reject_secret_bearing_urls() {

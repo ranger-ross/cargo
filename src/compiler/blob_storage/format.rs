@@ -1,4 +1,4 @@
-//! Versioned immutable graph objects and local cache entries.
+//! Versioned immutable unit outputs and snapshots, plus mutable cache entries.
 
 use std::path::{Component, Path, PathBuf};
 
@@ -8,8 +8,8 @@ use crate::CargoResult;
 
 pub(super) type Digest = [u8; 32];
 const UNIT_MAGIC: &[u8] = b"cargo-shared-storage-unit-output-v1\0";
-const SNAPSHOT_MAGIC: &[u8] = b"cargo-shared-storage-snapshot-v1\0";
-const CACHE_MAGIC: &[u8] = b"cargo-shared-storage-cache-entry-v1\0";
+const SNAPSHOT_MAGIC: &[u8] = b"cargo-shared-storage-snapshot-v2\0";
+const CACHE_MAGIC: &[u8] = b"cargo-shared-storage-cache-entry-v2\0";
 
 #[cfg(unix)]
 const PATH_ENCODING: u8 = 1;
@@ -18,8 +18,9 @@ const PATH_ENCODING: u8 = 2;
 #[cfg(not(any(unix, windows)))]
 const PATH_ENCODING: u8 = 3;
 
+/// One captured file: its path relative to the unit directory and its blob.
 #[derive(Debug)]
-pub(super) struct Output {
+pub(in crate::compiler) struct Output {
     pub path: Vec<u8>,
     pub hash: Digest,
     pub size: u64,
@@ -56,8 +57,13 @@ impl UnitOutput {
     }
 }
 
+/// A cache entry duplicates the unit-output paths and hashes so a lookup needs
+/// a single read. It also stores the metadata used to restore each file.
 #[derive(Debug, Eq, PartialEq)]
-pub(super) struct OutputMetadata {
+pub(super) struct CachedOutput {
+    pub path: Vec<u8>,
+    pub hash: Digest,
+    pub size: u64,
     pub mode: u32,
     pub mtime_seconds: i64,
     pub mtime_nanos: u32,
@@ -65,10 +71,17 @@ pub(super) struct OutputMetadata {
 
 #[derive(Debug, Eq, PartialEq)]
 pub(super) struct CacheEntry {
-    pub unit_output: Digest,
+    /// Input guard covering inputs that the unit hash does not.
     pub fingerprint: u64,
-    /// Metadata follows the unit output's canonical path order.
-    pub outputs: Vec<OutputMetadata>,
+    /// Outputs in canonical path order.
+    pub outputs: Vec<CachedOutput>,
+}
+
+/// Unit-output and cache-entry members of one successful build.
+#[derive(Debug, Eq, PartialEq)]
+pub(super) struct Snapshot {
+    pub unit_outputs: Vec<Digest>,
+    pub cache_entries: Vec<String>,
 }
 
 /// Encode components explicitly; native OsStr encoding is not a wire format.
@@ -172,54 +185,99 @@ pub(super) fn decode_unit(bytes: &[u8], id: &Digest) -> CargoResult<Vec<Output>>
     Ok(outputs)
 }
 
-/// Sorting and hashing avoid serializing an already-published graph.
-pub(super) fn snapshot_id(results: &mut Vec<Digest>) -> Digest {
-    results.sort_unstable();
-    results.dedup();
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(SNAPSHOT_MAGIC);
-    hasher.update(&(results.len() as u64).to_le_bytes());
-    for result in results {
-        hasher.update(result);
+impl Snapshot {
+    /// Sorting makes identical member sets share an identity.
+    pub fn new(mut unit_outputs: Vec<Digest>, mut cache_entries: Vec<String>) -> Self {
+        unit_outputs.sort_unstable();
+        unit_outputs.dedup();
+        cache_entries.sort_unstable();
+        cache_entries.dedup();
+        Self {
+            unit_outputs,
+            cache_entries,
+        }
     }
-    *hasher.finalize().as_bytes()
-}
 
-pub(super) fn encode_snapshot(results: &[Digest]) -> Vec<u8> {
-    let mut bytes = Vec::with_capacity(SNAPSHOT_MAGIC.len() + 8 + results.len() * 32);
-    bytes.extend_from_slice(SNAPSHOT_MAGIC);
-    put_u64(&mut bytes, results.len() as u64);
-    for result in results {
-        bytes.extend_from_slice(result);
+    pub fn encode(&self) -> Vec<u8> {
+        let capacity = SNAPSHOT_MAGIC.len()
+            + 16
+            + self.unit_outputs.len() * 32
+            + self
+                .cache_entries
+                .iter()
+                .map(|name| 8 + name.len())
+                .sum::<usize>();
+        let mut bytes = Vec::with_capacity(capacity);
+        bytes.extend_from_slice(SNAPSHOT_MAGIC);
+        put_u64(&mut bytes, self.unit_outputs.len() as u64);
+        for id in &self.unit_outputs {
+            bytes.extend_from_slice(id);
+        }
+        put_u64(&mut bytes, self.cache_entries.len() as u64);
+        for name in &self.cache_entries {
+            put_bytes(&mut bytes, name.as_bytes());
+        }
+        bytes
     }
-    bytes
-}
 
-pub(super) fn decode_snapshot(bytes: &[u8], id: &Digest) -> CargoResult<Vec<Digest>> {
-    verify_digest(bytes, id)?;
-    let mut reader = Reader::new(bytes, SNAPSHOT_MAGIC)?;
-    let count = reader.count(32)?;
-    let mut results = Vec::with_capacity(count);
-    for _ in 0..count {
-        let result = reader.digest()?;
-        ensure!(
-            results.last().is_none_or(|last| last < &result),
-            "unordered or duplicate snapshot member"
-        );
-        results.push(result);
+    pub fn decode(bytes: &[u8], id: &Digest) -> CargoResult<Self> {
+        verify_digest(bytes, id)?;
+        let mut reader = Reader::new(bytes, SNAPSHOT_MAGIC)?;
+        let count = reader.count(32)?;
+        let mut unit_outputs: Vec<Digest> = Vec::with_capacity(count);
+        for _ in 0..count {
+            let id = reader.digest()?;
+            ensure!(
+                unit_outputs.last().is_none_or(|last| last < &id),
+                "unordered or duplicate snapshot unit output"
+            );
+            unit_outputs.push(id);
+        }
+        let count = reader.count(9)?;
+        let mut cache_entries: Vec<String> = Vec::with_capacity(count);
+        for _ in 0..count {
+            let name = std::str::from_utf8(reader.bytes()?)?;
+            ensure!(valid_unit_hash(name), "invalid snapshot cache entry");
+            ensure!(
+                cache_entries.last().is_none_or(|last| last.as_str() < name),
+                "unordered or duplicate snapshot cache entry"
+            );
+            cache_entries.push(name.to_owned());
+        }
+        reader.finish()?;
+        Ok(Self {
+            unit_outputs,
+            cache_entries,
+        })
     }
-    reader.finish()?;
-    Ok(results)
 }
 
 impl CacheEntry {
+    pub fn new(fingerprint: u64, mut outputs: Vec<CachedOutput>) -> Self {
+        outputs.sort_unstable_by(|a, b| a.path.cmp(&b.path));
+        Self {
+            fingerprint,
+            outputs,
+        }
+    }
+
     pub fn encode(&self) -> Vec<u8> {
-        let mut bytes = Vec::with_capacity(CACHE_MAGIC.len() + 48 + self.outputs.len() * 16);
+        let capacity = CACHE_MAGIC.len()
+            + 17
+            + self
+                .outputs
+                .iter()
+                .map(|output| 64 + output.path.len())
+                .sum::<usize>();
+        let mut bytes = Vec::with_capacity(capacity);
         bytes.extend_from_slice(CACHE_MAGIC);
-        bytes.extend_from_slice(&self.unit_output);
+        bytes.push(PATH_ENCODING);
         put_u64(&mut bytes, self.fingerprint);
         put_u64(&mut bytes, self.outputs.len() as u64);
         for output in &self.outputs {
+            put_bytes(&mut bytes, &output.path);
+            bytes.extend_from_slice(&output.hash);
+            put_u64(&mut bytes, output.size);
             bytes.extend_from_slice(&output.mode.to_le_bytes());
             bytes.extend_from_slice(&output.mtime_seconds.to_le_bytes());
             bytes.extend_from_slice(&output.mtime_nanos.to_le_bytes());
@@ -227,22 +285,37 @@ impl CacheEntry {
         bytes
     }
 
+    /// Decode any path encoding. Restoration must use `decode_native`.
     pub fn decode(bytes: &[u8]) -> CargoResult<Self> {
         let mut reader = Reader::new(bytes, CACHE_MAGIC)?;
-        let unit_output = reader.digest()?;
+        let encoding = reader.take(1)?[0];
+        ensure!((1..=3).contains(&encoding), "unknown output path encoding");
         let fingerprint = reader.u64()?;
-        let count = reader.count(16)?;
-        let mut outputs = Vec::with_capacity(count);
+        let count = reader.count(64)?;
+        let mut outputs: Vec<CachedOutput> = Vec::with_capacity(count);
         for _ in 0..count {
-            let mode = u32::from_le_bytes(reader.take(4)?.try_into().unwrap());
+            let path = reader.bytes()?;
+            validate_path(encoding, path)?;
+            ensure!(
+                outputs
+                    .last()
+                    .is_none_or(|last| last.path.as_slice() < path),
+                "unordered or duplicate output path"
+            );
+            let hash = reader.digest()?;
+            let size = reader.u64()?;
+            let mode = reader.u32()?;
             let mtime_seconds = i64::from_le_bytes(reader.take(8)?.try_into().unwrap());
-            let mtime_nanos = u32::from_le_bytes(reader.take(4)?.try_into().unwrap());
+            let mtime_nanos = reader.u32()?;
             ensure!(mode & !0o777 == 0, "invalid cached output permissions");
             ensure!(
                 mtime_nanos < 1_000_000_000,
                 "invalid cached output timestamp"
             );
-            outputs.push(OutputMetadata {
+            outputs.push(CachedOutput {
+                path: path.to_vec(),
+                hash,
+                size,
                 mode,
                 mtime_seconds,
                 mtime_nanos,
@@ -250,11 +323,28 @@ impl CacheEntry {
         }
         reader.finish()?;
         Ok(Self {
-            unit_output,
             fingerprint,
             outputs,
         })
     }
+
+    pub fn decode_native(bytes: &[u8]) -> CargoResult<Self> {
+        let entry = Self::decode(bytes)?;
+        ensure!(
+            bytes[CACHE_MAGIC.len()] == PATH_ENCODING,
+            "foreign output path encoding"
+        );
+        Ok(entry)
+    }
+}
+
+/// Cache entries are named by Cargo's lowercase hexadecimal unit hash.
+pub(super) fn valid_unit_hash(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 pub(super) fn digest_filename(name: &str) -> Option<Digest> {
@@ -358,6 +448,10 @@ impl<'a> Reader<'a> {
         Ok(value)
     }
 
+    fn u32(&mut self) -> CargoResult<u32> {
+        Ok(u32::from_le_bytes(self.take(4)?.try_into().unwrap()))
+    }
+
     fn u64(&mut self) -> CargoResult<u64> {
         Ok(u64::from_le_bytes(self.take(8)?.try_into().unwrap()))
     }
@@ -416,13 +510,20 @@ mod tests {
             decode_unit(&first.bytes, &first.id).unwrap()[0].size,
             u64::MAX
         );
-        let mut members = vec![first.id, [2; 32], first.id];
-        let id = snapshot_id(&mut members);
-        assert_eq!(
-            decode_snapshot(&encode_snapshot(&members), &id).unwrap(),
-            members
+        let snapshot = Snapshot::new(
+            vec![first.id, [2; 32], first.id],
+            vec!["b".to_owned(), "a".to_owned(), "b".to_owned()],
         );
-        assert_ne!(unit(&[]).id, snapshot_id(&mut vec![]));
+        let reordered = Snapshot::new(
+            vec![[2; 32], first.id],
+            vec!["a".to_owned(), "b".to_owned()],
+        );
+        let bytes = snapshot.encode();
+        assert_eq!(bytes, reordered.encode());
+        assert_eq!(
+            Snapshot::decode(&bytes, blake3::hash(&bytes).as_bytes()).unwrap(),
+            snapshot
+        );
     }
 
     #[test]
@@ -437,23 +538,34 @@ mod tests {
         let mut bytes = result.bytes;
         bytes.push(0);
         assert!(decode_unit(&bytes, blake3::hash(&bytes).as_bytes()).is_err());
-        let mut snapshot = encode_snapshot(&[[1; 32]]);
+        let mut snapshot = Snapshot::new(vec![[1; 32]], vec!["ab".to_owned()]).encode();
         for end in 0..snapshot.len() {
             let bytes = &snapshot[..end];
-            assert!(decode_snapshot(bytes, blake3::hash(bytes).as_bytes()).is_err());
+            assert!(Snapshot::decode(bytes, blake3::hash(bytes).as_bytes()).is_err());
         }
         snapshot.push(0);
-        assert!(decode_snapshot(&snapshot, blake3::hash(&snapshot).as_bytes()).is_err());
+        assert!(Snapshot::decode(&snapshot, blake3::hash(&snapshot).as_bytes()).is_err());
     }
 
     #[test]
     fn rejects_unbounded_counts_and_noncanonical_order() {
-        let mut bytes = encode_snapshot(&[]);
-        bytes[SNAPSHOT_MAGIC.len()..].copy_from_slice(&u64::MAX.to_le_bytes());
-        assert!(decode_snapshot(&bytes, blake3::hash(&bytes).as_bytes()).is_err());
-        for members in [vec![[1; 32], [1; 32]], vec![[2; 32], [1; 32]]] {
-            let bytes = encode_snapshot(&members);
-            assert!(decode_snapshot(&bytes, blake3::hash(&bytes).as_bytes()).is_err());
+        let mut bytes = Snapshot::new(Vec::new(), Vec::new()).encode();
+        bytes[SNAPSHOT_MAGIC.len()..SNAPSHOT_MAGIC.len() + 8]
+            .copy_from_slice(&u64::MAX.to_le_bytes());
+        assert!(Snapshot::decode(&bytes, blake3::hash(&bytes).as_bytes()).is_err());
+        for (unit_outputs, cache_entries) in [
+            (vec![[1; 32], [1; 32]], vec![]),
+            (vec![[2; 32], [1; 32]], vec![]),
+            (vec![], vec!["b", "a"]),
+            (vec![], vec!["a", "a"]),
+            (vec![], vec!["../a"]),
+        ] {
+            let snapshot = Snapshot {
+                unit_outputs,
+                cache_entries: cache_entries.into_iter().map(str::to_owned).collect(),
+            };
+            let bytes = snapshot.encode();
+            assert!(Snapshot::decode(&bytes, blake3::hash(&bytes).as_bytes()).is_err());
         }
         let path = encode_output_path(Path::new("a")).unwrap();
         let duplicate = unit(&[&path, &path]);
@@ -483,25 +595,51 @@ mod tests {
         assert!(decode_unit(&bytes, blake3::hash(&bytes).as_bytes()).is_err());
     }
 
+    fn cached(path: &str) -> CachedOutput {
+        CachedOutput {
+            path: encode_output_path(Path::new(path)).unwrap(),
+            hash: [3; 32],
+            size: u64::MAX,
+            mode: 0o755,
+            mtime_seconds: -1,
+            mtime_nanos: 123,
+        }
+    }
+
     #[test]
     fn cache_entry_roundtrip_and_rejects_truncation() {
-        let entry = CacheEntry {
-            unit_output: [3; 32],
-            fingerprint: u64::MAX,
-            outputs: vec![OutputMetadata {
-                mode: 0o755,
-                mtime_seconds: -1,
-                mtime_nanos: 123,
-            }],
-        };
+        let entry = CacheEntry::new(u64::MAX, vec![cached("out/b"), cached("out/a")]);
+        assert_eq!(entry.outputs[0].path, cached("out/a").path);
         let bytes = entry.encode();
         assert_eq!(CacheEntry::decode(&bytes).unwrap(), entry);
+        assert_eq!(CacheEntry::decode_native(&bytes).unwrap(), entry);
         for end in 0..bytes.len() {
             assert!(CacheEntry::decode(&bytes[..end]).is_err());
         }
-        let mut trailing = bytes;
+        let mut trailing = bytes.clone();
         trailing.push(0);
         assert!(CacheEntry::decode(&trailing).is_err());
+        let duplicate = CacheEntry {
+            fingerprint: 0,
+            outputs: vec![cached("out/a"), cached("out/a")],
+        };
+        assert!(CacheEntry::decode(&duplicate.encode()).is_err());
+    }
+
+    #[test]
+    fn foreign_cache_entries_decode_for_collection_but_not_restoration() {
+        let mut bytes = CACHE_MAGIC.to_vec();
+        bytes.push(if PATH_ENCODING == 3 { 1 } else { 3 });
+        put_u64(&mut bytes, 7);
+        put_u64(&mut bytes, 1);
+        put_bytes(&mut bytes, b"out/a");
+        bytes.extend_from_slice(&[1; 32]);
+        put_u64(&mut bytes, 0);
+        bytes.extend_from_slice(&0o644_u32.to_le_bytes());
+        bytes.extend_from_slice(&0_i64.to_le_bytes());
+        bytes.extend_from_slice(&0_u32.to_le_bytes());
+        assert_eq!(CacheEntry::decode(&bytes).unwrap().fingerprint, 7);
+        assert!(CacheEntry::decode_native(&bytes).is_err());
     }
 
     #[test]

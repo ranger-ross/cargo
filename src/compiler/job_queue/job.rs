@@ -12,6 +12,8 @@ use crate::util::CargoResult;
 pub struct Job {
     work: Work,
     fresh: Freshness,
+    /// While this returns true, the queue starts other work instead.
+    defer: Option<Box<dyn Fn() -> bool + Send>>,
 }
 
 /// The basic unit of work.
@@ -56,6 +58,7 @@ impl Job {
         Job {
             work: Work::noop(),
             fresh: Freshness::Fresh,
+            defer: None,
         }
     }
 
@@ -64,6 +67,7 @@ impl Job {
         Job {
             work,
             fresh: Freshness::Dirty(dirty_reason),
+            defer: None,
         }
     }
 
@@ -90,6 +94,17 @@ impl Job {
     pub fn after(&mut self, next: Work) {
         let prev = mem::replace(&mut self.work, Work::noop());
         self.work = prev.then(next);
+    }
+
+    /// Keep this job from taking a job slot while `defer` returns true. The
+    /// condition must become false without the job queue making progress, and
+    /// whatever clears it must wake the queue.
+    pub fn defer_while(&mut self, defer: impl Fn() -> bool + Send + 'static) {
+        self.defer = Some(Box::new(defer));
+    }
+
+    pub(super) fn deferred(&self) -> bool {
+        self.defer.as_ref().is_some_and(|defer| defer())
     }
 }
 

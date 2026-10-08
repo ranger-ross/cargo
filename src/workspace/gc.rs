@@ -285,8 +285,8 @@ impl<'a, 'gctx> Gc<'a, 'gctx> {
     /// Performs garbage collection based on the given options.
     pub fn gc(&mut self, clean_ctx: &mut CleanContext<'gctx>, gc_opts: &GcOpts) -> CargoResult<()> {
         self.global_cache_tracker.clean(clean_ctx, gc_opts)?;
-        if let Some(blob_dir) = self.gctx.blob_storage_dir() {
-            BlobStorage::clean(&blob_dir, clean_ctx, gc_opts.max_blob_size)?;
+        if let Some(shared_storage) = self.gctx.shared_storage_dir() {
+            BlobStorage::clean(&shared_storage, clean_ctx, gc_opts.max_blob_size)?;
         }
         // In the future, other gc operations go here, such as target cleaning.
         Ok(())

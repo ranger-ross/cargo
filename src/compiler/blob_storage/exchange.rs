@@ -1,46 +1,47 @@
-//! Transfer cache entries and their complete output graph through REAPI.
+//! Transfer cache entries and their blobs through REAPI.
 
 use std::fs;
 use std::path::Path;
 
 use anyhow::{Context, ensure};
-use bazel_remote_apis::build::bazel::remote::execution::v2::{ActionResult, Digest, OutputFile};
+use bazel_remote_apis::build::bazel::remote::execution::v2::{ActionResult, OutputFile};
 
-use super::format::{CacheEntry, Output, UnitOutput, decode_native_unit};
-use super::remote::RemoteCache;
-use super::snapshots::{SnapshotStore, check_directory, hex, regular_size};
+use super::format::{CacheEntry, Digest};
+use super::remote::{RemoteCache, verify_contents};
+use super::snapshots::{
+    SnapshotStore, blob_path, check_directory, hex, publish_blob, regular_size,
+};
 use super::{BlobStorage, restore_path};
 use crate::CargoResult;
 use crate::util::data_structures::{HashMap, HashSet};
 
 const MAX_METADATA_SIZE: i64 = 16 * 1024 * 1024;
+const CACHE_ENTRY: &str = "cache-entry";
+// Bump when the remote ActionResult layout changes.
+const KEY_VERSION: &str = "cargo-remote-cache-v2";
 
 pub(super) fn publish(
     remote: &RemoteCache,
     root: &Path,
     unit_hash: &str,
     entry: &CacheEntry,
-    outputs: &[Output],
 ) -> CargoResult<()> {
     tracing::debug!(unit_hash, "publishing unit to remote cache");
-    let store = SnapshotStore::new(root);
     let staging = tempfile::Builder::new()
         .prefix(".remote-upload")
         .tempdir_in(root)?;
-    let cache_entry = staging.path().join("cache-entry");
+    let cache_entry = staging.path().join(CACHE_ENTRY);
     // The local cache entry can be replaced by another Cargo invocation.
     fs::write(&cache_entry, entry.encode())?;
-    let mut paths = Vec::with_capacity(outputs.len() + 2);
+    let mut paths = Vec::with_capacity(entry.outputs.len() + 1);
     paths.push(cache_entry);
-    paths.push(store.unit_path(&entry.unit_output));
-    let mut names = Vec::with_capacity(outputs.len() + 2);
-    names.push("cache-entry".to_owned());
-    names.push("unit-output".to_owned());
+    let mut names = Vec::with_capacity(entry.outputs.len() + 1);
+    names.push(CACHE_ENTRY.to_owned());
     let mut seen = HashSet::default();
-    for output in outputs {
+    for output in &entry.outputs {
         if seen.insert(output.hash) {
             let hash = hex(&output.hash);
-            let path = root.join(&hash);
+            let path = blob_path(root, &output.hash);
             ensure!(
                 regular_size(&path)? == Some(output.size),
                 "missing or invalid blob during remote publication"
@@ -71,14 +72,15 @@ pub(super) fn publish(
     Ok(())
 }
 
+/// Returns the restored entry and the digest of its local encoding.
 pub(super) fn fetch(
     remote: &RemoteCache,
     root: &Path,
     unit_hash: &str,
     fingerprint: u64,
-) -> CargoResult<Option<CacheEntry>> {
+) -> CargoResult<Option<(Digest, CacheEntry)>> {
     tracing::debug!(unit_hash, "looking up unit in remote cache");
-    let Some(result) = remote.get_action(&key(unit_hash, fingerprint))? else {
+    let Some(result) = remote.get_action(&key(unit_hash, fingerprint), &[CACHE_ENTRY])? else {
         tracing::debug!(unit_hash, "remote cache miss");
         return Ok(None);
     };
@@ -100,29 +102,27 @@ pub(super) fn fetch(
         "unsupported remote cache output type"
     );
     let mut files = HashMap::default();
-    for output in &result.output_files {
+    for output in result.output_files {
         ensure!(!output.is_executable, "executable remote cache container");
-        let digest = output
-            .digest
-            .as_ref()
-            .context("missing remote output digest")?;
+        ensure!(output.digest.is_some(), "missing remote output digest");
         ensure!(
-            files.insert(output.path.as_str(), digest).is_none(),
+            !files.contains_key(&output.path),
             "duplicate remote cache output"
         );
+        files.insert(output.path.clone(), output);
     }
     check_directory(root)?;
     let staging = tempfile::Builder::new()
         .prefix(".remote-download")
         .tempdir_in(root)?;
-    let cache_entry = download_metadata(
+    let cache_entry = read_metadata(
         remote,
         files
-            .remove("cache-entry")
+            .remove(CACHE_ENTRY)
             .context("missing remote cache entry")?,
-        &staging.path().join("cache-entry"),
+        &staging.path().join(CACHE_ENTRY),
     )?;
-    let entry = CacheEntry::decode(&cache_entry)?;
+    let entry = CacheEntry::decode_native(&cache_entry)?;
     if entry.fingerprint != fingerprint {
         tracing::debug!(
             unit_hash,
@@ -130,21 +130,9 @@ pub(super) fn fetch(
         );
         return Ok(None);
     }
-    let bytes = download_metadata(
-        remote,
-        files
-            .remove("unit-output")
-            .context("missing remote unit output")?,
-        &staging.path().join("unit-output"),
-    )?;
-    let outputs = decode_native_unit(&bytes, &entry.unit_output)?;
-    ensure!(
-        outputs.len() == entry.outputs.len(),
-        "remote output metadata count mismatch"
-    );
-    let mut blobs = Vec::with_capacity(outputs.len());
+    let mut blobs = Vec::with_capacity(entry.outputs.len());
     let mut seen = HashMap::default();
-    for output in &outputs {
+    for output in &entry.outputs {
         restore_path(&output.path)?;
         if let Some(size) = seen.insert(output.hash, output.size) {
             ensure!(size == output.size, "inconsistent remote blob size");
@@ -153,17 +141,19 @@ pub(super) fn fetch(
         let name = format!("blobs/{}", hex(&output.hash));
         let digest = files
             .remove(name.as_str())
+            .and_then(|file| file.digest)
             .context("missing remote output blob")?;
         ensure!(
             u64::try_from(digest.size_bytes).ok() == Some(output.size),
-            "remote blob size does not match unit output"
+            "remote blob size does not match cache entry"
         );
         blobs.push((output, digest));
     }
     ensure!(files.is_empty(), "unexpected remote cache output");
+    let mut downloads = Vec::with_capacity(blobs.len());
+    let mut pending = Vec::with_capacity(blobs.len());
     for (output, digest) in blobs {
-        let name = hex(&output.hash);
-        let destination = root.join(&name);
+        let destination = blob_path(root, &output.hash);
         if regular_size(&destination)? == Some(output.size)
             && BlobStorage::hash(&destination)? == output.hash
         {
@@ -175,35 +165,44 @@ pub(super) fn fetch(
             );
             continue;
         }
-        let downloaded = staging.path().join(name);
-        remote.download_file(digest, &downloaded)?;
+        let downloaded = staging.path().join(hex(&output.hash));
+        downloads.push((digest, downloaded.clone()));
+        pending.push((output, downloaded, destination));
+    }
+    remote.download_files(downloads)?;
+    for (output, downloaded, destination) in pending {
         ensure!(
             BlobStorage::hash(&downloaded)? == output.hash,
             "remote blob BLAKE3 digest mismatch"
         );
-        fs::rename(downloaded, destination)?;
+        publish_blob(&downloaded, &destination)?;
     }
-    let store = SnapshotStore::new(root);
-    store.publish_unit(&UnitOutput {
-        id: entry.unit_output,
-        bytes,
-    })?;
-    store.publish_cache_entry(unit_hash, &entry)?;
-    Ok(Some(entry))
+    let digest = SnapshotStore::new(root).publish_cache_entry(unit_hash, &entry)?;
+    Ok(Some((digest, entry)))
 }
 
-fn download_metadata(remote: &RemoteCache, digest: &Digest, path: &Path) -> CargoResult<Vec<u8>> {
+/// Prefer contents inlined by GetActionResult. Servers may omit them.
+fn read_metadata(remote: &RemoteCache, file: OutputFile, path: &Path) -> CargoResult<Vec<u8>> {
+    let digest = file
+        .digest
+        .as_ref()
+        .context("missing remote output digest")?;
     ensure!(
         (0..=MAX_METADATA_SIZE).contains(&digest.size_bytes),
         "remote cache metadata exceeds size limit"
     );
-    remote.download_file(digest, path)?;
+    if !file.contents.is_empty() {
+        verify_contents(digest, &file.contents)?;
+        tracing::debug!(path = %file.path, "using inlined remote cache metadata");
+        return Ok(file.contents);
+    }
+    remote.download_files(vec![(digest.clone(), path.to_path_buf())])?;
     Ok(fs::read(path)?)
 }
 
 fn key(unit_hash: &str, fingerprint: u64) -> Vec<u8> {
     format!(
-        "cargo-remote-cache-v1/{}/{unit_hash}/{fingerprint:016x}",
+        "{KEY_VERSION}/{}/{unit_hash}/{fingerprint:016x}",
         std::env::consts::OS
     )
     .into_bytes()

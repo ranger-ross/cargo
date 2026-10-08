@@ -2097,54 +2097,62 @@ shared-blob-storage = true
 
 ### Blob storage and tracking
 
-The tracking system separates output contents from build and workspace identity:
+The tracking system separates output contents from build identity:
 
 ```text
-$CARGO_HOME/blobs/
-  <blob hash>
 $CARGO_HOME/shared-storage/
+  blobs/<hash[..2]>/<hash[2..]>
   unit-output/<unit-output hash>
   snapshots/<snapshot hash>
-  workspace-history/<workspace-id>/<snapshot hash>
+  snapshots/usage/<snapshot hash>
   cache-entries/<unit-hash>
 ```
 
+Blobs are named by their BLAKE3 hash and sharded by the first two hex digits.
 A **unit output** contains relative output paths, blob hashes, and sizes. It is
 keyed by the BLAKE3 hash of its canonical contents and contains no unit identity.
-A **build snapshot** contains the sorted, unique unit-output hashes used by a
-successful invocation. It covers the non-local outputs participating in blob
-storage, including fresh units and restored cache entries.
+Non-local units that cannot be cached are tracked by unit output.
+A **cache entry** is keyed by Cargo's unit hash and duplicates the same path and
+blob list, so a lookup needs a single read. Cacheable units are tracked only by
+their cache entry.
+A **build snapshot** contains the sorted, unique unit-output hashes and cache
+entry names used by a successful invocation. It covers the non-local outputs
+participating in blob storage, including fresh units and restored cache entries.
 
-**Workspace history** records when a workspace last used each build snapshot.
-Each snapshot has its own file containing a Unix timestamp in seconds. Every
-successful use refreshes that file. The workspace ID hashes the canonical
-workspace root, so changing the build directory does not create another
-workspace history. This identity is local to the machine.
+**Snapshot usage** records when any workspace last used each build snapshot.
+Each snapshot has one usage file containing a Unix timestamp in seconds. Every
+successful use refreshes that file, regardless of the workspace or build
+directory that produced it.
 
-Each eligible unit's short fingerprint can carry an optional unit-output hash:
-`<16-digit fingerprint>\nunit-output-v1 <64-digit unit-output hash>`.
-This field does not participate in fingerprint propagation. Fresh units reuse it
-without rehashing their output files. Cargo validates the unit output and blob
-sizes, recapturing outputs if storage is missing or incomplete. A rebuild clears
-the field before attaching a newly published unit output.
+Each tracked unit's short fingerprint carries an optional pointer:
+`<16-digit fingerprint>\nunit-output-v1 <64-digit unit-output hash>` or
+`<16-digit fingerprint>\ncache-entry-v1`. The pointer does not participate in
+fingerprint propagation. Fresh units reuse it without rehashing their output
+files. Cargo validates the referenced metadata and blob sizes, recapturing
+outputs if storage is missing or incomplete. A rebuild clears the pointer before
+attaching a newly published one.
 
-Unit outputs and build snapshots use versioned binary formats with explicit path
-encodings. Workspace history uses decimal timestamps. These unstable formats
-are not a public compatibility contract. There are no per-blob usage timestamps,
-workspace receipts, cache revision tokens, or import grace periods.
+Unit outputs, cache entries, and build snapshots use versioned binary formats
+with explicit path encodings. Snapshot usage files use decimal timestamps. These
+unstable formats are not a public compatibility contract. There are no per-blob
+usage timestamps, workspace receipts, cache revision tokens, or import grace
+periods.
 
 ### Local build cache
 
-A **cache entry** is keyed by Cargo's unit hash and references a unit output.
-Cargo also checks a fingerprint and dependency-artifact guard before accepting
-an entry. Entries carry output permissions and modification times separately
-from the content-addressed unit output.
+A cache entry also stores an input guard derived from Cargo's fingerprint and
+the dependency artifacts, plus each output's permissions and modification time.
+Cargo checks the guard before accepting an entry. Workspaces that share a unit
+hash share its entry. A fresh unit keeps using whichever version is present.
 
-The initial build cache restores immutable registry and Git library units for
-`cargo build` and `cargo check`. Local units, build scripts, proc-macros, and
-units depending on them are excluded. Forced builds, custom compiler commands,
-compiler wrappers, extra per-unit arguments, and artifact dependencies are also
-excluded.
+The build cache restores immutable registry and Git library units for
+`cargo build` and `cargo check`, including consumers of build scripts and
+proc-macros. Build scripts and proc-macros themselves still compile. For a
+package with a build script, the input guard covers the script output passed
+to rustc and the contents of its `OUT_DIR`. Proc-macros that read undeclared
+files or environment variables can produce stale hits, as with Cargo's own
+freshness checks. Local units, forced builds, custom compiler commands, compiler
+wrappers, extra per-unit arguments, and artifact dependencies are excluded.
 
 On a cache hit, Cargo verifies each blob's contents, restores the output tree,
 checks the environment dependencies recorded by rustc, regenerates Cargo's
@@ -2203,15 +2211,32 @@ The remote configuration fields are:
   final upload acknowledgment. A progressing transfer or a unit's combined uploads
   can take longer than this limit. Local file hashing does not count toward it.
 
-Local cache entries are tried first. A remote hit downloads and verifies the
-complete unit output before applying the existing fingerprint, source, and
-environment checks. SHA256 protects transfers through REAPI. Cargo also verifies
-the local BLAKE3 identities and rejects unexpected paths or metadata.
+Local cache entries are tried first. A remote hit downloads the cache entry,
+inlined in the lookup when the server supports it, and verifies every blob
+before applying the existing fingerprint, source, and environment checks.
+SHA256 protects transfers through REAPI. Cargo also verifies the local BLAKE3
+identities and rejects unexpected paths or metadata.
 
-Newly compiled eligible units can populate the remote cache. Local and remote
-cache hits are not republished. If a restored entry is rejected by the input
-checks and recompilation changes its inputs or outputs, the rebuilt entry can
-be published.
+Remote lookups start before the job queue reaches a unit. A unit's input guard
+depends on its dependencies' artifacts, which Cargo identifies by the blob
+hashes recorded when each dependency is fetched, restored, compiled, or found
+fresh. Once those hashes and any build-script output are known, background
+threads fetch the entry into local storage. They do not use jobserver tokens.
+A unit whose fetch is in flight does not take a job slot, so other work can run
+meanwhile. Its job then restores from local storage. A unit that prefetching has
+not started is fetched by its own job. A remote miss seen during prefetching is
+not looked up again.
+
+Newly compiled eligible units can populate the remote cache. Uploads run on
+background threads so compilation does not wait on the network, and the build
+waits for them before it finishes. Local and remote cache hits are not
+republished. If a restored entry is rejected by the input checks and
+recompilation changes its inputs or outputs, the rebuilt entry can be published.
+
+Transfers use zstd when the server advertises it through `GetCapabilities`.
+Lookups use a separate connection from blob transfers. Transient failures, such
+as an unavailable server or a timeout, are retried up to three times before the
+remote cache is disabled for the rest of the invocation.
 
 Fresh builds do not contact the remote cache. Ordinary `cargo clean` retains the
 local shared cache, so rebuilding afterward can restore locally without any
@@ -2238,6 +2263,8 @@ the remote cache is enabled and read-only. Cache events distinguish:
   blob transfers, including their SHA256 digest and byte count.
 * `restored unit from remote cache`: the remote entry and its outputs were
   downloaded or reused locally, verified, and restored.
+* `prefetched unit from remote cache`: the entry and its blobs were fetched
+  ahead of the unit's job. The job then reports a local restore.
 * `skipping remote publication of unchanged cache hit`: the restored unit is
   still valid, so Cargo does not upload blobs or update its remote action result.
 
@@ -2257,26 +2284,26 @@ also disables only the remote cache.
 
 Remote cache writers must be trusted. Outputs can contain source paths, recorded
 environment values, and diagnostics. Content hashes detect corruption but do not
-authenticate the producer. Workspace history and build snapshots remain local.
+authenticate the producer. Snapshot usage and build snapshots remain local.
 The server controls remote retention, and `cargo clean gc` only collects local
 storage.
 
 ### Garbage collection
 
-Workspace history is the retention root. Automatic collection expires history
-after 30 days, walks retained build snapshots and unit outputs, and removes
-unreferenced blobs. A cache entry survives only while its unit output is retained
-by a build snapshot. A successful cache hit refreshes workspace history in the
-same way as a successful compilation. Failed builds do not refresh history.
+Snapshot usage is the retention root. Automatic collection expires usage
+after 30 days, walks retained build snapshots, unit outputs, and cache entries,
+and removes unreferenced blobs. A cache entry survives only while a retained
+build snapshot names it. A successful cache hit refreshes snapshot usage in the
+same way as a successful compilation. Failed builds do not refresh usage.
 
-Snapshots without recent workspace history do not retain blobs. Unreadable or
-malformed history stops collection before deletion. Collection validates the
+Snapshots without recent usage do not retain blobs. Unreadable or malformed
+usage files stop collection before deletion. Collection validates the
 metadata graph and blob sizes without rehashing every blob.
 
 Builds hold Cargo's shared package-cache lock to exclude garbage collection.
-Immutable objects are published atomically. Snapshot and workspace-history
-commits also take the package-cache download/append lock. Collection takes its
-exclusive mutation lock before traversing or deleting shared storage.
+Immutable objects are published atomically. Snapshot and usage commits also
+take the package-cache download/append lock. Collection takes its exclusive
+mutation lock before traversing or deleting shared storage.
 
 To additionally enforce a logical blob-size limit, evicting the oldest build
 snapshots first, run:

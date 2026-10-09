@@ -14,7 +14,8 @@ use anyhow::{Context, ensure};
 use cargo_util::paths::create_dir_all;
 use filetime::FileTime;
 use format::{
-    CacheEntry, CachedOutput, Digest, UnitOutput, decode_output_path, encode_output_path,
+    CacheEntry, CachedOutput, Digest, SYMLINK_MODE, UnitOutput, decode_output_path,
+    encode_output_path,
 };
 use parking_lot::Mutex;
 use remote::RemoteCache;
@@ -34,6 +35,37 @@ pub(super) use prefetch::{DependencyArtifact, PrefetchSource};
 /// Encode a path relative to a unit directory as stored in cache metadata.
 pub(super) fn output_path_key(relative: &Path) -> CargoResult<Vec<u8>> {
     encode_output_path(relative)
+}
+
+/// The prefetch key recording that a build-script run's job has finished.
+/// Its outputs are recorded under the unit directory as soon as a prefetch
+/// finds them, but consumers also need the parsed output and a final `OUT_DIR`.
+pub(super) fn build_script_marker(run_unit_dir: &Path) -> PathBuf {
+    run_unit_dir.join("run")
+}
+
+/// Outputs that dependents need only for linking or debugging. A prefetch
+/// downloads them last so dependents can compile against the rmeta sooner.
+fn deferred_output(path: &[u8]) -> bool {
+    decode_output_path(path).is_ok_and(|path| {
+        path.extension()
+            .is_some_and(|extension| extension == "rlib" || extension == "o")
+    })
+}
+
+/// The result of restoring a cacheable unit.
+pub(super) enum Restored {
+    Miss,
+    Complete,
+    /// Outputs other than deferred ones are restored. Pass this to
+    /// [`BlobStorage::finish_restore`] for the rest.
+    Metadata(PendingOutputs),
+}
+
+pub(super) struct PendingOutputs {
+    unit_hash: String,
+    fingerprint: u64,
+    entry: Arc<CacheEntry>,
 }
 
 /// The tracking object recorded in a unit's fingerprint. Cacheable units are
@@ -62,6 +94,8 @@ pub struct BlobStorage {
     prefetcher: Option<Prefetcher>,
     // Rejected hits can still publish if recompilation changes either identity.
     restored_units: Mutex<HashMap<String, (u64, Digest)>>,
+    /// Hashes of finished build scripts' `OUT_DIR`s, shared by their consumers.
+    tree_hashes: Mutex<HashMap<PathBuf, Digest>>,
 }
 
 impl BlobStorage {
@@ -94,6 +128,7 @@ impl BlobStorage {
             uploader: Mutex::default(),
             prefetcher,
             restored_units: Mutex::default(),
+            tree_hashes: Mutex::default(),
         })
     }
 
@@ -155,11 +190,33 @@ impl BlobStorage {
         }
     }
 
-    /// Whether a remote prefetch for this unit is running.
-    pub(super) fn prefetching(&self, unit_hash: &str) -> bool {
+    /// Whether a remote prefetch should keep this unit's job from starting.
+    /// With `metadata_first`, the job may start once metadata is available.
+    pub(super) fn prefetching(&self, unit_hash: &str, metadata_first: bool) -> bool {
         self.prefetcher
             .as_ref()
-            .is_some_and(|prefetcher| prefetcher.in_flight(unit_hash))
+            .is_some_and(|prefetcher| prefetcher.blocks(unit_hash, metadata_first))
+    }
+
+    /// Make a finished build-script run available to prefetching dependents.
+    pub(super) fn build_script_finished(&self, unit_dir: &Path) {
+        self.record_outputs(&build_script_marker(unit_dir), []);
+    }
+
+    /// A directory hash computed at most once per build in the common case.
+    /// The directory must not change for the rest of the build.
+    pub(super) fn tree_hash(
+        &self,
+        dir: &Path,
+        compute: impl FnOnce() -> CargoResult<Digest>,
+    ) -> CargoResult<Digest> {
+        if let Some(hash) = self.tree_hashes.lock().get(dir) {
+            return Ok(*hash);
+        }
+        // Hashing outside the lock lets unrelated directories proceed.
+        let hash = compute()?;
+        self.tree_hashes.lock().insert(dir.to_path_buf(), hash);
+        Ok(hash)
     }
 
     /// Make a finished unit's blob hashes available to prefetching dependents.
@@ -176,7 +233,6 @@ impl BlobStorage {
     /// Capture all regular compiler outputs, including raw rustc dep-info.
     /// Hardlinks are allowed only when the compiler detaches the output tree
     /// before every dirty run, including builds with tracking disabled.
-    #[instrument(skip_all)]
     pub(super) fn capture_outputs(
         &self,
         unit_dir: &Path,
@@ -187,30 +243,51 @@ impl BlobStorage {
             out_dir == unit_dir.join("out"),
             "unexpected unit output directory"
         );
-        check_directory(out_dir)?;
+        self.capture_files(unit_dir, &[out_dir.to_path_buf()], hardlink_allowed)
+    }
+
+    /// Capture the regular files under each root, which must lie in one of the
+    /// unit's output trees.
+    #[instrument(skip_all)]
+    pub(super) fn capture_files(
+        &self,
+        unit_dir: &Path,
+        roots: &[PathBuf],
+        hardlink_allowed: bool,
+    ) -> CargoResult<Vec<Output>> {
         let mut outputs = Vec::new();
-        for entry in walkdir::WalkDir::new(out_dir) {
-            let entry = entry?;
+        for root in roots {
+            let relative = root.strip_prefix(unit_dir)?;
             ensure!(
-                !entry.file_type().is_symlink(),
-                "symlink in unit output: {}",
-                entry.path().display()
+                OUTPUT_TREES.iter().any(|tree| relative.starts_with(tree)),
+                "unexpected unit output path {}",
+                root.display()
             );
-            if !entry.file_type().is_file() {
-                continue;
+            if root.is_dir() {
+                check_directory(root)?;
             }
-            let path = entry.path();
-            let size = entry.metadata()?.len();
-            let hash = Self::hash(path)?;
-            let storage_path = blob_path(&self.root, &hash);
-            if !self.insert(path, &storage_path, &hash, false, hardlink_allowed)? {
-                self.dedup(path, &storage_path, &hash, hardlink_allowed)?;
+            for entry in walkdir::WalkDir::new(root) {
+                let entry = entry?;
+                let path = entry.path();
+                let (hash, size) = if entry.file_type().is_symlink() {
+                    self.capture_symlink(path)?
+                } else if entry.file_type().is_file() {
+                    let size = entry.metadata()?.len();
+                    let hash = Self::hash(path)?;
+                    let storage_path = blob_path(&self.root, &hash);
+                    if !self.insert(path, &storage_path, &hash, false, hardlink_allowed)? {
+                        self.dedup(path, &storage_path, &hash, hardlink_allowed)?;
+                    }
+                    (hash, size)
+                } else {
+                    continue;
+                };
+                outputs.push(Output {
+                    path: encode_output_path(path.strip_prefix(unit_dir)?)?,
+                    hash,
+                    size,
+                });
             }
-            outputs.push(Output {
-                path: encode_output_path(path.strip_prefix(unit_dir)?)?,
-                hash,
-                size,
-            });
         }
         self.record_outputs(
             unit_dir,
@@ -219,6 +296,23 @@ impl BlobStorage {
                 .map(|output| (output.path.as_slice(), output.hash)),
         );
         Ok(outputs)
+    }
+
+    /// Store a symlink's target as a blob. Build scripts may link generated
+    /// trees to sources.
+    fn capture_symlink(&self, path: &Path) -> CargoResult<(Digest, u64)> {
+        let target = symlink_target(path)?;
+        let hash = *blake3::hash(&target).as_bytes();
+        let blob = blob_path(&self.root, &hash);
+        if fs::symlink_metadata(&blob).is_err() {
+            let staging = tempfile::Builder::new()
+                .prefix(".blob")
+                .tempdir_in(&self.root)?;
+            let staged = staging.path().join("artifact");
+            fs::write(&staged, &target)?;
+            publish_blob(&staged, &blob)?;
+        }
+        Ok((hash, target.len() as u64))
     }
 
     /// Track a non-cacheable unit by its content-addressed unit output.
@@ -241,17 +335,22 @@ impl BlobStorage {
         for output in outputs {
             let path = unit_dir.join(restore_path(&output.path)?);
             let file = fs::symlink_metadata(&path)?;
-            ensure!(
-                file.is_file() && file.len() == output.size,
-                "captured output changed: {}",
-                path.display()
-            );
+            let (unchanged, mode) = if file.file_type().is_symlink() {
+                let target = symlink_target(&path)?;
+                (target.len() as u64 == output.size, SYMLINK_MODE)
+            } else {
+                (
+                    file.is_file() && file.len() == output.size,
+                    permission_mode(&file),
+                )
+            };
+            ensure!(unchanged, "captured output changed: {}", path.display());
             let mtime = FileTime::from_last_modification_time(&file);
             cached.push(CachedOutput {
                 path: output.path,
                 hash: output.hash,
                 size: output.size,
-                mode: permission_mode(&file),
+                mode,
                 mtime_seconds: mtime.unix_seconds(),
                 mtime_nanos: mtime.nanoseconds(),
             });
@@ -277,25 +376,39 @@ impl BlobStorage {
         Ok(TrackedOutput::CacheEntry)
     }
 
-    /// Stage and verify all restored bytes before replacing the output tree.
+    /// Stage and verify restored bytes before replacing the output tree.
     /// The compiler calls `accept_cache_entry` after dep-info and environment
     /// validation, so a rejected hit cannot become a successful snapshot member.
+    /// With `metadata_first`, a prefetch that has only downloaded metadata
+    /// restores that part and returns [`Restored::Metadata`].
     pub(super) fn restore_cache_entry(
         &self,
         unit_hash: &str,
         fingerprint: u64,
         unit_dir: &Path,
-    ) -> CargoResult<bool> {
-        // Waits for an in-flight prefetch. A prefetched hit is a local entry.
+        metadata_first: bool,
+    ) -> CargoResult<Restored> {
+        // Waits for a running lookup. A prefetched hit is a local entry.
         let prefetched = self
             .prefetcher
             .as_ref()
-            .and_then(|prefetcher| prefetcher.claim(unit_hash));
+            .and_then(|prefetcher| prefetcher.claim(unit_hash, metadata_first));
+        if let Some(Prefetched::Metadata(key, entry)) = &prefetched
+            && *key == fingerprint
+        {
+            self.restore_outputs(entry, unit_dir, |output| !deferred_output(&output.path))?;
+            tracing::debug!(unit_hash, "restored unit metadata from remote cache");
+            return Ok(Restored::Metadata(PendingOutputs {
+                unit_hash: unit_hash.to_owned(),
+                fingerprint,
+                entry: Arc::clone(entry),
+            }));
+        }
         let store = SnapshotStore::new(&self.root);
         if let Some((digest, entry)) = store.read_cache_entry(unit_hash)?
             && entry.fingerprint == fingerprint
         {
-            match self.restore_outputs(&entry, unit_dir) {
+            match self.restore_outputs(&entry, unit_dir, |_| true) {
                 Ok(()) => {
                     if self.remote().is_some_and(|remote| !remote.is_read_only()) {
                         self.restored_units
@@ -303,7 +416,7 @@ impl BlobStorage {
                             .insert(unit_hash.to_owned(), (fingerprint, digest));
                     }
                     tracing::debug!(unit_hash, "restored unit from local cache");
-                    return Ok(true);
+                    return Ok(Restored::Complete);
                 }
                 Err(error) => {
                     tracing::debug!(?error, unit_hash, "discarding invalid local cache entry");
@@ -315,24 +428,26 @@ impl BlobStorage {
         match prefetched {
             Some(Prefetched::Miss(key)) if key == fingerprint => {
                 tracing::debug!(unit_hash, "remote cache miss already seen by prefetch");
-                return Ok(false);
+                return Ok(Restored::Miss);
             }
-            Some(Prefetched::Hit(key) | Prefetched::Miss(key)) if key != fingerprint => {
+            Some(Prefetched::Hit(key) | Prefetched::Miss(key) | Prefetched::Metadata(key, _))
+                if key != fingerprint =>
+            {
                 tracing::debug!(unit_hash, "prefetch used a different input guard");
             }
             _ => {}
         }
         let Some(remote) = self.remote() else {
             tracing::debug!(unit_hash, "remote cache unavailable");
-            return Ok(false);
+            return Ok(Restored::Miss);
         };
         let result = (|| {
             let Some((digest, entry)) =
                 exchange::fetch(remote, &self.root, unit_hash, fingerprint)?
             else {
-                return Ok(false);
+                return Ok(Restored::Miss);
             };
-            if let Err(error) = self.restore_outputs(&entry, unit_dir) {
+            if let Err(error) = self.restore_outputs(&entry, unit_dir, |_| true) {
                 store.evict_cache_entry(unit_hash)?;
                 return Err(error);
             }
@@ -340,15 +455,50 @@ impl BlobStorage {
                 .lock()
                 .insert(unit_hash.to_owned(), (fingerprint, digest));
             tracing::debug!(unit_hash, "restored unit from remote cache");
-            CargoResult::Ok(true)
+            CargoResult::Ok(Restored::Complete)
         })();
         match result {
             Ok(restored) => Ok(restored),
             Err(error) => {
                 self.remote_failed(error);
-                Ok(false)
+                Ok(Restored::Miss)
             }
         }
+    }
+
+    /// Wait for the downloads after [`Restored::Metadata`] and restore the
+    /// remaining outputs next to the restored metadata.
+    pub(super) fn finish_restore(
+        &self,
+        pending: PendingOutputs,
+        unit_dir: &Path,
+    ) -> CargoResult<()> {
+        let PendingOutputs {
+            unit_hash,
+            fingerprint,
+            entry,
+        } = pending;
+        let downloaded = self
+            .prefetcher
+            .as_ref()
+            .is_some_and(|prefetcher| prefetcher.wait_for_outputs(&unit_hash));
+        if !downloaded {
+            let reason = self
+                .remote
+                .as_ref()
+                .and_then(|remote| remote.error())
+                .unwrap_or_else(|| "the download did not finish".to_owned());
+            anyhow::bail!("failed to download cached outputs: {reason}");
+        }
+        self.restore_more_outputs(&entry, unit_dir, |output| deferred_output(&output.path))?;
+        if self.remote().is_some_and(|remote| !remote.is_read_only()) {
+            let digest = *blake3::hash(&entry.encode()).as_bytes();
+            self.restored_units
+                .lock()
+                .insert(unit_hash.clone(), (fingerprint, digest));
+        }
+        tracing::debug!(unit_hash, "restored unit from remote cache");
+        Ok(())
     }
 
     /// Record an accepted cache hit as a snapshot member.
@@ -394,15 +544,63 @@ impl BlobStorage {
         }
     }
 
-    fn restore_outputs(&self, entry: &CacheEntry, unit_dir: &Path) -> CargoResult<()> {
+    /// Restore the outputs matching `select`, replacing the output tree.
+    fn restore_outputs(
+        &self,
+        entry: &CacheEntry,
+        unit_dir: &Path,
+        select: impl Fn(&CachedOutput) -> bool,
+    ) -> CargoResult<()> {
+        let staging = self.stage_outputs(entry, unit_dir, select)?;
+        for tree in OUTPUT_TREES {
+            let staged = staging.path().join(tree);
+            // The output tree always exists. Build-script runs also have `run`.
+            if *tree != "out" && !staged.exists() {
+                continue;
+            }
+            if let Err(error) = replace_tree(staging.path(), &staged, &unit_dir.join(tree)) {
+                if error.downcast_ref::<OriginalPreserved>().is_some() {
+                    let _ = staging.keep();
+                }
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+
+    /// Restore the outputs matching `select` into an existing output tree.
+    fn restore_more_outputs(
+        &self,
+        entry: &CacheEntry,
+        unit_dir: &Path,
+        select: impl Fn(&CachedOutput) -> bool,
+    ) -> CargoResult<()> {
+        let staging = self.stage_outputs(entry, unit_dir, &select)?;
+        check_directory(&unit_dir.join("out"))?;
+        for output in entry.outputs.iter().filter(|output| select(output)) {
+            let relative = restore_path(&output.path)?;
+            let dest = unit_dir.join(&relative);
+            fs::create_dir_all(dest.parent().unwrap())?;
+            fs::rename(staging.path().join(&relative), &dest)?;
+        }
+        Ok(())
+    }
+
+    /// Copy and verify the outputs matching `select` into a staging directory
+    /// within `unit_dir`, laid out like the unit directory.
+    fn stage_outputs(
+        &self,
+        entry: &CacheEntry,
+        unit_dir: &Path,
+        select: impl Fn(&CachedOutput) -> bool,
+    ) -> CargoResult<tempfile::TempDir> {
         check_directory(unit_dir)?;
         fs::create_dir_all(unit_dir)?;
         let staging = tempfile::Builder::new()
             .prefix(".cache-restore")
             .tempdir_in(unit_dir)?;
-        let staged_out = staging.path().join("out");
-        fs::create_dir(&staged_out)?;
-        for output in &entry.outputs {
+        fs::create_dir(staging.path().join("out"))?;
+        for output in entry.outputs.iter().filter(|output| select(output)) {
             let relative = restore_path(&output.path)?;
             let source = blob_path(&self.root, &output.hash);
             ensure!(
@@ -411,6 +609,15 @@ impl BlobStorage {
             );
             let dest = staging.path().join(relative);
             fs::create_dir_all(dest.parent().unwrap())?;
+            if output.mode == SYMLINK_MODE {
+                let target = fs::read(&source)?;
+                ensure!(
+                    blake3::hash(&target).as_bytes() == &output.hash,
+                    "cached blob digest mismatch"
+                );
+                create_symlink(&cargo_util::paths::bytes2path(&target)?, &dest)?;
+                continue;
+            }
             private_copy(&source, &dest)?;
             ensure!(
                 Self::hash(&dest)? == output.hash,
@@ -422,29 +629,7 @@ impl BlobStorage {
             #[cfg(target_os = "linux")]
             ensure_no_writers(&dest)?;
         }
-        let out = unit_dir.join("out");
-        check_directory(&out)?;
-        let backup = staging.path().join("previous-out");
-        let had_out = out.try_exists()?;
-        if had_out {
-            fs::rename(&out, &backup)?;
-        }
-        if let Err(error) = fs::rename(&staged_out, &out) {
-            if had_out {
-                if let Err(rollback) = fs::rename(&backup, &out) {
-                    // Preserve the original output if rollback itself fails.
-                    let preserved = staging.keep();
-                    return Err(rollback).with_context(|| {
-                        format!(
-                            "restoring output after {error}; original output preserved at {}",
-                            preserved.join("previous-out").display()
-                        )
-                    });
-                }
-            }
-            return Err(error.into());
-        }
-        Ok(())
+        Ok(staging)
     }
 
     /// Waits for background uploads. Only successful builds publish a snapshot
@@ -574,22 +759,70 @@ impl BlobStorage {
     }
 }
 
+/// Top-level directories of a unit that cache entries may contain. `run` holds
+/// a build script's captured stdout, stderr, and `OUT_DIR` record.
+const OUTPUT_TREES: &[&str] = &["out", "run"];
+
 fn restore_path(bytes: &[u8]) -> CargoResult<PathBuf> {
     let path = decode_output_path(bytes)?;
-    let suffix = path
-        .strip_prefix("out")
+    let tree = OUTPUT_TREES
+        .iter()
+        .find(|tree| path.starts_with(tree))
         .context("cached output is outside the output tree")?;
     ensure!(
-        !suffix.as_os_str().is_empty(),
+        !path.strip_prefix(tree)?.as_os_str().is_empty(),
         "cached output has no filename"
     );
     Ok(path)
+}
+
+/// Marks a failed restore whose rollback also failed. The staging directory
+/// holds the original output and must be kept.
+#[derive(Debug)]
+struct OriginalPreserved(PathBuf);
+
+impl std::fmt::Display for OriginalPreserved {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "original output preserved at {}", self.0.display())
+    }
+}
+
+/// Replace `dest` with `staged`, restoring the original if the swap fails.
+fn replace_tree(staging: &Path, staged: &Path, dest: &Path) -> CargoResult<()> {
+    check_directory(dest)?;
+    let backup = staging.join(format!("previous-{}", dest.file_name().unwrap().display()));
+    let had_dest = dest.try_exists()?;
+    if had_dest {
+        fs::rename(dest, &backup)?;
+    }
+    if let Err(error) = fs::rename(staged, dest) {
+        if had_dest && let Err(rollback) = fs::rename(&backup, dest) {
+            return Err(anyhow::Error::new(rollback)
+                .context(format!("restoring output after {error}"))
+                .context(OriginalPreserved(backup)));
+        }
+        return Err(error.into());
+    }
+    Ok(())
 }
 
 fn private_copy(source: &Path, dest: &Path) -> CargoResult<()> {
     if reflink_copy::reflink(source, dest).is_err() {
         fs::copy(source, dest)?;
     }
+    Ok(())
+}
+
+fn symlink_target(path: &Path) -> CargoResult<Vec<u8>> {
+    Ok(cargo_util::paths::path2bytes(&fs::read_link(path)?)?.to_vec())
+}
+
+fn create_symlink(target: &Path, link: &Path) -> CargoResult<()> {
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(target, link)?;
+    #[cfg(not(unix))]
+    anyhow::bail!("cannot restore symlink {} on this platform", link.display());
+    #[cfg(unix)]
     Ok(())
 }
 
@@ -666,6 +899,7 @@ mod tests {
             uploader: Mutex::default(),
             prefetcher: None,
             restored_units: Mutex::default(),
+            tree_hashes: Mutex::default(),
         }
     }
 
@@ -692,9 +926,19 @@ mod tests {
         capture(&storage, &unit, true);
         storage.used.lock().cache_entries.clear();
         fs::remove_dir_all(unit.join("out")).unwrap();
-        assert!(!storage.restore_cache_entry("1234", 41, &unit).unwrap());
+        assert!(matches!(
+            storage
+                .restore_cache_entry("1234", 41, &unit, true)
+                .unwrap(),
+            Restored::Miss
+        ));
         assert!(!unit.join("out").exists());
-        assert!(storage.restore_cache_entry("1234", 42, &unit).unwrap());
+        assert!(matches!(
+            storage
+                .restore_cache_entry("1234", 42, &unit, true)
+                .unwrap(),
+            Restored::Complete
+        ));
         assert_eq!(
             fs::read(unit.join("out/artifact")).unwrap(),
             b"compiled bytes"
@@ -725,7 +969,12 @@ mod tests {
         fs::write(blob, b"corrupted data").unwrap();
         fs::write(unit.join("out/artifact"), b"keep original").unwrap();
         fs::write(unit.join("out/artifact.d"), b"keep dep-info").unwrap();
-        assert!(!storage.restore_cache_entry("1234", 42, &unit).unwrap());
+        assert!(matches!(
+            storage
+                .restore_cache_entry("1234", 42, &unit, true)
+                .unwrap(),
+            Restored::Miss
+        ));
         assert_eq!(
             fs::read(unit.join("out/artifact")).unwrap(),
             b"keep original"
@@ -805,7 +1054,12 @@ mod tests {
         let downloaded = FileTime::from_unix_time(1_600_000_000, 0);
         filetime::set_file_mtime(&blob, downloaded).unwrap();
         fs::remove_dir_all(unit.join("out")).unwrap();
-        assert!(storage.restore_cache_entry("1234", 42, &unit).unwrap());
+        assert!(matches!(
+            storage
+                .restore_cache_entry("1234", 42, &unit, true)
+                .unwrap(),
+            Restored::Complete
+        ));
         let metadata = artifact.metadata().unwrap();
         assert_eq!(FileTime::from_last_modification_time(&metadata), compiled);
         assert_eq!(metadata.permissions().mode() & 0o777, 0o755);

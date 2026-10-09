@@ -2,11 +2,14 @@
 
 use std::fs;
 use std::path::Path;
+use std::sync::Arc;
 
 use anyhow::{Context, ensure};
-use bazel_remote_apis::build::bazel::remote::execution::v2::{ActionResult, OutputFile};
+use bazel_remote_apis::build::bazel::remote::execution::v2::{
+    ActionResult, Digest as RemoteDigest, OutputFile,
+};
 
-use super::format::{CacheEntry, Digest};
+use super::format::{CacheEntry, CachedOutput, Digest};
 use super::remote::{RemoteCache, verify_contents};
 use super::snapshots::{
     SnapshotStore, blob_path, check_directory, hex, publish_blob, regular_size,
@@ -18,7 +21,7 @@ use crate::util::data_structures::{HashMap, HashSet};
 const MAX_METADATA_SIZE: i64 = 16 * 1024 * 1024;
 const CACHE_ENTRY: &str = "cache-entry";
 // Bump when the remote ActionResult layout changes.
-const KEY_VERSION: &str = "cargo-remote-cache-v2";
+const KEY_VERSION: &str = "cargo-remote-cache-v3";
 
 pub(super) fn publish(
     remote: &RemoteCache,
@@ -78,7 +81,77 @@ pub(super) fn fetch(
     root: &Path,
     unit_hash: &str,
     fingerprint: u64,
-) -> CargoResult<Option<(Digest, CacheEntry)>> {
+) -> CargoResult<Option<(Digest, Arc<CacheEntry>)>> {
+    let Some(found) = lookup(remote, root, unit_hash, fingerprint)? else {
+        return Ok(None);
+    };
+    found.finish(remote, root, unit_hash).map(Some)
+}
+
+/// A remote cache entry whose blobs have not all been downloaded.
+pub(super) struct Found {
+    pub entry: Arc<CacheEntry>,
+    /// Blobs missing locally, by index into `entry.outputs`.
+    missing: Vec<(usize, RemoteDigest)>,
+    staging: tempfile::TempDir,
+}
+
+impl Found {
+    pub fn is_complete(&self) -> bool {
+        self.missing.is_empty()
+    }
+
+    /// Download and publish the missing blobs of outputs matching `select`.
+    pub fn download(
+        &mut self,
+        remote: &RemoteCache,
+        root: &Path,
+        select: impl Fn(&CachedOutput) -> bool,
+    ) -> CargoResult<()> {
+        let (selected, rest) = std::mem::take(&mut self.missing)
+            .into_iter()
+            .partition::<Vec<_>, _>(|(index, _)| select(&self.entry.outputs[*index]));
+        self.missing = rest;
+        let downloads = selected
+            .iter()
+            .map(|(index, digest)| {
+                let hash = &self.entry.outputs[*index].hash;
+                (digest.clone(), self.staging.path().join(hex(hash)))
+            })
+            .collect();
+        remote.download_files(downloads)?;
+        for (index, _) in selected {
+            let output = &self.entry.outputs[index];
+            let downloaded = self.staging.path().join(hex(&output.hash));
+            ensure!(
+                BlobStorage::hash(&downloaded)? == output.hash,
+                "remote blob BLAKE3 digest mismatch"
+            );
+            publish_blob(&downloaded, &blob_path(root, &output.hash))?;
+        }
+        Ok(())
+    }
+
+    /// Download the remaining blobs and publish the local cache entry.
+    pub fn finish(
+        mut self,
+        remote: &RemoteCache,
+        root: &Path,
+        unit_hash: &str,
+    ) -> CargoResult<(Digest, Arc<CacheEntry>)> {
+        self.download(remote, root, |_| true)?;
+        let digest = SnapshotStore::new(root).publish_cache_entry(unit_hash, &self.entry)?;
+        Ok((digest, self.entry))
+    }
+}
+
+/// Look up an entry and validate its layout without downloading output blobs.
+pub(super) fn lookup(
+    remote: &RemoteCache,
+    root: &Path,
+    unit_hash: &str,
+    fingerprint: u64,
+) -> CargoResult<Option<Found>> {
     tracing::debug!(unit_hash, "looking up unit in remote cache");
     let Some(result) = remote.get_action(&key(unit_hash, fingerprint), &[CACHE_ENTRY])? else {
         tracing::debug!(unit_hash, "remote cache miss");
@@ -130,9 +203,9 @@ pub(super) fn fetch(
         );
         return Ok(None);
     }
-    let mut blobs = Vec::with_capacity(entry.outputs.len());
+    let mut missing = Vec::with_capacity(entry.outputs.len());
     let mut seen = HashMap::default();
-    for output in &entry.outputs {
+    for (index, output) in entry.outputs.iter().enumerate() {
         restore_path(&output.path)?;
         if let Some(size) = seen.insert(output.hash, output.size) {
             ensure!(size == output.size, "inconsistent remote blob size");
@@ -147,12 +220,6 @@ pub(super) fn fetch(
             u64::try_from(digest.size_bytes).ok() == Some(output.size),
             "remote blob size does not match cache entry"
         );
-        blobs.push((output, digest));
-    }
-    ensure!(files.is_empty(), "unexpected remote cache output");
-    let mut downloads = Vec::with_capacity(blobs.len());
-    let mut pending = Vec::with_capacity(blobs.len());
-    for (output, digest) in blobs {
         let destination = blob_path(root, &output.hash);
         if regular_size(&destination)? == Some(output.size)
             && BlobStorage::hash(&destination)? == output.hash
@@ -165,20 +232,14 @@ pub(super) fn fetch(
             );
             continue;
         }
-        let downloaded = staging.path().join(hex(&output.hash));
-        downloads.push((digest, downloaded.clone()));
-        pending.push((output, downloaded, destination));
+        missing.push((index, digest));
     }
-    remote.download_files(downloads)?;
-    for (output, downloaded, destination) in pending {
-        ensure!(
-            BlobStorage::hash(&downloaded)? == output.hash,
-            "remote blob BLAKE3 digest mismatch"
-        );
-        publish_blob(&downloaded, &destination)?;
-    }
-    let digest = SnapshotStore::new(root).publish_cache_entry(unit_hash, &entry)?;
-    Ok(Some((digest, entry)))
+    ensure!(files.is_empty(), "unexpected remote cache output");
+    Ok(Some(Found {
+        entry: Arc::new(entry),
+        missing,
+        staging,
+    }))
 }
 
 /// Prefer contents inlined by GetActionResult. Servers may omit them.

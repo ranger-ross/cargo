@@ -2145,14 +2145,25 @@ the dependency artifacts, plus each output's permissions and modification time.
 Cargo checks the guard before accepting an entry. Workspaces that share a unit
 hash share its entry. A fresh unit keeps using whichever version is present.
 
-The build cache restores immutable registry and Git library units for
-`cargo build` and `cargo check`, including consumers of build scripts and
-proc-macros. Build scripts and proc-macros themselves still compile. For a
-package with a build script, the input guard covers the script output passed
-to rustc and the contents of its `OUT_DIR`. Proc-macros that read undeclared
-files or environment variables can produce stale hits, as with Cargo's own
-freshness checks. Local units, forced builds, custom compiler commands, compiler
-wrappers, extra per-unit arguments, and artifact dependencies are excluded.
+The build cache restores immutable registry and Git units for `cargo build` and
+`cargo check`: libraries, proc-macros, compiled build scripts, and build-script
+runs. For a package with a build script, the input guard covers the script
+output passed to rustc and the contents of its `OUT_DIR`. Proc-macros that read
+undeclared files or environment variables can produce stale hits, as with
+Cargo's own freshness checks. Local units, forced builds, custom compiler
+commands, compiler wrappers, extra per-unit arguments, and artifact
+dependencies are excluded.
+
+A cached build-script run restores the script's `OUT_DIR` and captured output
+instead of running it. Its guard covers the run's fingerprint, the compiled
+script, the environment Cargo sets for it, and the metadata and `OUT_DIR`
+contents of linked dependencies. Values of variables named by
+`rerun-if-env-changed` are recorded when the run is published, and a restore is
+rejected if they differ. A script that reads other environment variables,
+system libraries, or files outside its package can restore output produced
+under different conditions, and running `cargo clean` does not rerun it. Paths
+into the publisher's `OUT_DIR` are rewritten, but generated files that contain
+absolute paths are restored as published.
 
 On a cache hit, Cargo verifies each blob's contents, restores the output tree,
 checks the environment dependencies recorded by rustc, regenerates Cargo's
@@ -2219,13 +2230,18 @@ identities and rejects unexpected paths or metadata.
 
 Remote lookups start before the job queue reaches a unit. A unit's input guard
 depends on its dependencies' artifacts, which Cargo identifies by the blob
-hashes recorded when each dependency is fetched, restored, compiled, or found
+hashes recorded when each dependency is looked up, restored, compiled, or found
 fresh. Once those hashes and any build-script output are known, background
-threads fetch the entry into local storage. They do not use jobserver tokens.
-A unit whose fetch is in flight does not take a job slot, so other work can run
-meanwhile. Its job then restores from local storage. A unit that prefetching has
-not started is fetched by its own job. A remote miss seen during prefetching is
-not looked up again.
+threads fetch the entry into local storage. They do not use jobserver tokens,
+and a unit waiting for them does not take a job slot.
+
+Fetches download everything except rlibs and object files first. A dependent
+that only needs metadata, such as a library built with pipelining, can then
+compile against the restored rmeta while the rest downloads. Units linked by
+build scripts or proc-macros are fetched first and in full. If the rest of a
+unit fails to download after dependents started using its metadata, the build
+fails. Running the build again fetches or compiles the unit. A remote miss seen
+during prefetching is not looked up again.
 
 Newly compiled eligible units can populate the remote cache. Uploads run on
 background threads so compilation does not wait on the network, and the build
@@ -2263,8 +2279,10 @@ the remote cache is enabled and read-only. Cache events distinguish:
   blob transfers, including their SHA256 digest and byte count.
 * `restored unit from remote cache`: the remote entry and its outputs were
   downloaded or reused locally, verified, and restored.
-* `prefetched unit from remote cache`: the entry and its blobs were fetched
-  ahead of the unit's job. The job then reports a local restore.
+* `prefetched unit metadata from remote cache` and `prefetched unit from remote
+  cache`: the two phases of a fetch made ahead of the unit's job.
+  `restored unit metadata from remote cache` means dependents can compile
+  against the unit while its rlib downloads.
 * `skipping remote publication of unchanged cache hit`: the restored unit is
   still valid, so Cargo does not upload blobs or update its remote action result.
 

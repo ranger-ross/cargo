@@ -9,7 +9,10 @@ use crate::CargoResult;
 pub(super) type Digest = [u8; 32];
 const UNIT_MAGIC: &[u8] = b"cargo-shared-storage-unit-output-v1\0";
 const SNAPSHOT_MAGIC: &[u8] = b"cargo-shared-storage-snapshot-v2\0";
-const CACHE_MAGIC: &[u8] = b"cargo-shared-storage-cache-entry-v2\0";
+const CACHE_MAGIC: &[u8] = b"cargo-shared-storage-cache-entry-v3\0";
+/// The mode recorded for a symlink in a cache entry. Its blob holds the link
+/// target.
+pub(super) const SYMLINK_MODE: u32 = 0o120000;
 
 #[cfg(unix)]
 const PATH_ENCODING: u8 = 1;
@@ -307,7 +310,10 @@ impl CacheEntry {
             let mode = reader.u32()?;
             let mtime_seconds = i64::from_le_bytes(reader.take(8)?.try_into().unwrap());
             let mtime_nanos = reader.u32()?;
-            ensure!(mode & !0o777 == 0, "invalid cached output permissions");
+            ensure!(
+                mode & !0o777 == 0 || mode == SYMLINK_MODE,
+                "invalid cached output permissions"
+            );
             ensure!(
                 mtime_nanos < 1_000_000_000,
                 "invalid cached output timestamp"

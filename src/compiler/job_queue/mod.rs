@@ -181,6 +181,8 @@ struct DrainState<'gctx> {
     /// Count of warnings, used to print a summary after the job succeeds
     warning_count: HashMap<JobId, WarningCount>,
     active: HashMap<JobId, Unit>,
+    /// Active jobs that gave up their slot to wait on I/O.
+    yielded: HashSet<JobId>,
     compiled: HashSet<PackageId>,
     documented: HashSet<PackageId>,
     scraped: HashSet<PackageId>,
@@ -200,6 +202,8 @@ struct DrainState<'gctx> {
     /// as we share the implicit token given to this Cargo process with a
     /// single rustc process.
     tokens: Vec<Acquired>,
+    /// Token requests sent to the jobserver helper and not yet answered.
+    token_requests: usize,
 
     /// The list of jobs that we have not yet started executing, but have
     /// retrieved from the `queue`. We eagerly pull jobs off the main queue to
@@ -394,6 +398,8 @@ enum Message {
     UnusedExterns(JobId, std::collections::BTreeSet<InternedString>),
     /// A deferred job may be ready to start.
     Wake,
+    /// See [`JobState::yield_slot`].
+    YieldSlot(JobId),
 }
 
 impl<'gctx> JobQueue<'gctx> {
@@ -506,6 +512,7 @@ impl<'gctx> JobQueue<'gctx> {
             diag_dedupe: DiagDedupe::new(build_runner.bcx.gctx),
             warning_count: HashMap::default(),
             active: HashMap::default(),
+            yielded: HashSet::default(),
             compiled: HashSet::default(),
             documented: HashSet::default(),
             scraped: HashSet::default(),
@@ -520,6 +527,7 @@ impl<'gctx> JobQueue<'gctx> {
                 .map(|(unit, &index)| (index, unit.clone()))
                 .collect(),
             tokens: Vec::new(),
+            token_requests: 0,
             pending_queue: Vec::new(),
             print: DiagnosticPrinter::new(
                 build_runner.bcx.gctx,
@@ -574,9 +582,7 @@ impl<'gctx> DrainState<'gctx> {
         scope: &'s Scope<'s, '_>,
     ) -> CargoResult<()> {
         // Dequeue as much work as we can, learning about everything
-        // possible that can run. Note that this is also the point where we
-        // start requesting job tokens. Each job after the first needs to
-        // request a token.
+        // possible that can run.
         while let Some((unit, job, priority)) = self.queue.dequeue() {
             // We want to keep the pieces of work in the `pending_queue` sorted
             // by their priorities, and insert the current job at its correctly
@@ -587,9 +593,6 @@ impl<'gctx> DrainState<'gctx> {
                 .pending_queue
                 .partition_point(|&(_, _, p)| p <= priority);
             self.pending_queue.insert(idx, (unit, job, priority));
-            if self.active.len() + self.pending_queue.len() > 1 {
-                jobserver_helper.request_token();
-            }
         }
 
         // Now that we've learned of all possible work that we can execute
@@ -621,11 +624,31 @@ impl<'gctx> DrainState<'gctx> {
             self.run(&unit, job, build_runner, scope);
         }
 
+        // Request a token for each job that could run now, beyond the first
+        // which shares Cargo's implicit token. Deferred jobs request theirs
+        // when they become ready, so they do not hold tokens other processes
+        // such as build scripts could use.
+        let runnable = self
+            .pending_queue
+            .iter()
+            .filter(|(_, job, _)| !job.deferred())
+            .count();
+        let wanted = (self.running_jobs() + runnable).saturating_sub(1);
+        for _ in self.tokens.len() + self.token_requests..wanted {
+            jobserver_helper.request_token();
+            self.token_requests += 1;
+        }
+
         Ok(())
     }
 
     fn has_extra_tokens(&self) -> bool {
-        self.active.len() < self.tokens.len() + 1
+        self.running_jobs() < self.tokens.len() + 1
+    }
+
+    /// Active jobs that still occupy a job slot.
+    fn running_jobs(&self) -> usize {
+        self.active.len() - self.yielded.len()
     }
 
     fn handle_event(
@@ -697,6 +720,7 @@ impl<'gctx> DrainState<'gctx> {
                         trace!("end: {:?}", id);
                         self.finished += 1;
                         let unit = self.active.remove(&id).unwrap();
+                        self.yielded.remove(&id);
                         // An error could add an entry for a `Unit`
                         // with 0 warnings but having fixable
                         // warnings be disallowed
@@ -773,6 +797,7 @@ impl<'gctx> DrainState<'gctx> {
                     .record_unused_externs_for_unit(unit, unused_externs);
             }
             Message::Token(acquired_token) => {
+                self.token_requests = self.token_requests.saturating_sub(1);
                 let token = acquired_token.context("failed to acquire jobserver token")?;
                 self.tokens.push(token);
             }
@@ -780,6 +805,11 @@ impl<'gctx> DrainState<'gctx> {
                 self.timings.unit_section_timing(build_runner, id, &section);
             }
             Message::Wake => {}
+            Message::YieldSlot(id) => {
+                if self.active.contains_key(&id) {
+                    self.yielded.insert(id);
+                }
+            }
             Message::PeakMemory(id, bytes) => {
                 self.timings.unit_peak_memory(build_runner, id, bytes);
             }
@@ -800,15 +830,15 @@ impl<'gctx> DrainState<'gctx> {
         if events.is_empty() {
             loop {
                 self.tick_progress();
-                // Deferred jobs keep their tokens for when they become ready.
-                if self.pending_queue.is_empty() {
-                    self.tokens.truncate(self.active.len().saturating_sub(1));
-                }
+                self.tokens.truncate(self.running_jobs().saturating_sub(1));
                 match self.messages.pop(Duration::from_millis(500)) {
                     Some(message) => {
                         events.push(message);
                         break;
                     }
+                    // Deferred jobs are rechecked on each heartbeat in case
+                    // the condition cleared without a wakeup.
+                    None if !self.pending_queue.is_empty() => break,
                     None => continue,
                 }
             }

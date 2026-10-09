@@ -242,7 +242,28 @@ fn compile<'gctx>(
         fingerprint::prepare_init(build_runner, unit)?;
 
         let job = if unit.mode.is_run_custom_build() {
-            custom_build::prepare(build_runner, unit)?
+            let mut job = custom_build::prepare(build_runner, unit)?;
+            // Prefetching waits for the whole job. Its fingerprint changes after
+            // the script's output is published, and hashing it earlier would
+            // memoize a stale value.
+            if let Some(storage) = build_runner.files().blob_storage() {
+                let unit_dir = build_runner.files().build_unit_dir(unit);
+                // Consumers in immutable packages hash a rebuilt OUT_DIR into
+                // their cache keys. Doing it here uses this job's slot instead
+                // of a prefetch thread competing with compilation.
+                let out_dir = (job.freshness().is_dirty() && local_cache::immutable(unit))
+                    .then(|| build_runner.files().out_dir_new_layout(unit));
+                job.after(Work::new(move |_| {
+                    if let Some(out_dir) = &out_dir
+                        && let Err(error) = local_cache::out_dir_hash(&storage, out_dir)
+                    {
+                        debug!(?error, "failed to hash build script output directory");
+                    }
+                    storage.build_script_finished(&unit_dir);
+                    Ok(())
+                }));
+            }
+            job
         } else if unit.mode.is_doc_test() {
             // We run these targets later, so this is just a no-op for now.
             Job::new_fresh()
@@ -277,7 +298,8 @@ fn compile<'gctx>(
             {
                 cache.prefetch();
                 let cache = Arc::clone(cache);
-                job.defer_while(move || cache.prefetching());
+                let metadata_first = build_runner.rmeta_required(unit);
+                job.defer_while(move || cache.prefetching(metadata_first));
             }
             job.before(if job.freshness().is_dirty() {
                 let work = if unit.mode.is_doc() || unit.mode.is_doc_scrape() {
@@ -536,19 +558,33 @@ fn rustc(
         }
 
         if let Some(cache) = &local_cache {
+            // Set once dependents may compile against the restored rmeta. The
+            // unit can no longer fall back to rustc after that.
+            let mut metadata_used = false;
             let restored = (|| {
-                if !cache.restore()? {
-                    return CargoResult::Ok(false);
-                }
+                let pending = match cache.restore(rmeta_required)? {
+                    blob_storage::Restored::Miss => return CargoResult::Ok(false),
+                    blob_storage::Restored::Complete => None,
+                    blob_storage::Restored::Metadata(pending) => Some(pending),
+                };
                 cache.validate_dep_info(&rustc_dep_info_loc, &rustc, &cwd, &pkg_root)?;
-                for output in outputs.iter().filter(|output| {
-                    !matches!(output.flavor, FileFlavor::DebugInfo | FileFlavor::Auxiliary)
-                }) {
-                    anyhow::ensure!(
-                        output.path.is_file(),
-                        "cache entry is missing compiler output {}",
-                        output.path.display()
-                    );
+                // Linkable outputs arrive last when only metadata was restored.
+                let ensure_outputs = |linkable: bool| -> CargoResult<()> {
+                    if let Some(output) = outputs.iter().find(|output| {
+                        !matches!(output.flavor, FileFlavor::DebugInfo | FileFlavor::Auxiliary)
+                            && (output.flavor == FileFlavor::Linkable) == linkable
+                            && !output.path.is_file()
+                    }) {
+                        anyhow::bail!(
+                            "cache entry is missing compiler output {}",
+                            output.path.display()
+                        );
+                    }
+                    Ok(())
+                };
+                ensure_outputs(false)?;
+                if pending.is_none() {
+                    ensure_outputs(true)?;
                 }
                 let timestamp = paths::set_invocation_time(&fingerprint_dir)?;
                 fingerprint::translate_dep_info(
@@ -573,17 +609,37 @@ fn rustc(
                     .take()
                     .expect("cache replay work")
                     .call(state)?;
+                if let Some(pending) = pending {
+                    // Dependents compile against the rmeta while the rest of
+                    // the unit downloads. Waiting needs no job slot.
+                    state.rmeta_produced();
+                    metadata_used = true;
+                    state.yield_slot();
+                    cache.finish_restore(pending)?;
+                    ensure_outputs(true)?;
+                    for output in outputs.iter() {
+                        paths::set_file_time_no_err(&output.path, timestamp);
+                    }
+                }
                 cache.accept()?;
                 Ok(true)
             })();
             match restored {
                 Ok(true) => {
-                    if rmeta_required {
+                    if rmeta_required && !metadata_used {
                         state.rmeta_produced();
                     }
                     return Ok(());
                 }
                 Ok(false) => {}
+                // Recompiling could change the rmeta that dependents already
+                // use, so the build fails instead.
+                Err(err) if metadata_used => {
+                    return Err(err.context(format!(
+                        "failed to restore `{package_id}` from the build cache after \
+                         dependents started using its metadata"
+                    )));
+                }
                 Err(err) => {
                     debug!(?package_id, ?err, "local cache miss");
                 }

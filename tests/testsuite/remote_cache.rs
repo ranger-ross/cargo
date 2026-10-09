@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::net::TcpListener;
+use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::thread;
@@ -20,6 +21,8 @@ use cargo_test_support::{Execs, Project, paths, prelude::*, project, t};
 const INSTANCE: &str = "cargo/tests";
 const API_KEY: &str = "remote-cache-test-secret";
 const API_KEY_ENV: &str = "CARGO_REMOTE_CACHE_TEST_API_KEY";
+/// Below the default remote timeout, so a held read that times out still succeeds.
+const HOLD_LIMIT: Duration = Duration::from_secs(10);
 
 type BlobKey = (String, i64);
 type RpcStream<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send>>;
@@ -49,6 +52,12 @@ struct State {
     read_keys: Vec<BlobKey>,
     upload_delay: Duration,
     read_delay: Duration,
+    /// Hold each ByteStream read until this returns true or `HOLD_LIMIT` passes.
+    hold_reads_until: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
+    /// For each held read, whether the condition held before the limit.
+    held_reads: Vec<bool>,
+    /// Fail ByteStream reads with `Unavailable`.
+    fail_reads: bool,
     lookup_delay: Duration,
     /// Advertise and accept zstd transfers.
     compression: bool,
@@ -528,6 +537,26 @@ impl bs::byte_stream_server::ByteStream for CacheService {
         request: Request<bs::ReadRequest>,
     ) -> Result<Response<Self::ReadStream>, Status> {
         self.authorize(&request)?;
+        let (hold, fail) = {
+            let state = self.state.lock();
+            (state.hold_reads_until.clone(), state.fail_reads)
+        };
+        if fail {
+            return Err(Status::unavailable("reads intentionally unavailable"));
+        }
+        if let Some(ready) = hold {
+            let deadline = tokio::time::Instant::now() + HOLD_LIMIT;
+            let released = loop {
+                if ready() {
+                    break true;
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    break false;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            };
+            self.state.lock().held_reads.push(released);
+        }
         let request = request.into_inner();
         let (key, compressed) = self.resource(&request.resource_name, false)?;
         let mut state = self.state.lock();
@@ -778,9 +807,10 @@ fn restores_from_remote(mode: &str) {
     assert_compiled(&restored.stderr, "app", true);
     let after_restore = server.counts();
     assert!(after_restore.reads > uploaded.reads);
-    // Each restored unit's small outputs fit in a single batch.
+    // Each restored unit batches its small outputs, once for metadata and
+    // once for deferred outputs.
     let batches = after_restore.batch_reads - uploaded.batch_reads;
-    assert!((1..=2).contains(&batches), "{batches}");
+    assert!((1..=4).contains(&batches), "{batches}");
     assert_eq!(after_restore.writes, uploaded.writes);
     assert_eq!(after_restore.updates, uploaded.updates);
     if mode == "build" {
@@ -1327,4 +1357,159 @@ fn dependencies_are_prefetched_outside_the_job_queue() {
     let peak = server.service.state.lock().peak_lookups;
     assert!(peak > 1, "peak concurrent lookups: {peak}");
     p.process(&p.bin("app")).with_stdout_data("16\n").run();
+}
+
+/// A library whose only dependency streams its rlib but batches its rmeta.
+fn pipelined_project() -> Project {
+    Package::new("common", "0.1.0")
+        .file("payload", &"x".repeat(1536 * 1024))
+        .file(
+            "src/lib.rs",
+            "pub fn data() -> &'static [u8] { include_bytes!(\"../payload\") }",
+        )
+        .publish();
+    project()
+        .file(
+            "Cargo.toml",
+            r#"
+                [package]
+                name = "app"
+                version = "0.1.0"
+                edition = "2021"
+                [dependencies]
+                common = "0.1.0"
+            "#,
+        )
+        .file(
+            "src/lib.rs",
+            "pub fn len() -> usize { common::data().len() }",
+        )
+        .build()
+}
+
+fn build_lib(p: &Project) -> Execs {
+    let mut command = p.cargo("build -vv -Zshared-blob-storage");
+    command
+        .env(API_KEY_ENV, API_KEY)
+        .masquerade_as_nightly_cargo(&["shared-blob-storage"]);
+    command
+}
+
+fn contains_file(dir: &Path, matches: &dyn Fn(&str) -> bool) -> bool {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return false;
+    };
+    entries.flatten().any(|entry| {
+        let path = entry.path();
+        if path.is_dir() {
+            contains_file(&path, matches)
+        } else {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(matches)
+        }
+    })
+}
+
+#[cargo_test]
+fn dependents_compile_against_metadata_before_rlibs_arrive() {
+    let server = CacheServer::new(Some(API_KEY));
+    let p = pipelined_project();
+    server.configure(&p, false);
+    build_lib(&p).run();
+    purge_local_cache(&p);
+    let target = p.build_dir();
+    server.service.state.lock().hold_reads_until = Some(Arc::new(move || {
+        contains_file(&target, &|name| {
+            name.starts_with("libapp-") && name.ends_with(".rmeta")
+        })
+    }));
+    let restored = build_lib(&p).run();
+    assert_compiled(&restored.stderr, "common", false);
+    assert_compiled(&restored.stderr, "app", true);
+    // Streaming `common`'s rlib waited until `app` compiled against its rmeta.
+    let held = server.service.state.lock().held_reads.clone();
+    assert!(
+        !held.is_empty() && held.iter().all(|released| *released),
+        "{held:?}"
+    );
+}
+
+#[cargo_test]
+fn failed_download_after_metadata_use_fails_the_build() {
+    let server = CacheServer::new(Some(API_KEY));
+    let p = pipelined_project();
+    server.configure(&p, false);
+    build_lib(&p).run();
+    purge_local_cache(&p);
+    server.service.state.lock().fail_reads = true;
+    build_lib(&p)
+        .with_status(101)
+        .with_stderr_contains(
+            "[ERROR] failed to restore `common v0.1.0` from the build cache after dependents started using its metadata",
+        )
+        .run();
+    // The next build fetches the unit again.
+    server.service.state.lock().fail_reads = false;
+    let rebuilt = build_lib(&p).run();
+    assert_compiled(&rebuilt.stderr, "common", false);
+}
+
+#[cargo_test]
+fn build_script_runs_restore_from_remote() {
+    Package::new("generated", "0.1.0")
+        .file(
+            "build.rs",
+            r#"
+            fn main() {
+                let out = std::env::var("OUT_DIR").unwrap();
+                std::fs::write(format!("{out}/value.rs"), "pub const VALUE: u32 = 7;").unwrap();
+                println!("cargo::rustc-link-search=native={out}");
+            }
+        "#,
+        )
+        .file(
+            "src/lib.rs",
+            r#"include!(concat!(env!("OUT_DIR"), "/value.rs"));"#,
+        )
+        .publish();
+    let p = project()
+        .file(
+            "Cargo.toml",
+            r#"
+                [package]
+                name = "app"
+                version = "0.1.0"
+                edition = "2021"
+                [dependencies]
+                generated = "0.1.0"
+            "#,
+        )
+        .file(
+            "src/main.rs",
+            "fn main() { println!(\"{}\", generated::VALUE); }",
+        )
+        .build();
+    let server = CacheServer::new(Some(API_KEY));
+    server.configure(&p, false);
+    let build = || {
+        let mut command = p.cargo("build -vv -Zshared-blob-storage");
+        command
+            .env(API_KEY_ENV, API_KEY)
+            .masquerade_as_nightly_cargo(&["shared-blob-storage"]);
+        command.run()
+    };
+    build();
+    purge_local_cache(&p);
+    let restored = build();
+    let stderr = String::from_utf8_lossy(&restored.stderr);
+    assert_compiled(&restored.stderr, "build_script_build", false);
+    assert_compiled(&restored.stderr, "generated", false);
+    assert!(
+        !stderr
+            .lines()
+            .any(|line| line.contains("Running") && line.contains("build_script_build`")),
+        "{stderr}"
+    );
+    p.process(&p.bin("app")).with_stdout_data("7\n").run();
 }

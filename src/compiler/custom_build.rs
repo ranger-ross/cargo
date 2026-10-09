@@ -357,6 +357,7 @@ fn build_work(build_runner: &mut BuildRunner<'_, '_>, unit: &Unit) -> CargoResul
         unit.target.name().to_string()
     };
     let to_exec = script_dir.join(bin_name);
+    let script_path = to_exec.clone();
 
     // Start preparing the process to execute, starting out with some
     // environment variables. Note that the profile-related environment
@@ -465,6 +466,15 @@ fn build_work(build_runner: &mut BuildRunner<'_, '_>, unit: &Unit) -> CargoResul
     }
     cmd.env("CARGO_ENCODED_RUSTFLAGS", unit.rustflags.join("\x1f"));
     cmd.env_remove("RUSTFLAGS");
+    let run_cache = super::local_cache::RunCache::new(
+        build_runner,
+        unit,
+        build_script_unit,
+        script_path,
+        cmd.get_envs(),
+    )?;
+    let run_cache_job = run_cache.clone();
+    let run_cache_fresh = run_cache.clone();
 
     if build_runner.bcx.ws.gctx().extra_verbose() {
         cmd.display_env_vars();
@@ -595,6 +605,46 @@ fn build_work(build_runner: &mut BuildRunner<'_, '_>, unit: &Unit) -> CargoResul
             }
         }
 
+        if let Some(cache) = &run_cache {
+            let restored = restore_cached_run(
+                cache,
+                &cmd,
+                &run_files,
+                &script_out_dir,
+                |stdout, prev_out_dir| {
+                    BuildOutput::parse(
+                        stdout,
+                        library_name.clone(),
+                        &pkg_descr,
+                        prev_out_dir,
+                        &script_out_dir,
+                        nightly_features_allowed,
+                        &targets,
+                        &msrv,
+                    )
+                },
+            );
+            match restored {
+                Ok(Some(parsed_output)) => {
+                    if json_messages {
+                        emit_build_output(state, &parsed_output, script_out_dir.as_path(), id)?;
+                    }
+                    build_script_outputs
+                        .lock()
+                        .unwrap()
+                        .insert(id, metadata_hash, parsed_output);
+                    return Ok(());
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    tracing::debug!(?error, "discarding cached build script run");
+                    // A partial restore must not leak into the real run.
+                    paths::remove_dir_all(&script_out_dir)?;
+                    paths::create_dir_all(&script_out_dir)?;
+                }
+            }
+        }
+
         // And now finally, run the build command itself!
         state.running(&cmd);
         let timestamp = paths::set_invocation_time(&run_files.root)?;
@@ -704,7 +754,14 @@ fn build_work(build_runner: &mut BuildRunner<'_, '_>, unit: &Unit) -> CargoResul
             &targets,
             &msrv,
         )?;
-
+        if let Some(cache) = &run_cache
+            && let Err(error) = cache.publish(&parsed_output, |name| {
+                cmd.get_env(name)
+                    .map(|value| value.to_string_lossy().into_owned())
+            })
+        {
+            tracing::debug!(?error, "failed to cache build script run");
+        }
         if json_messages {
             emit_build_output(state, &parsed_output, script_out_dir.as_path(), id)?;
         }
@@ -738,6 +795,11 @@ fn build_work(build_runner: &mut BuildRunner<'_, '_>, unit: &Unit) -> CargoResul
             emit_build_output(state, &output, script_out_dir.as_path(), id)?;
         }
 
+        if let Some(cache) = &run_cache_fresh
+            && let Err(error) = cache.retain()
+        {
+            tracing::debug!(?error, "failed to retain cached build script run");
+        }
         build_script_outputs
             .lock()
             .unwrap()
@@ -747,11 +809,49 @@ fn build_work(build_runner: &mut BuildRunner<'_, '_>, unit: &Unit) -> CargoResul
 
     let mut job = fingerprint::prepare_target(build_runner, unit, false)?;
     if job.freshness().is_dirty() {
+        if let Some(cache) = run_cache_job {
+            cache.prefetch();
+            job.defer_while(move || cache.prefetching());
+        }
         job.before(dirty);
     } else {
         job.before(fresh);
     }
     Ok(job)
+}
+
+/// Restore a cached run of a build script instead of running it. Returns the
+/// parsed output on a hit. `parse` takes the restored stdout and the `OUT_DIR`
+/// the publisher ran with, so paths into it can be rewritten.
+fn restore_cached_run(
+    cache: &super::local_cache::RunCache,
+    cmd: &cargo_util::ProcessBuilder,
+    run_files: &BuildScriptRunFiles,
+    script_out_dir: &Path,
+    parse: impl FnOnce(&[u8], &Path) -> CargoResult<BuildOutput>,
+) -> CargoResult<Option<BuildOutput>> {
+    if !cache.restore()? {
+        return Ok(None);
+    }
+    let stdout = paths::read_bytes(&run_files.stdout)?;
+    let prev_out_dir = paths::bytes2path(&paths::read_bytes(&run_files.root_output)?)?;
+    let output = parse(&stdout, &prev_out_dir)?;
+    let current = |name: &str| {
+        cmd.get_env(name)
+            .map(|value| value.to_string_lossy().into_owned())
+    };
+    if !cache.env_matches(&output, current)? {
+        tracing::debug!("cached build script run used different environment values");
+        paths::remove_dir_all(script_out_dir)?;
+        paths::create_dir_all(script_out_dir)?;
+        return Ok(None);
+    }
+    // Later fresh builds read this to relocate paths into `OUT_DIR`.
+    paths::write(&run_files.root_output, paths::path2bytes(script_out_dir)?)?;
+    let timestamp = paths::set_invocation_time(&run_files.root)?;
+    paths::set_file_time_no_err(&run_files.stdout, timestamp);
+    cache.accept()?;
+    Ok(Some(output))
 }
 
 /// When a build script run fails, store only log messages, and nuke other

@@ -78,6 +78,10 @@ pub struct BuildRunner<'a, 'gctx> {
     /// metadata files in addition to the rlib itself.
     rmeta_required: HashSet<Unit>,
 
+    /// Units that build scripts or proc-macros link against, directly or
+    /// transitively. Their full artifacts gate compilation of other units.
+    build_tool_deps: HashSet<Unit>,
+
     /// Map of the LTO-status of each unit. This indicates what sort of
     /// compilation is happening (only object, only bitcode, both, etc), and is
     /// precalculated early on.
@@ -133,6 +137,7 @@ impl<'a, 'gctx> BuildRunner<'a, 'gctx> {
             primary_packages: HashSet::default(),
             files: None,
             rmeta_required: HashSet::default(),
+            build_tool_deps: HashSet::default(),
             lto: HashMap::default(),
             metadata_for_doc_units: HashMap::default(),
             failed_scrape_units: Arc::new(Mutex::new(HashSet::default())),
@@ -463,6 +468,7 @@ impl<'a, 'gctx> BuildRunner<'a, 'gctx> {
             .extend(self.bcx.roots.iter().map(|u| u.target.crate_name()));
 
         self.record_units_requiring_metadata();
+        self.record_build_tool_deps();
 
         let files = CompilationFiles::new(self, host_layout, targets)?;
         self.files = Some(files);
@@ -769,6 +775,26 @@ impl<'a, 'gctx> BuildRunner<'a, 'gctx> {
         }
     }
 
+    /// Records the units that build scripts and proc-macros link against.
+    fn record_build_tool_deps(&mut self) {
+        let mut pending = self
+            .bcx
+            .unit_graph
+            .keys()
+            .filter(|unit| {
+                unit.mode == CompileMode::Build
+                    && (unit.target.is_custom_build() || unit.target.proc_macro())
+            })
+            .flat_map(|unit| &self.bcx.unit_graph[unit])
+            .map(|dep| &dep.unit)
+            .collect::<Vec<_>>();
+        while let Some(unit) = pending.pop() {
+            if self.build_tool_deps.insert(unit.clone()) {
+                pending.extend(self.bcx.unit_graph[unit].iter().map(|dep| &dep.unit));
+            }
+        }
+    }
+
     /// Returns whether when `parent` depends on `dep` if it only requires the
     /// metadata file from `dep`.
     pub fn only_requires_rmeta(&self, parent: &Unit, dep: &Unit) -> bool {
@@ -786,6 +812,11 @@ impl<'a, 'gctx> BuildRunner<'a, 'gctx> {
     /// well because some compilations rely on that.
     pub fn rmeta_required(&self, unit: &Unit) -> bool {
         self.rmeta_required.contains(unit)
+    }
+
+    /// Whether a build script or proc-macro links against `unit`.
+    pub fn is_build_tool_dep(&self, unit: &Unit) -> bool {
+        self.build_tool_deps.contains(unit)
     }
 
     /// Finds metadata for Doc/Docscrape units.

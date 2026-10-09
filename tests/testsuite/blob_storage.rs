@@ -11,7 +11,7 @@ use cargo_test_support::{Project, paths, prelude::*, project, t};
 type Digest = [u8; 32];
 const UNIT_OUTPUT_MAGIC: &[u8] = b"cargo-shared-storage-unit-output-v1\0";
 const SNAPSHOT_MAGIC: &[u8] = b"cargo-shared-storage-snapshot-v2\0";
-const CACHE_ENTRY_MAGIC: &[u8] = b"cargo-shared-storage-cache-entry-v2\0";
+const CACHE_ENTRY_MAGIC: &[u8] = b"cargo-shared-storage-cache-entry-v3\0";
 
 /// A snapshot member. Cacheable units are tracked by cache entry and other
 /// non-local units by unit output.
@@ -311,6 +311,14 @@ fn compiled(stderr: &[u8], name: &str) -> bool {
         .any(|line| line.contains("Running") && line.contains(&format!("--crate-name {name} ")))
 }
 
+/// Whether `-v` output shows a build script being executed.
+fn ran_build_script(stderr: &[u8]) -> bool {
+    std::str::from_utf8(stderr)
+        .unwrap()
+        .lines()
+        .any(|line| line.contains("Running") && line.contains("build_script_build`"))
+}
+
 #[cargo_test]
 fn disabled_without_unstable_flag() {
     let p = snapshot_project();
@@ -331,8 +339,8 @@ fn stores_dependency_artifact_by_content_hash() {
     assert_eq!(t!(fs::read(&blob)), contents);
     let id = snapshot_ids().pop_first().unwrap();
     assert!(snapshot_blobs(&id).contains(&blob));
-    // Cacheable units, including consumers of build scripts, appear as cache
-    // entries. The build script itself is only deduplicated, as a unit output.
+    // Non-local units, including build scripts, their runs, and consumers of
+    // their output, appear as cache entries.
     let members = snapshot_members(&id);
     let common = tracked_member(&fingerprint_file(&p, "common"));
     assert!(matches!(common, Member::CacheEntry(_)), "{common:?}");
@@ -343,7 +351,7 @@ fn stores_dependency_artifact_by_content_hash() {
         .iter()
         .filter(|member| matches!(member, Member::CacheEntry(_)))
         .count();
-    assert_eq!((entries, members.len() - entries), (3, 1), "{members:?}");
+    assert_eq!((entries, members.len() - entries), (5, 0), "{members:?}");
     let local = t!(fs::read(p.bin("app")));
     assert!(!blob_path(blake3::hash(&local).as_bytes()).exists());
 }
@@ -858,7 +866,7 @@ fn changed_environment_invalidates_cached_transitive_consumers() {
 }
 
 #[cargo_test]
-fn consumers_of_build_scripts_and_proc_macros_are_restored() {
+fn build_scripts_and_proc_macros_are_restored() {
     Package::new("scripted", "0.1.0")
         .file(
             "build.rs",
@@ -922,26 +930,87 @@ fn consumers_of_build_scripts_and_proc_macros_are_restored() {
         .masquerade_as_nightly_cargo(&["shared-blob-storage"])
         .with_stdout_contains("42 42")
         .run();
-    // Build scripts and proc-macros still compile. Their consumers restore.
+    // Build scripts, their runs, and proc-macros restore like their consumers.
     for (name, expected) in [
-        ("build_script_build", true),
-        ("macro_dep", true),
+        ("build_script_build", false),
+        ("macro_dep", false),
         ("scripted", false),
         ("consumer", false),
         ("app", true),
     ] {
         assert_eq!(compiled(&output.stderr, name), expected, "{name}");
     }
+    assert!(
+        !ran_build_script(&output.stderr),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
-/// Build scripts that read untracked inputs. A clean build reruns them without
-/// changing any fingerprint, so only the cache key can notice new output.
+#[cfg(unix)]
+#[cargo_test]
+fn build_script_runs_with_symlinks_are_restored() {
+    Package::new("linked", "0.1.0")
+        .file(
+            "build.rs",
+            r#"
+            fn main() {
+                let out = std::env::var("OUT_DIR").unwrap();
+                std::fs::write(format!("{out}/value.rs"), "pub const VALUE: u32 = 5;").unwrap();
+                let _ = std::fs::remove_file(format!("{out}/linked.rs"));
+                std::os::unix::fs::symlink("value.rs", format!("{out}/linked.rs")).unwrap();
+            }
+        "#,
+        )
+        .file(
+            "src/lib.rs",
+            r#"include!(concat!(env!("OUT_DIR"), "/linked.rs"));"#,
+        )
+        .publish();
+    let p = project()
+        .file(
+            "Cargo.toml",
+            r#"
+        [package]
+        name = "app"
+        version = "0.1.0"
+        edition = "2021"
+        [dependencies]
+        linked = "0.1.0"
+    "#,
+        )
+        .file(
+            "src/main.rs",
+            "fn main() { println!(\"{}\", linked::VALUE); }",
+        )
+        .build();
+    p.cargo("run -Zshared-blob-storage")
+        .masquerade_as_nightly_cargo(&["shared-blob-storage"])
+        .with_stdout_data("5\n")
+        .run();
+    p.cargo("clean").run();
+    let output = p
+        .cargo("run -vv -Zshared-blob-storage")
+        .masquerade_as_nightly_cargo(&["shared-blob-storage"])
+        .with_stdout_data("5\n")
+        .run();
+    assert!(
+        !ran_build_script(&output.stderr),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!compiled(&output.stderr, "linked"));
+}
+
+/// Build scripts whose output depends on declared environment variables. A
+/// clean build restores their runs unless a declared value changed.
 fn untracked_script_project() -> Project {
     Package::new("generated", "0.1.0")
         .file(
             "build.rs",
             r#"
             fn main() {
+                println!("cargo::rerun-if-env-changed=GENERATED_VALUE");
                 let value = std::env::var("GENERATED_VALUE").unwrap();
                 let out = std::env::var("OUT_DIR").unwrap();
                 std::fs::write(
@@ -962,6 +1031,7 @@ fn untracked_script_project() -> Project {
             "build.rs",
             r#"
             fn main() {
+                println!("cargo::rerun-if-env-changed=CONFIGURED_VALUE");
                 println!("cargo::rustc-check-cfg=cfg(flavor, values(\"one\", \"two\"))");
                 let value = std::env::var("CONFIGURED_VALUE").unwrap();
                 println!("cargo::rustc-cfg=flavor=\"{value}\"");
@@ -1015,6 +1085,9 @@ fn generated_out_dir_inputs_are_part_of_the_cache_key() {
     run_untracked(&p, "one", "one");
     let same = run_untracked(&p, "one", "one");
     assert!(!compiled(&same, "generated"));
+    assert!(!ran_build_script(&same));
+    // The changed value rejects the cached run, and the new `OUT_DIR` contents
+    // change the consumer's key.
     let changed = run_untracked(&p, "two", "one");
     assert!(compiled(&changed, "generated"));
     assert!(!compiled(&changed, "configured"));

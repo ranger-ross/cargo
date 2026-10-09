@@ -155,6 +155,13 @@ impl<'a, 'gctx> JobState<'a, 'gctx> {
             .push(Message::Finish(self.id, Artifact::Metadata, Ok(())));
     }
 
+    /// Give this job's slot to other work because it will only wait on I/O
+    /// from now on. The job must not run the compiler or other CPU-heavy work
+    /// afterwards, since the slot is not returned.
+    pub fn yield_slot(&self) {
+        self.messages.push(Message::YieldSlot(self.id));
+    }
+
     pub fn lock_exclusive(&self, lock: &LockKey) -> CargoResult<()> {
         self.lock_manager.lock(lock)
     }

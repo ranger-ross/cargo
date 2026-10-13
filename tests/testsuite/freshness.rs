@@ -2043,3 +2043,45 @@ fn changing_linker() {
 "#]])
         .run();
 }
+
+#[cargo_test]
+fn build_script_to_old_style_rebuild() {
+    // Changing from new-style to old-style should track freshness properly.
+    let p = project()
+        .file("src/lib.rs", "")
+        .file(
+            "build.rs",
+            r#"
+            fn main() {
+                println!("cargo:rerun-if-changed=build.rs");
+            }
+            "#,
+        )
+        .build();
+
+    p.cargo("build").run();
+    p.cargo("build -v")
+        .with_stderr_data(str![["
+[FRESH] foo [..]
+[FINISHED] [..]
+"]])
+        .run();
+    p.change_file("build.rs", "fn main() {}");
+    p.cargo("build -v")
+        .with_stderr_data(str![["
+[DIRTY] foo [..]
+[COMPILING] foo [..]
+[RUNNING] [..]build.rs[..]
+[RUNNING] [..]build_script_build[..]
+[RUNNING] [..]lib.rs[..]
+[FINISHED] [..]
+"]])
+        .run();
+    // This line is currently bugged and doesn't appear fresh.
+    p.cargo("build -v")
+        .with_stderr_data(str![["
+[FRESH] foo [..]
+[FINISHED] [..]
+"]])
+        .run();
+}

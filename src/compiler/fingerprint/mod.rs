@@ -551,38 +551,54 @@ pub fn prepare_target(
     }
 
     let write_fingerprint = if unit.mode.is_run_custom_build() {
-        // For build scripts the `local` field of the fingerprint may change
-        // while we're executing it. For example it could be in the legacy
-        // "consider everything a dependency mode" and then we switch to "deps
-        // are explicitly specified" mode.
-        //
-        // To handle this movement we need to regenerate the `local` field of a
-        // build script's fingerprint after it's executed. We do this by
-        // using the `build_script_local_fingerprints` function which returns a
-        // thunk we can invoke on a foreign thread to calculate this.
-        let build_script_outputs = Arc::clone(&build_runner.build_script_outputs);
         let metadata = build_runner.get_run_build_script_metadata(unit);
-        let (gen_local, _overridden) = build_script_local_fingerprints(build_runner, unit)?;
-        let output_path = build_runner.build_explicit_deps[unit]
-            .build_script_output
-            .clone();
-        Work::new(move |_| {
-            let outputs = build_script_outputs.lock().unwrap();
-            let output = outputs
-                .get(metadata)
-                .expect("output must exist after running");
-            let deps = BuildDeps::new(&output_path, Some(output));
-
-            // FIXME: it's basically buggy that we pass `None` to `call_box`
-            // here. See documentation on `build_script_local_fingerprints`
-            // below for more information. Despite this just try to proceed and
-            // hobble along if it happens to return `Some`.
-            if let Some(new_local) = (gen_local)(&deps, None)? {
+        if build_runner
+            .build_script_outputs
+            .lock()
+            .unwrap()
+            .get(metadata)
+            .is_some()
+        {
+            // Prepopulated output means the build script is overridden.
+            Work::new(move |_| write_fingerprint(&loc, &fingerprint))
+        } else {
+            // Capture package state before execution in case the script drops its directives.
+            let pkg_fingerprint = {
+                let local = fingerprint.local.lock().unwrap();
+                match local.as_slice() {
+                    [LocalFingerprint::Precalculated(value)] => Some(value.clone()),
+                    _ => None,
+                }
+            };
+            let pkg_fingerprint = match pkg_fingerprint {
+                Some(value) => Ok(value),
+                None => build_script_pkg_fingerprint(build_runner.bcx, &unit.pkg),
+            };
+            let build_script_outputs = Arc::clone(&build_runner.build_script_outputs);
+            let output_path = build_runner.build_explicit_deps[unit]
+                .build_script_output
+                .clone();
+            let pkg_root = unit.pkg.root().to_path_buf();
+            let build_dir = build_root(build_runner);
+            let env_config = Arc::clone(build_runner.bcx.gctx.env_config()?);
+            Work::new(move |_| {
+                let deps = {
+                    let outputs = build_script_outputs.lock().unwrap();
+                    let output = outputs
+                        .get(metadata)
+                        .expect("output must exist after running");
+                    BuildDeps::new(&output_path, Some(output))
+                };
+                let new_local =
+                    if deps.rerun_if_changed.is_empty() && deps.rerun_if_env_changed.is_empty() {
+                        vec![LocalFingerprint::Precalculated(pkg_fingerprint?)]
+                    } else {
+                        local_fingerprints_deps(&deps, &build_dir, &pkg_root, &env_config)
+                    };
                 *fingerprint.local.lock().unwrap() = new_local;
-            }
-
-            write_fingerprint(&loc, &fingerprint)
-        })
+                write_fingerprint(&loc, &fingerprint)
+            })
+        }
     } else {
         Work::new(move |_| write_fingerprint(&loc, &fingerprint))
     };
@@ -1744,28 +1760,24 @@ fn calculate_run_custom_build(
     // the build script this means we'll be watching files and env vars.
     // Otherwise if we haven't previously executed it we'll just start watching
     // the whole crate.
-    let (gen_local, overridden) = build_script_local_fingerprints(build_runner, unit)?;
+    let override_fingerprint = build_script_override_fingerprint(build_runner, unit);
     let deps = &build_runner.build_explicit_deps[unit];
-    let local = (gen_local)(
-        deps,
-        Some(&|| {
-            const IO_ERR_MESSAGE: &str = "\
-An I/O error happened. Please make sure you can access the file.
-
-By default, if your project contains a build script, cargo scans all files in
-it to determine whether a rebuild is needed. If you don't expect to access the
-file, specify `rerun-if-changed` in your build script.
-See https://doc.rust-lang.org/cargo/reference/build-scripts.html#rerun-if-changed for more information.";
-            pkg_fingerprint(build_runner.bcx, &unit.pkg).map_err(|err| {
-                let mut message = format!("failed to determine package fingerprint for build script for {}", unit.pkg);
-                if err.root_cause().is::<io::Error>() {
-                    message = format!("{}\n{}", message, IO_ERR_MESSAGE)
-                }
-                err.context(message)
-            })
-        }),
-    )?
-    .unwrap();
+    let overridden = override_fingerprint.is_some();
+    let local = if let Some(value) = override_fingerprint {
+        vec![value]
+    } else if deps.rerun_if_changed.is_empty() && deps.rerun_if_env_changed.is_empty() {
+        // Path fingerprints hash mtimes, which remains fragile on some filesystems.
+        vec![LocalFingerprint::Precalculated(
+            build_script_pkg_fingerprint(build_runner.bcx, &unit.pkg)?,
+        )]
+    } else {
+        local_fingerprints_deps(
+            deps,
+            &build_root(build_runner),
+            unit.pkg.root(),
+            build_runner.bcx.gctx.env_config()?,
+        )
+    };
     let output = deps.build_script_output.clone();
 
     // Include any dependencies of our execution, which is typically just the
@@ -1800,119 +1812,22 @@ See https://doc.rust-lang.org/cargo/reference/build-scripts.html#rerun-if-change
     })
 }
 
-/// Get ready to compute the [`LocalFingerprint`] values
-/// for a [`RunCustomBuild`] unit.
-///
-/// This function has, what's on the surface, a seriously wonky interface.
-/// You'll call this function and it'll return a closure and a boolean. The
-/// boolean is pretty simple in that it indicates whether the `unit` has been
-/// overridden via `.cargo/config.toml`. The closure is much more complicated.
-///
-/// This closure is intended to capture any local state necessary to compute
-/// the `LocalFingerprint` values for this unit. It is `Send` and `'static` to
-/// be sent to other threads as well (such as when we're executing build
-/// scripts). That deduplication is the rationale for the closure at least.
-///
-/// The arguments to the closure are a bit weirder, though, and I'll apologize
-/// in advance for the weirdness too. The first argument to the closure is a
-/// `&BuildDeps`. This is the parsed version of a build script, and when Cargo
-/// starts up this is cached from previous runs of a build script.  After a
-/// build script executes the output file is reparsed and passed in here.
-///
-/// The second argument is the weirdest, it's *optionally* a closure to
-/// call [`pkg_fingerprint`]. The `pkg_fingerprint` requires access to
-/// "source map" located in `Context`. That's very non-`'static` and
-/// non-`Send`, so it can't be used on other threads, such as when we invoke
-/// this after a build script has finished. The `Option` allows us to for sure
-/// calculate it on the main thread at the beginning, and then swallow the bug
-/// for now where a worker thread after a build script has finished doesn't
-/// have access. Ideally there would be no second argument or it would be more
-/// "first class" and not an `Option` but something that can be sent between
-/// threads. In any case, it's a bug for now.
-///
-/// This isn't the greatest of interfaces, and if there's suggestions to
-/// improve please do so!
-///
-/// FIXME(#6779) - see all the words above
-///
-/// [`RunCustomBuild`]: crate::compiler::CompileMode::RunCustomBuild
-fn build_script_local_fingerprints(
-    build_runner: &mut BuildRunner<'_, '_>,
-    unit: &Unit,
-) -> CargoResult<(
-    Box<
-        dyn FnOnce(
-                &BuildDeps,
-                Option<&dyn Fn() -> CargoResult<String>>,
-            ) -> CargoResult<Option<Vec<LocalFingerprint>>>
-            + Send,
-    >,
-    bool,
-)> {
-    assert!(unit.mode.is_run_custom_build());
-    // First up, if this build script is entirely overridden, then we just
-    // return the hash of what we overrode it with. This is the easy case!
-    if let Some(fingerprint) = build_script_override_fingerprint(build_runner, unit) {
-        debug!("override local fingerprints deps {}", unit.pkg);
-        return Ok((
-            Box::new(
-                move |_: &BuildDeps, _: Option<&dyn Fn() -> CargoResult<String>>| {
-                    Ok(Some(vec![fingerprint]))
-                },
-            ),
-            true, // this is an overridden build script
-        ));
-    }
+fn build_script_pkg_fingerprint(bcx: &BuildContext<'_, '_>, pkg: &Package) -> CargoResult<String> {
+    const IO_ERR_MESSAGE: &str = "\
+An I/O error happened. Please make sure you can access the file.
 
-    // ... Otherwise this is a "real" build script and we need to return a real
-    // closure. Our returned closure classifies the build script based on
-    // whether it prints `rerun-if-*`. If it *doesn't* print this it's where the
-    // magical second argument comes into play, which fingerprints a whole
-    // package. Remember that the fact that this is an `Option` is a bug, but a
-    // longstanding bug, in Cargo. Recent refactorings just made it painfully
-    // obvious.
-    let pkg_root = unit.pkg.root().to_path_buf();
-    let build_dir = build_root(build_runner);
-    let env_config = Arc::clone(build_runner.bcx.gctx.env_config()?);
-    let calculate =
-        move |deps: &BuildDeps, pkg_fingerprint: Option<&dyn Fn() -> CargoResult<String>>| {
-            if deps.rerun_if_changed.is_empty() && deps.rerun_if_env_changed.is_empty() {
-                match pkg_fingerprint {
-                    // FIXME: this is somewhat buggy with respect to docker and
-                    // weird filesystems. The `Precalculated` variant
-                    // constructed below will, for `path` dependencies, contain
-                    // a stringified version of the mtime for the local crate.
-                    // This violates one of the things we describe in this
-                    // module's doc comment, never hashing mtimes. We should
-                    // figure out a better scheme where a package fingerprint
-                    // may be a string (like for a registry) or a list of files
-                    // (like for a path dependency). Those list of files would
-                    // be stored here rather than the mtime of them.
-                    Some(f) => {
-                        let s = f()?;
-                        debug!(
-                            "old local fingerprints deps {:?} precalculated={:?}",
-                            pkg_root, s
-                        );
-                        return Ok(Some(vec![LocalFingerprint::Precalculated(s)]));
-                    }
-                    None => return Ok(None),
-                }
-            }
-
-            // Ok so now we're in "new mode" where we can have files listed as
-            // dependencies as well as env vars listed as dependencies. Process
-            // them all here.
-            Ok(Some(local_fingerprints_deps(
-                deps,
-                &build_dir,
-                &pkg_root,
-                &env_config,
-            )))
-        };
-
-    // Note that `false` == "not overridden"
-    Ok((Box::new(calculate), false))
+By default, if your project contains a build script, cargo scans all files in
+it to determine whether a rebuild is needed. If you don't expect to access the
+file, specify `rerun-if-changed` in your build script.
+See https://doc.rust-lang.org/cargo/reference/build-scripts.html#rerun-if-changed for more information.";
+    pkg_fingerprint(bcx, pkg).map_err(|err| {
+        let mut message =
+            format!("failed to determine package fingerprint for build script for {pkg}");
+        if err.root_cause().is::<io::Error>() {
+            message = format!("{}\n{}", message, IO_ERR_MESSAGE);
+        }
+        err.context(message)
+    })
 }
 
 /// Create a [`LocalFingerprint`] for an overridden build script.

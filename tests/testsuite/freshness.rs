@@ -2085,3 +2085,162 @@ fn build_script_to_old_style_rebuild() {
 "]])
         .run();
 }
+
+#[cargo_test]
+fn build_script_env_to_old_style_tracks_package() {
+    let p = project()
+        .file("data.txt", "before")
+        .file(
+            "src/main.rs",
+            r#"fn main() { println!("{}", env!("INPUT_VALUE")); }"#,
+        )
+        .file(
+            "build.rs",
+            r#"
+                fn main() {
+                    let value = std::fs::read_to_string("data.txt").unwrap();
+                    println!("cargo:rustc-env=INPUT_VALUE={value}");
+                    if std::env::var("CARGO_TEST_FINGERPRINT_MODE").as_deref() != Ok("old") {
+                        println!("cargo:rerun-if-env-changed=CARGO_TEST_FINGERPRINT_MODE");
+                    }
+                }
+            "#,
+        )
+        .build();
+
+    p.cargo("run")
+        .env("CARGO_TEST_FINGERPRINT_MODE", "new")
+        .with_stdout_data(str![["
+before
+
+"]])
+        .run();
+    p.cargo("build -v")
+        .env("CARGO_TEST_FINGERPRINT_MODE", "new")
+        .with_stderr_data(str![["
+[FRESH] foo [..]
+[FINISHED] [..]
+"]])
+        .run();
+
+    if cargo_test_support::is_coarse_mtime() {
+        cargo_test_support::sleep_ms(1000);
+    }
+    p.change_file("data.txt", "during");
+    p.cargo("run -v")
+        .env("CARGO_TEST_FINGERPRINT_MODE", "new")
+        .with_stdout_data(str![["
+before
+
+"]])
+        .with_stderr_data(str![["
+[FRESH] foo [..]
+[FINISHED] [..]
+[RUNNING] `target/debug/foo[EXE]`
+
+"]])
+        .run();
+
+    p.cargo("run -v")
+        .env("CARGO_TEST_FINGERPRINT_MODE", "old")
+        .with_stdout_data(str![["
+during
+
+"]])
+        .with_stderr_data(str![["
+[DIRTY] foo [..]
+[COMPILING] foo [..]
+[RUNNING] [..]build_script_build[..]
+[RUNNING] [..]rustc [..]src/main.rs[..]
+[FINISHED] [..]
+[RUNNING] `target/debug/foo[EXE]`
+
+"]])
+        .run();
+    p.cargo("build -v")
+        .env("CARGO_TEST_FINGERPRINT_MODE", "old")
+        .with_stderr_data(str![["
+[FRESH] foo [..]
+[FINISHED] [..]
+"]])
+        .run();
+
+    if cargo_test_support::is_coarse_mtime() {
+        cargo_test_support::sleep_ms(1000);
+    }
+    p.change_file("data.txt", "after");
+    p.cargo("run -v")
+        .env("CARGO_TEST_FINGERPRINT_MODE", "old")
+        .with_stdout_data(str![["
+after
+
+"]])
+        .with_stderr_data(str![["
+[DIRTY] foo [..]
+[COMPILING] foo [..]
+[RUNNING] [..]build_script_build[..]
+[RUNNING] [..]rustc [..]src/main.rs[..]
+[FINISHED] [..]
+[RUNNING] `target/debug/foo[EXE]`
+
+"]])
+        .run();
+    p.cargo("build -v")
+        .env("CARGO_TEST_FINGERPRINT_MODE", "old")
+        .with_stderr_data(str![["
+[FRESH] foo [..]
+[FINISHED] [..]
+"]])
+        .run();
+}
+
+#[cargo_test]
+fn build_script_old_style_snapshot_error() {
+    let p = cargo_test_support::git::new("foo", |p| {
+        p.file("Cargo.toml", &basic_manifest("foo", "1.0.0"))
+            .file("src/lib.rs", "")
+            .file(
+                "build.rs",
+                r#"
+                    fn main() {
+                        if std::env::var("CARGO_TEST_FINGERPRINT_MODE").as_deref() != Ok("old") {
+                            println!("cargo:rerun-if-env-changed=CARGO_TEST_FINGERPRINT_MODE");
+                        }
+                    }
+                "#,
+            )
+    });
+    p.cargo("build")
+        .env("CARGO_TEST_FINGERPRINT_MODE", "new")
+        .run();
+    // Keep the invalid index long enough for gix to read its checksum.
+    fs::write(p.root().join(".git/index"), b"invalid index".repeat(3)).unwrap();
+
+    p.cargo("build -v")
+        .env("CARGO_TEST_FINGERPRINT_MODE", "again")
+        .with_stderr_data(str![["
+[DIRTY] foo [..]
+[COMPILING] foo [..]
+[RUNNING] [..]build_script_build[..]
+[RUNNING] [..]rustc [..]src/lib.rs[..]
+[FINISHED] [..]
+"]])
+        .run();
+    p.cargo("build -v")
+        .env("CARGO_TEST_FINGERPRINT_MODE", "again")
+        .with_stderr_data(str![["
+[FRESH] foo [..]
+[FINISHED] [..]
+"]])
+        .run();
+
+    p.cargo("build -v")
+        .env("CARGO_TEST_FINGERPRINT_MODE", "old")
+        .with_status(101)
+        .with_stderr_contains("[RUNNING] [..]build_script_build[..]")
+        .with_stderr_contains(
+            "[..]failed to determine package fingerprint for build script for foo[..]",
+        )
+        .with_stderr_contains("[..]failed to open git index at[..]")
+        .run();
+}

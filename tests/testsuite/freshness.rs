@@ -9,6 +9,7 @@ use std::fs;
 use std::io::prelude::*;
 use std::net::TcpListener;
 use std::process::Stdio;
+use std::time::Duration;
 
 use crate::prelude::*;
 use cargo_test_support::registry::Package;
@@ -57,6 +58,74 @@ fn checksum_build_compatible_with_mtime_build() {
 
 "#]])
         .run();
+}
+
+#[cargo_test]
+fn touching_dependency_output_rebuilds_consumer() {
+    let p = project()
+        .file(
+            "Cargo.toml",
+            r#"
+                [package]
+                name = "foo"
+                version = "0.0.1"
+                edition = "2021"
+
+                [dependencies]
+                bar = { path = "bar" }
+            "#,
+        )
+        .file(
+            "src/main.rs",
+            "fn main() { println!(\"{}\", bar::value()); }",
+        )
+        .file("bar/Cargo.toml", &basic_manifest("bar", "0.0.1"))
+        .file("bar/src/lib.rs", "pub fn value() -> u32 { 7 }")
+        .build();
+
+    p.cargo("build")
+        .with_stderr_data(str![[r#"
+[LOCKING] 1 package to highest compatible version
+[COMPILING] bar v0.0.1 ([ROOT]/foo/bar)
+[COMPILING] foo v0.0.1 ([ROOT]/foo)
+[FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
+
+"#]])
+        .run();
+
+    p.cargo("build -v")
+        .with_stderr_data(str![[r#"
+[FRESH] bar v0.0.1 ([ROOT]/foo/bar)
+[FRESH] foo v0.0.1 ([ROOT]/foo)
+[FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
+
+"#]])
+        .run();
+
+    let rlib = p
+        .glob("target/debug/build/bar/*/out/libbar-*.rlib")
+        .next()
+        .unwrap()
+        .unwrap();
+    let consumer_mtime = fs::metadata(p.bin("foo")).unwrap().modified().unwrap();
+    // Change only the output timestamp, with enough separation for coarse filesystems.
+    filetime::set_file_mtime(
+        rlib,
+        filetime::FileTime::from_system_time(consumer_mtime + Duration::from_secs(2)),
+    )
+    .unwrap();
+
+    p.cargo("build -v")
+        .with_stderr_data(str![[r#"
+[FRESH] bar v0.0.1 ([ROOT]/foo/bar)
+[DIRTY] foo v0.0.1 ([ROOT]/foo): [..]
+[COMPILING] foo v0.0.1 ([ROOT]/foo)
+[RUNNING] `rustc --crate-name foo [..]
+[FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
+
+"#]])
+        .run();
+    p.process(&p.bin("foo")).with_stdout_data("7\n").run();
 }
 
 #[cargo_test]

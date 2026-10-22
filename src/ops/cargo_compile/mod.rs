@@ -203,11 +203,22 @@ fn compile_ws<'a>(
     }
     crate::workspace::gc::auto_gc(bcx.gctx);
     let build_runner = BuildRunner::new(&bcx)?;
-    if options.build_config.dry_run {
+    let compilation = if options.build_config.dry_run {
         build_runner.dry_run()
     } else {
         build_runner.compile(exec)
+    }?;
+    // Flush blob last-use tracking queued during the build. This needs a
+    // download lock to write the tracking database, and blobs were written by
+    // compilation workers that could not safely take that lock themselves.
+    if !bcx.gctx.deferred_global_last_use()?.is_empty() {
+        use crate::util::cache_lock::CacheLockMode;
+        let _lock = bcx
+            .gctx
+            .acquire_package_cache_lock(CacheLockMode::DownloadExclusive)?;
+        bcx.gctx.deferred_global_last_use()?.save_no_error(bcx.gctx);
     }
+    Ok(compilation)
 }
 
 /// Executes `rustc --print <VALUE>`.

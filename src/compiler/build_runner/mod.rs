@@ -10,6 +10,7 @@ use crate::compiler::{self, Unit, UserIntent, artifact};
 use crate::util::cache_lock::CacheLockMode;
 use crate::util::errors::CargoResult;
 use crate::workspace::PackageId;
+use crate::workspace::global_cache_tracker;
 use anyhow::{Context as _, bail};
 use cargo_util::paths;
 use cargo_util_terminal::report::{Level, Message};
@@ -207,6 +208,9 @@ impl<'a, 'gctx> BuildRunner<'a, 'gctx> {
         // Now that we've figured out everything that we're going to do, do it!
         queue.execute(&mut self)?;
 
+        // Record last-use information for blobs used during this build.
+        self.mark_blobs_used()?;
+
         // Add `OUT_DIR` to env vars if unit has a build script.
         let units_with_build_script = &self
             .bcx
@@ -312,6 +316,31 @@ impl<'a, 'gctx> BuildRunner<'a, 'gctx> {
             }
         }
         Ok(self.compilation)
+    }
+    /// Records last-use information for blobs used during this build.
+    ///
+    /// Dirty units dedup their out-dirs, fresh units re-mark their known
+    /// blobs. Deferred tracking is saved later by the normal package
+    /// download path, which holds the lock needed to write the database.
+    fn mark_blobs_used(&self) -> CargoResult<()> {
+        let blob_storage = self.files().blob_storage();
+        let hashes = blob_storage.take_used_hashes();
+        if hashes.is_empty() {
+            return Ok(());
+        }
+        let gctx = self.bcx.gctx;
+        let mut deferred = gctx.deferred_global_last_use()?;
+        for hash in hashes {
+            let size = match std::fs::metadata(blob_storage.root().join(&hash)) {
+                Ok(meta) => meta.len(),
+                Err(_) => continue,
+            };
+            deferred.mark_blob_used(global_cache_tracker::Blob {
+                hash: hash.into(),
+                size,
+            });
+        }
+        Ok(())
     }
 
     fn collect_tests_and_executables(&mut self, unit: &Unit) -> CargoResult<()> {

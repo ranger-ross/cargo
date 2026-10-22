@@ -60,9 +60,8 @@ fn checksum_build_compatible_with_mtime_build() {
         .run();
 }
 
-#[cargo_test]
-fn touching_dependency_output_rebuilds_consumer() {
-    let p = project()
+fn output_checksum_project() -> cargo_test_support::Project {
+    project()
         .file(
             "Cargo.toml",
             r#"
@@ -81,9 +80,39 @@ fn touching_dependency_output_rebuilds_consumer() {
         )
         .file("bar/Cargo.toml", &basic_manifest("bar", "0.0.1"))
         .file("bar/src/lib.rs", "pub fn value() -> u32 { 7 }")
-        .build();
+        .build()
+}
 
-    p.cargo("build")
+fn output_checksum_cargo(
+    p: &cargo_test_support::Project,
+    args: &str,
+    enabled: bool,
+) -> cargo_test_support::Execs {
+    let mut command = p.cargo(args);
+    if enabled {
+        command
+            .env("CARGO_BUILD_FINGERPRINT", "content")
+            .arg("-Zchecksum-freshness")
+            .masquerade_as_nightly_cargo(&["checksum-freshness"]);
+    } else {
+        command.env("CARGO_BUILD_FINGERPRINT", "mtime");
+    }
+    command
+}
+
+#[cargo_test]
+fn touching_dependency_output_rebuilds_consumer() {
+    check_touching_dependency_output(false);
+}
+
+#[cargo_test(nightly, reason = "requires -Zchecksum-hash-algorithm")]
+fn output_checksum_touching_dependency_output_stays_fresh() {
+    check_touching_dependency_output(true);
+}
+
+fn check_touching_dependency_output(enabled: bool) {
+    let p = output_checksum_project();
+    output_checksum_cargo(&p, "build", enabled)
         .with_stderr_data(str![[r#"
 [LOCKING] 1 package to highest compatible version
 [COMPILING] bar v0.0.1 ([ROOT]/foo/bar)
@@ -93,7 +122,7 @@ fn touching_dependency_output_rebuilds_consumer() {
 "#]])
         .run();
 
-    p.cargo("build -v")
+    output_checksum_cargo(&p, "build -v", enabled)
         .with_stderr_data(str![[r#"
 [FRESH] bar v0.0.1 ([ROOT]/foo/bar)
 [FRESH] foo v0.0.1 ([ROOT]/foo)
@@ -115,7 +144,176 @@ fn touching_dependency_output_rebuilds_consumer() {
     )
     .unwrap();
 
-    p.cargo("build -v")
+    let mut command = output_checksum_cargo(&p, "build -v", enabled);
+    if enabled {
+        command.with_stderr_data(str![[r#"
+[FRESH] bar v0.0.1 ([ROOT]/foo/bar)
+[FRESH] foo v0.0.1 ([ROOT]/foo)
+[FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
+
+"#]]);
+    } else {
+        command.with_stderr_data(str![[r#"
+[FRESH] bar v0.0.1 ([ROOT]/foo/bar)
+[DIRTY] foo v0.0.1 ([ROOT]/foo): [..]
+[COMPILING] foo v0.0.1 ([ROOT]/foo)
+[RUNNING] `rustc --crate-name foo [..]
+[FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
+
+"#]]);
+    }
+    command.run();
+    p.process(&p.bin("foo")).with_stdout_data("7\n").run();
+}
+
+#[cargo_test(nightly, reason = "requires -Zchecksum-hash-algorithm")]
+fn output_checksum_rustc_without_outputs() {
+    let p = output_checksum_project();
+    output_checksum_cargo(&p, "rustc --bin foo", true)
+        .arg("--")
+        .arg("-Zunpretty=expanded")
+        .with_stdout_contains("fn main() [..]")
+        .run();
+    output_checksum_cargo(&p, "build", true)
+        .with_stderr_contains("[COMPILING] foo v0.0.1 ([ROOT]/foo)")
+        .run();
+    p.process(&p.bin("foo")).with_stdout_data("7\n").run();
+    output_checksum_cargo(&p, "build", true)
+        .with_stderr_data(str![[r#"
+[FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
+
+"#]])
+        .run();
+}
+
+#[cargo_test(nightly, reason = "requires -Zchecksum-hash-algorithm")]
+fn output_checksum_changed_dependency_output_rebuilds_consumer() {
+    let p = output_checksum_project();
+    output_checksum_cargo(&p, "build", true).run();
+    let rlib = p
+        .glob("target/debug/build/bar/*/out/libbar-*.rlib")
+        .next()
+        .unwrap()
+        .unwrap();
+    let mut archive = fs::read(&rlib).unwrap();
+    assert_eq!(&archive[..8], b"!<arch>\n");
+    // Change an ar member's timestamp without changing its payload or validity.
+    let timestamp = if &archive[24..36] == b"1           " {
+        b"2           "
+    } else {
+        b"1           "
+    };
+    archive[24..36].copy_from_slice(timestamp);
+    fs::write(&rlib, archive).unwrap();
+    let consumer_mtime = fs::metadata(p.bin("foo")).unwrap().modified().unwrap();
+    filetime::set_file_mtime(
+        &rlib,
+        filetime::FileTime::from_system_time(consumer_mtime + Duration::from_secs(2)),
+    )
+    .unwrap();
+
+    output_checksum_cargo(&p, "build -v", true)
+        .with_stderr_data(str![[r#"
+[FRESH] bar v0.0.1 ([ROOT]/foo/bar)
+[DIRTY] foo v0.0.1 ([ROOT]/foo): [..]
+[COMPILING] foo v0.0.1 ([ROOT]/foo)
+[RUNNING] `rustc --crate-name foo [..]
+[FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
+
+"#]])
+        .run();
+    output_checksum_cargo(&p, "build -v", true)
+        .with_stderr_data(str![[r#"
+[FRESH] bar v0.0.1 ([ROOT]/foo/bar)
+[FRESH] foo v0.0.1 ([ROOT]/foo)
+[FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
+
+"#]])
+        .run();
+    p.process(&p.bin("foo")).with_stdout_data("7\n").run();
+}
+
+#[cargo_test(nightly, reason = "requires -Zchecksum-hash-algorithm")]
+fn output_checksum_separate_dependency_rebuild_ignores_output_mtime() {
+    for backdate in [Duration::ZERO, Duration::from_secs(2)] {
+        let p = output_checksum_project();
+        output_checksum_cargo(&p, "build", true).run();
+        p.root().move_into_the_past();
+        p.root().join("target").move_into_the_past();
+        let consumer_mtime = fs::metadata(p.bin("foo")).unwrap().modified().unwrap();
+        p.change_file("bar/src/lib.rs", "pub fn value() -> u32 { 9 }");
+        output_checksum_cargo(&p, "build -p bar", true)
+            .with_stderr_contains("[COMPILING] bar v0.0.1 ([ROOT]/foo/bar)")
+            .run();
+        for artifact in p.glob("target/debug/build/bar/*/out/*") {
+            filetime::set_file_mtime(
+                artifact.unwrap(),
+                filetime::FileTime::from_system_time(consumer_mtime - backdate),
+            )
+            .unwrap();
+        }
+
+        output_checksum_cargo(&p, "build -v", true)
+            .with_stderr_data(str![[r#"
+[FRESH] bar v0.0.1 ([ROOT]/foo/bar)
+[DIRTY] foo v0.0.1 ([ROOT]/foo): [..]
+[COMPILING] foo v0.0.1 ([ROOT]/foo)
+[RUNNING] `rustc --crate-name foo [..]
+[FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
+
+"#]])
+            .run();
+        p.process(&p.bin("foo")).with_stdout_data("9\n").run();
+    }
+}
+
+#[cargo_test(nightly, reason = "requires -Zchecksum-hash-algorithm")]
+fn output_checksum_pipelined_dependency_rebuild() {
+    let p = output_checksum_project();
+    p.change_file("src/lib.rs", "pub fn value() -> u32 { bar::value() }");
+    p.change_file(
+        "src/main.rs",
+        "fn main() { println!(\"{}\", foo::value()); }",
+    );
+    output_checksum_cargo(&p, "build -j2", true).run();
+    p.root().move_into_the_past();
+    p.root().join("target").move_into_the_past();
+    p.change_file("bar/src/lib.rs", "pub fn value() -> u32 { 9 }");
+    output_checksum_cargo(&p, "build -j2 -v", true)
+        .with_stderr_contains("[COMPILING] bar v0.0.1 ([ROOT]/foo/bar)")
+        .with_stderr_contains("[COMPILING] foo v0.0.1 ([ROOT]/foo)")
+        .with_stderr_contains("[RUNNING] `rustc --crate-name foo [..] src/lib.rs [..]")
+        .with_stderr_contains("[RUNNING] `rustc --crate-name foo [..] src/main.rs [..]")
+        .run();
+    output_checksum_cargo(&p, "build -j2", true)
+        .with_stderr_data(str![[r#"
+[FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
+
+"#]])
+        .run();
+    p.process(&p.bin("foo")).with_stdout_data("9\n").run();
+}
+
+#[cargo_test(nightly, reason = "requires -Zchecksum-hash-algorithm")]
+fn output_checksum_rebuild_with_identical_bytes_rotates_generation() {
+    let p = output_checksum_project();
+    output_checksum_cargo(&p, "build", true).run();
+    let state_path = p
+        .glob("target/debug/build/bar/*/fingerprint/lib-bar.json")
+        .next()
+        .unwrap()
+        .unwrap();
+    let before: serde_json::Value =
+        serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
+    fs::remove_file(state_path.with_extension("")).unwrap();
+    output_checksum_cargo(&p, "build -p bar", true)
+        .with_stderr_contains("[COMPILING] bar v0.0.1 ([ROOT]/foo/bar)")
+        .run();
+    let after: serde_json::Value = serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
+    assert_eq!(before["checksums"], after["checksums"]);
+    assert_ne!(before["output-id"], after["output-id"]);
+
+    output_checksum_cargo(&p, "build -v", true)
         .with_stderr_data(str![[r#"
 [FRESH] bar v0.0.1 ([ROOT]/foo/bar)
 [DIRTY] foo v0.0.1 ([ROOT]/foo): [..]
@@ -126,6 +324,318 @@ fn touching_dependency_output_rebuilds_consumer() {
 "#]])
         .run();
     p.process(&p.bin("foo")).with_stdout_data("7\n").run();
+}
+
+#[cargo_test(nightly, reason = "requires -Zchecksum-hash-algorithm")]
+fn output_checksum_missing_output_or_state_rebuilds() {
+    for missing_output in [false, true] {
+        let p = output_checksum_project();
+        output_checksum_cargo(&p, "build", true).run();
+        if missing_output {
+            let rlib = p
+                .glob("target/debug/build/bar/*/out/libbar-*.rlib")
+                .next()
+                .unwrap()
+                .unwrap();
+            fs::remove_file(rlib).unwrap();
+        } else {
+            let state_path = p
+                .glob("target/debug/build/bar/*/fingerprint/lib-bar.json")
+                .next()
+                .unwrap()
+                .unwrap();
+            let short_path = state_path.with_extension("");
+            let short = fs::read_to_string(&short_path).unwrap();
+            fs::write(short_path, short.split_once('\n').unwrap().0).unwrap();
+        }
+
+        output_checksum_cargo(&p, "build", true)
+            .with_stderr_data(str![[r#"
+[COMPILING] bar v0.0.1 ([ROOT]/foo/bar)
+[COMPILING] foo v0.0.1 ([ROOT]/foo)
+[FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
+
+"#]])
+            .run();
+        p.process(&p.bin("foo")).with_stdout_data("7\n").run();
+    }
+}
+
+#[cargo_test(nightly, reason = "requires -Zchecksum-hash-algorithm")]
+fn output_checksum_fresh_rehash_persists_checked_at() {
+    let p = output_checksum_project();
+    output_checksum_cargo(&p, "build", true).run();
+    let state_path = p
+        .glob("target/debug/build/bar/*/fingerprint/lib-bar.json")
+        .next()
+        .unwrap()
+        .unwrap();
+    let mut state: serde_json::Value =
+        serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
+    let checked_at = state["checked-at"].as_u64().unwrap();
+    let earlier = (checked_at / 1000 - 3600) * 1000;
+    state["checked-at"] = earlier.into();
+    fs::write(&state_path, serde_json::to_vec(&state).unwrap()).unwrap();
+    let short_path = state_path.with_extension("");
+    let short = fs::read_to_string(&short_path).unwrap();
+    let (metadata, _) = short.rsplit_once('\n').unwrap();
+    fs::write(&short_path, format!("{metadata}\n{earlier}")).unwrap();
+    // Equality must rehash too, including when mtimes have coarse resolution.
+    for artifact in p.glob("target/debug/build/bar/*/out/*") {
+        filetime::set_file_mtime(
+            artifact.unwrap(),
+            filetime::FileTime::from_system_time(
+                std::time::UNIX_EPOCH + Duration::from_millis(earlier),
+            ),
+        )
+        .unwrap();
+    }
+
+    output_checksum_cargo(&p, "build -v", true)
+        .with_stderr_data(str![[r#"
+[FRESH] bar v0.0.1 ([ROOT]/foo/bar)
+[FRESH] foo v0.0.1 ([ROOT]/foo)
+[FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
+
+"#]])
+        .run();
+    let refreshed: serde_json::Value =
+        serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
+    let refreshed_at = refreshed["checked-at"].as_u64().unwrap();
+    assert!(refreshed_at > earlier);
+    assert_eq!(state["output-id"], refreshed["output-id"]);
+    assert_eq!(state["checksums"], refreshed["checksums"]);
+    let refreshed_short = fs::read_to_string(short_path).unwrap();
+    assert_eq!(
+        refreshed_short.rsplit_once('\n').unwrap().1,
+        refreshed_at.to_string()
+    );
+}
+
+#[cargo_test(nightly, reason = "requires -Zchecksum-hash-algorithm")]
+fn output_checksum_fresh_header_does_not_require_json() {
+    let p = output_checksum_project();
+    output_checksum_cargo(&p, "build", true).run();
+    let state_path = p
+        .glob("target/debug/build/bar/*/fingerprint/lib-bar.json")
+        .next()
+        .unwrap()
+        .unwrap();
+    let before: serde_json::Value =
+        serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
+    let short_path = state_path.with_extension("");
+    let short = fs::read_to_string(&short_path).unwrap();
+    // Make the header's mtime fast path certain, even on coarse filesystems.
+    p.root().join("target").move_into_the_past();
+    fs::remove_file(&state_path).unwrap();
+
+    output_checksum_cargo(&p, "build -v", true)
+        .with_stderr_data(str![[r#"
+[FRESH] bar v0.0.1 ([ROOT]/foo/bar)
+[FRESH] foo v0.0.1 ([ROOT]/foo)
+[FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
+
+"#]])
+        .run();
+    assert!(!state_path.exists());
+    assert_eq!(short, fs::read_to_string(&short_path).unwrap());
+    p.process(&p.bin("foo")).with_stdout_data("7\n").run();
+
+    let touched = filetime::FileTime::from_system_time(
+        std::time::UNIX_EPOCH
+            + Duration::from_millis(before["checked-at"].as_u64().unwrap())
+            + Duration::from_secs(2),
+    );
+    for artifact in p.glob("target/debug/build/bar/*/out/*") {
+        filetime::set_file_mtime(artifact.unwrap(), touched).unwrap();
+    }
+    output_checksum_cargo(&p, "build", true)
+        .with_stderr_data(str![[r#"
+[COMPILING] bar v0.0.1 ([ROOT]/foo/bar)
+[COMPILING] foo v0.0.1 ([ROOT]/foo)
+[FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
+
+"#]])
+        .run();
+    let after: serde_json::Value = serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
+    assert_ne!(before["output-id"], after["output-id"]);
+    p.process(&p.bin("foo")).with_stdout_data("7\n").run();
+}
+
+#[cargo_test(nightly, reason = "requires -Zchecksum-hash-algorithm")]
+fn output_checksum_mismatched_json_generation_rebuilds() {
+    let p = output_checksum_project();
+    output_checksum_cargo(&p, "build", true).run();
+    let state_path = p
+        .glob("target/debug/build/bar/*/fingerprint/lib-bar.json")
+        .next()
+        .unwrap()
+        .unwrap();
+    let mut state: serde_json::Value =
+        serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
+    let original_id = state["output-id"].clone();
+    let mismatched_id = u128::from_str_radix(original_id.as_str().unwrap(), 16).unwrap() ^ 1;
+    state["output-id"] = format!("{mismatched_id:032x}").into();
+    fs::write(&state_path, serde_json::to_vec(&state).unwrap()).unwrap();
+    // Leave the original header intact, but force loading the mismatched JSON.
+    let touched = filetime::FileTime::from_system_time(
+        std::time::UNIX_EPOCH
+            + Duration::from_millis(state["checked-at"].as_u64().unwrap())
+            + Duration::from_secs(2),
+    );
+    for artifact in p.glob("target/debug/build/bar/*/out/*") {
+        filetime::set_file_mtime(artifact.unwrap(), touched).unwrap();
+    }
+    output_checksum_cargo(&p, "build", true)
+        .with_stderr_data(str![[r#"
+[COMPILING] bar v0.0.1 ([ROOT]/foo/bar)
+[COMPILING] foo v0.0.1 ([ROOT]/foo)
+[FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
+
+"#]])
+        .run();
+    let rebuilt: serde_json::Value =
+        serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
+    assert_ne!(original_id, rebuilt["output-id"]);
+    assert_ne!(state["output-id"], rebuilt["output-id"]);
+    p.process(&p.bin("foo")).with_stdout_data("7\n").run();
+}
+
+#[cargo_test(nightly, reason = "requires -Zchecksum-hash-algorithm")]
+fn output_checksum_invalid_header_rebuilds() {
+    let p = output_checksum_project();
+    output_checksum_cargo(&p, "build", true).run();
+    let short_path = p
+        .glob("target/debug/build/bar/*/fingerprint/lib-bar")
+        .next()
+        .unwrap()
+        .unwrap();
+    let short = fs::read_to_string(&short_path).unwrap();
+    let hash = short.split_once('\n').unwrap().0;
+    fs::write(&short_path, format!("{hash}\n")).unwrap();
+    output_checksum_cargo(&p, "build", true)
+        .with_stderr_data(str![[r#"
+[COMPILING] bar v0.0.1 ([ROOT]/foo/bar)
+[COMPILING] foo v0.0.1 ([ROOT]/foo)
+[FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
+
+"#]])
+        .run();
+    p.process(&p.bin("foo")).with_stdout_data("7\n").run();
+}
+
+#[cargo_test(nightly, reason = "requires -Zchecksum-hash-algorithm")]
+fn output_checksum_mode_switch_rebuilds() {
+    let p = output_checksum_project();
+    output_checksum_cargo(&p, "build", false).run();
+    for enabled in [true, false, true] {
+        output_checksum_cargo(&p, "build", enabled)
+            .with_stderr_data(str![[r#"
+[COMPILING] bar v0.0.1 ([ROOT]/foo/bar)
+[COMPILING] foo v0.0.1 ([ROOT]/foo)
+[FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
+
+"#]])
+            .run();
+        output_checksum_cargo(&p, "build", enabled)
+            .with_stderr_data(str![[r#"
+[FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
+
+"#]])
+            .run();
+    }
+    p.process(&p.bin("foo")).with_stdout_data("7\n").run();
+}
+
+#[cargo_test(nightly, reason = "requires -Zchecksum-hash-algorithm")]
+fn output_checksum_failed_dependency_rebuild_does_not_reuse_generation() {
+    let p = output_checksum_project();
+    output_checksum_cargo(&p, "build", true).run();
+    p.root().move_into_the_past();
+    p.root().join("target").move_into_the_past();
+    let source = p.root().join("bar/src/lib.rs");
+    let original_mtime =
+        filetime::FileTime::from_last_modification_time(&fs::metadata(&source).unwrap());
+    p.change_file(
+        "bar/src/lib.rs",
+        "compile_error!(\"output checksum intentional failure\");",
+    );
+    output_checksum_cargo(&p, "build -j2", true)
+        .with_status(101)
+        .with_stderr_contains("[ERROR] output checksum intentional failure")
+        .run();
+
+    p.change_file("bar/src/lib.rs", "pub fn value() -> u32 { 7 }");
+    filetime::set_file_mtime(source, original_mtime).unwrap();
+    output_checksum_cargo(&p, "build -j2", true)
+        .with_stderr_data(str![[r#"
+[COMPILING] bar v0.0.1 ([ROOT]/foo/bar)
+[COMPILING] foo v0.0.1 ([ROOT]/foo)
+[FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
+
+"#]])
+        .run();
+    p.process(&p.bin("foo")).with_stdout_data("7\n").run();
+}
+
+#[cargo_test(nightly, reason = "requires -Zchecksum-hash-algorithm")]
+fn output_checksum_forced_roots_rotate_generation() {
+    let p = project()
+        .file("src/lib.rs", "pub fn value() -> u32 { 7 }")
+        .file(
+            "src/main.rs",
+            "extern crate foo; fn main() { println!(\"{}\", foo::value()); }",
+        )
+        .build();
+    output_checksum_cargo(&p, "fix --lib --bins --allow-no-vcs", true).run();
+    let before: Vec<_> = ["lib-foo", "bin-foo"]
+        .into_iter()
+        .map(|target| {
+            let path = p
+                .glob(format!(
+                    "target/debug/build/foo/*/fingerprint/{target}.json"
+                ))
+                .next()
+                .unwrap()
+                .unwrap();
+            let state: serde_json::Value =
+                serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            (path, state)
+        })
+        .collect();
+
+    output_checksum_cargo(&p, "fix --lib --bins --allow-no-vcs", true).run();
+    for (path, previous) in before {
+        let current: serde_json::Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+        assert_ne!(previous["output-id"], current["output-id"]);
+        assert_eq!(previous["checksums"], current["checksums"]);
+    }
+    output_checksum_cargo(&p, "check --lib --bins", true)
+        .with_stderr_data(str![[r#"
+[FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
+
+"#]])
+        .run();
+}
+
+#[cargo_test(nightly, reason = "requires -Zchecksum-hash-algorithm")]
+fn content_fingerprint_detects_source_change_with_preserved_mtime() {
+    let p = output_checksum_project();
+    output_checksum_cargo(&p, "build", true).run();
+    let source = p.root().join("bar/src/lib.rs");
+    let original_mtime =
+        filetime::FileTime::from_last_modification_time(&fs::metadata(&source).unwrap());
+    p.change_file("bar/src/lib.rs", "pub fn value() -> u32 { 9 }");
+    filetime::set_file_mtime(source, original_mtime).unwrap();
+    output_checksum_cargo(&p, "build", true)
+        .with_stderr_data(str![[r#"
+[COMPILING] bar v0.0.1 ([ROOT]/foo/bar)
+[COMPILING] foo v0.0.1 ([ROOT]/foo)
+[FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
+
+"#]])
+        .run();
+    p.process(&p.bin("foo")).with_stdout_data("9\n").run();
 }
 
 #[cargo_test]

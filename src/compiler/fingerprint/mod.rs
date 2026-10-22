@@ -34,7 +34,7 @@
 //!      dep-info, then the unit is dirty.
 //!
 //!  - Alternatively if you're using the unstable feature `checksum-freshness`
-//!    mtimes are ignored entirely in favor of comparing first the file size, and
+//!    source mtimes are ignored in favor of comparing first the file size, and
 //!    then the checksum with a known prior value emitted by rustc. Only nightly
 //!    rustc will emit the needed metadata at the time of writing. This is dependent
 //!    on the unstable feature `-Z checksum-hash-algorithm`.
@@ -127,7 +127,8 @@
 //!
 //! - A file with a 16 hex-digit hash. This is the Fingerprint hash, used for
 //!   quick loading and comparison.
-//! - A `.json` file that contains details about the Fingerprint. This is only
+//!   Content freshness appends a version, output ID, and Unix-millisecond check time.
+//! - A `.json` file that contains details about the Fingerprint. This is also
 //!   used to log details about *why* a fingerprint is considered dirty.
 //!   `CARGO_LOG=cargo::compiler::fingerprint=trace cargo build` can be
 //!   used to display this log information.
@@ -227,7 +228,7 @@
 //! The status of whether or not the mtime is "stale" or "up-to-date" is
 //! stored in [`Fingerprint::fs_status`].
 //!
-//! All units will compare the mtime of its newest output file with the mtimes
+//! In mtime mode, units compare the mtime of their newest output with the mtimes
 //! of the outputs of all its dependencies. If any output file is missing,
 //! then the unit is stale. If any dependency is newer, the unit is stale.
 //!
@@ -378,6 +379,7 @@
 
 mod dep_info;
 mod dirty_reason;
+mod output;
 mod rustdoc;
 
 use crate::util::data_structures::HashMap;
@@ -426,6 +428,7 @@ pub use self::dep_info::parse_dep_info;
 pub use self::dep_info::parse_rustc_dep_info;
 pub use self::dep_info::translate_dep_info;
 pub use self::dirty_reason::DirtyReason;
+use self::output::OutputFingerprint;
 pub use self::rustdoc::RustdocFingerprint;
 
 /// Result of comparing fingerprints between the current and previous builds.
@@ -497,8 +500,19 @@ pub fn prepare_target(
     }
 
     let Some(dirty_reason) = dirty_reason else {
+        if fingerprint
+            .output
+            .as_ref()
+            .is_some_and(|output| output.lock().unwrap().refreshed)
+        {
+            persist_fingerprint(&loc, &fingerprint)?;
+        }
         return Ok(Job::new_fresh());
     };
+
+    if let Some(output) = &fingerprint.output {
+        output.lock().unwrap().begin_build();
+    }
 
     // We're going to rebuild, so ensure the source of the crate passes all
     // verification checks before we build it.
@@ -685,6 +699,13 @@ pub struct Fingerprint {
     /// fingerprints output files are regenerated and look newer than this one.
     #[serde(skip)]
     outputs: Vec<PathBuf>,
+    /// The short fingerprint from the previous build
+    /// This avoids us needing to read the file multiple times
+    #[serde(skip)]
+    persisted_fingerprint: Option<String>,
+    /// Output tracking state, if enabled and the unit has expected output files.
+    #[serde(flatten)]
+    output: Option<Mutex<OutputFingerprint>>,
 }
 
 /// Indication of the status on the filesystem for a particular unit.
@@ -767,7 +788,7 @@ impl Serialize for DepFingerprint {
             &self.pkg_id,
             &self.name,
             &self.public,
-            &self.fingerprint.hash_u64(),
+            &self.fingerprint.dependency_hash(),
         )
             .serialize(ser)
     }
@@ -1055,6 +1076,8 @@ impl Fingerprint {
             index: UnitIndex::default(),
             fs_status: FsStatus::Stale,
             outputs: Vec::new(),
+            output: None,
+            persisted_fingerprint: None,
         }
     }
 
@@ -1077,12 +1100,60 @@ impl Fingerprint {
         ret
     }
 
+    fn dependency_hash(&self) -> u64 {
+        let hash = self.hash_u64();
+        match &self.output {
+            Some(output) => util::hash_u64((hash, output.lock().unwrap().output_id)),
+            None => hash,
+        }
+    }
+
+    fn check_outputs(&mut self, mtimes: &HashMap<PathBuf, FileTime>, loc: &Path) -> bool {
+        let Some(output) = &mut self.output else {
+            return true;
+        };
+        let persisted_fingerprint = self.persisted_fingerprint.as_deref();
+        let load = || {
+            let short = persisted_fingerprint.context("missing fingerprint")?;
+            Ok(load_fingerprint(loc, short)?
+                .output
+                .context("missing output fingerprint")?
+                .into_inner()
+                .unwrap())
+        };
+        match output
+            .get_mut()
+            .unwrap()
+            .compare(&self.outputs, mtimes, load)
+        {
+            Ok(fresh) => fresh,
+            Err(error) => {
+                debug!("output fingerprint validation failed: {error:#}");
+                false
+            }
+        }
+    }
+
     /// Compares this fingerprint with an old version which was previously
     /// serialized to filesystem.
     ///
     /// The purpose of this is exclusively to produce a diagnostic message
     /// [`DirtyReason`], indicating why we're recompiling something.
     fn compare(&self, old: &Fingerprint) -> DirtyReason {
+        if self.output.is_some() != old.output.is_some() {
+            return DirtyReason::FingerprintMethodChanged {
+                old: if old.output.is_some() {
+                    FingerprintMethod::Content
+                } else {
+                    FingerprintMethod::Mtime
+                },
+                new: if self.output.is_some() {
+                    FingerprintMethod::Content
+                } else {
+                    FingerprintMethod::Mtime
+                },
+            };
+        }
         if self.rustc != old.rustc {
             return DirtyReason::RustcChanged;
         }
@@ -1227,7 +1298,7 @@ impl Fingerprint {
                 };
             }
 
-            if a.fingerprint.hash_u64() != b.fingerprint.hash_u64() {
+            if a.fingerprint.dependency_hash() != b.fingerprint.dependency_hash() {
                 return DirtyReason::UnitDependencyInfoChanged {
                     unit: a.fingerprint.index,
                 };
@@ -1262,6 +1333,7 @@ impl Fingerprint {
         ws_root: &Path,
         cargo_exe: &Path,
         gctx: &GlobalContext,
+        loc: &Path,
     ) -> CargoResult<()> {
         assert!(!self.fs_status.up_to_date());
 
@@ -1312,6 +1384,12 @@ impl Fingerprint {
                     return Ok(());
                 }
             };
+
+            if self.output.is_some() {
+                // Dependency output checksums are included in the fingerprint hash
+                // so no need to check them here.
+                continue;
+            }
 
             // If our dependency edge only requires the rmeta file to be present
             // then we only need to look at that one output file, otherwise we
@@ -1379,6 +1457,10 @@ impl Fingerprint {
             }
         }
 
+        if !self.check_outputs(&mtimes, loc) {
+            return Ok(());
+        }
+
         // Everything was up to date! Record such.
         self.fs_status = FsStatus::UpToDate { mtimes };
         debug!("filesystem up-to-date {:?}", pkg_root);
@@ -1431,7 +1513,7 @@ impl hash::Hash for Fingerprint {
             name.hash(h);
             public.hash(h);
             // use memoized dep hashes to avoid exponential blowup
-            h.write_u64(fingerprint.hash_u64());
+            h.write_u64(fingerprint.dependency_hash());
         }
     }
 }
@@ -1556,9 +1638,26 @@ fn calculate(build_runner: &mut BuildRunner<'_, '_>, unit: &Unit) -> CargoResult
         calculate_normal(build_runner, unit)?
     };
 
+    // We cannot calculate the output content from the inputs, instead we load
+    // it from the previous fingerprint. We verify that the outputs haven't
+    // changed from what was in the previous fingerprint in check_filesystem().
+    let build_root = build_root(build_runner);
+    let loc = build_runner.files().fingerprint_file_path(unit, "");
+    fingerprint.persisted_fingerprint = paths::read(&loc).ok();
+    if !fingerprint.outputs.is_empty()
+        && build_runner.bcx.gctx.cli_unstable().checksum_freshness
+        && build_runner.bcx.gctx.build_config()?.fingerprint == Some(FingerprintMethod::Content)
+    {
+        let output = fingerprint
+            .persisted_fingerprint
+            .as_deref()
+            .and_then(|short| OutputFingerprint::from_short_fingerprint(short, build_root.clone()))
+            .unwrap_or_else(|| OutputFingerprint::new(build_root.clone()));
+        fingerprint.output = Some(Mutex::new(output));
+    }
+
     // After we built the initial `Fingerprint` be sure to update the
     // `fs_status` field of it.
-    let build_root = build_root(build_runner);
     let ws_root = build_runner.bcx.ws.root();
     let cargo_exe = build_runner.bcx.gctx.cargo_exe()?;
     fingerprint.check_filesystem(
@@ -1569,6 +1668,7 @@ fn calculate(build_runner: &mut BuildRunner<'_, '_>, unit: &Unit) -> CargoResult
         ws_root,
         cargo_exe,
         build_runner.bcx.gctx,
+        &loc,
     )?;
 
     let fingerprint = Arc::new(fingerprint);
@@ -1728,6 +1828,8 @@ fn calculate_normal(
         rustflags: extra_flags,
         fs_status: FsStatus::Stale,
         outputs,
+        output: None,
+        persisted_fingerprint: None,
     })
 }
 
@@ -1974,16 +2076,52 @@ fn local_fingerprints_deps(
     local
 }
 
+fn load_fingerprint(loc: &Path, short: &str) -> CargoResult<Fingerprint> {
+    let json = paths::read(&loc.with_extension("json"))?;
+    let fingerprint: Fingerprint =
+        serde_json::from_str(&json).with_context(|| internal("failed to deserialize json"))?;
+    // The marker is empty after an interrupted build.
+    if !short.is_empty() {
+        debug_assert_eq!(util::to_hex(fingerprint.hash_u64()), short_hash(short));
+    }
+    Ok(fingerprint)
+}
+
+fn short_hash(short: &str) -> &str {
+    short.split_once('\n').map_or(short, |(hash, _)| hash)
+}
+
 /// Writes the short fingerprint hash value to `<loc>`
 /// and logs detailed JSON information to `<loc>.json`.
 fn write_fingerprint(loc: &Path, fingerprint: &Fingerprint) -> CargoResult<()> {
+    if let Some(output) = &fingerprint.output {
+        if let Err(error) = output.lock().unwrap().finish_build(&fingerprint.outputs) {
+            if error
+                .downcast_ref::<io::Error>()
+                .is_some_and(|error| error.kind() == io::ErrorKind::NotFound)
+            {
+                // `cargo rustc` may intentionally omit expected outputs.
+                return Ok(());
+            }
+            return Err(error);
+        }
+    }
+    persist_fingerprint(loc, fingerprint)
+}
+
+fn persist_fingerprint(loc: &Path, fingerprint: &Fingerprint) -> CargoResult<()> {
     debug_assert_ne!(fingerprint.rustc, 0);
     // fingerprint::new().rustc == 0, make sure it doesn't make it to the file system.
     // This is mostly so outside tools can reliably find out what rust version this file is for,
     // as we can use the full hash.
     let hash = fingerprint.hash_u64();
     debug!("write fingerprint ({:x}) : {}", hash, loc.display());
-    paths::write(loc, util::to_hex(hash).as_bytes())?;
+
+    let mut short = util::to_hex(hash);
+    if let Some(output) = &fingerprint.output {
+        output.lock().unwrap().append_to_short(&mut short)?;
+    }
+    paths::write(loc, short.as_bytes())?;
 
     let json = serde_json::to_string(fingerprint).unwrap();
     if cfg!(debug_assertions) {
@@ -2018,7 +2156,7 @@ fn build_root(build_runner: &BuildRunner<'_, '_>) -> PathBuf {
     build_runner.bcx.ws.build_dir().into_path_unlocked()
 }
 
-/// Reads the value from the old fingerprint hash file and compare.
+/// Compares the saved short fingerprint with the current fingerprint.
 ///
 /// If dirty, it then restores the detailed information
 /// from the fingerprint JSON file, and provides an rich dirty reason.
@@ -2071,24 +2209,20 @@ fn _compare_old_fingerprint(
     old_hash_path: &Path,
     new_fingerprint: &Fingerprint,
 ) -> CargoResult<FingerprintComparison> {
-    let old_fingerprint_short = paths::read(old_hash_path)?;
+    let old_fingerprint_short = new_fingerprint
+        .persisted_fingerprint
+        .as_deref()
+        .context("failed to read fingerprint")?;
 
     let new_hash = new_fingerprint.hash_u64();
 
-    if util::to_hex(new_hash) == old_fingerprint_short && new_fingerprint.fs_status.up_to_date() {
+    if util::to_hex(new_hash) == short_hash(old_fingerprint_short)
+        && new_fingerprint.fs_status.up_to_date()
+    {
         return Ok(FingerprintComparison::Fresh);
     }
 
-    let old_fingerprint_json = paths::read(&old_hash_path.with_extension("json"))?;
-    let old_fingerprint: Fingerprint = serde_json::from_str(&old_fingerprint_json)
-        .with_context(|| internal("failed to deserialize json"))?;
-    // Fingerprint can be empty after a failed rebuild (see comment in prepare_target).
-    if !old_fingerprint_short.is_empty() {
-        debug_assert_eq!(
-            util::to_hex(old_fingerprint.hash_u64()),
-            old_fingerprint_short
-        );
-    }
+    let old_fingerprint = load_fingerprint(old_hash_path, old_fingerprint_short)?;
 
     let reason = new_fingerprint.compare(&old_fingerprint);
     Ok(FingerprintComparison::Dirty { reason })

@@ -949,6 +949,84 @@ warning: no files deleted due to --dry-run
             .raw(),
         )
         .run();
+
+    p.cargo("clean")
+        .env("CARGO_CACHE_RUSTC_INFO", "0")
+        .with_stderr_data(
+            str![[r#"
+     Removed 2 files, 1.0KiB total
+
+"#]]
+            .raw(),
+        )
+        .run();
+}
+
+#[cfg(target_os = "linux")]
+#[cargo_test]
+fn clean_accounts_for_reflinks() {
+    use rand::{RngExt, SeedableRng};
+    use std::fs::{File, OpenOptions};
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::FileExt;
+
+    let p = project()
+        .file("src/lib.rs", "")
+        .file("target/debug/original.bin", "")
+        .build();
+    let original = p.target_debug_dir().join("original.bin");
+    let mut rng = rand::rngs::StdRng::seed_from_u64(0);
+    let contents: Vec<u8> = (0..65536).map(|_| rng.random()).collect();
+    std::fs::write(&original, &contents).unwrap();
+    let source = File::open(&original).unwrap();
+    source.sync_all().unwrap();
+    for name in ["clone.bin", "modified.bin"] {
+        let cloned = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(p.target_debug_dir().join(name))
+            .unwrap();
+        if unsafe { libc::ioctl(cloned.as_raw_fd(), libc::FICLONE, source.as_raw_fd()) } == -1 {
+            let error = std::io::Error::last_os_error();
+            if matches!(
+                error.raw_os_error(),
+                Some(libc::EOPNOTSUPP | libc::ENOTTY | libc::EINVAL)
+            ) {
+                eprintln!("skipping reflink test: {error}");
+                return;
+            }
+            panic!("cloning failed: {error}");
+        }
+        if name == "modified.bin" {
+            cloned.write_all_at(&contents[..4096], 16384).unwrap();
+        }
+        cloned.sync_all().unwrap();
+    }
+    std::fs::hard_link(&original, p.target_debug_dir().join("hardlink.bin")).unwrap();
+
+    p.cargo("clean --dry-run")
+        .env("CARGO_CACHE_RUSTC_INFO", "0")
+        .with_stderr_data(
+            str![[r#"
+     Summary 4 files, 68.0KiB total
+warning: no files deleted due to --dry-run
+
+"#]]
+            .raw(),
+        )
+        .run();
+    assert_eq!(std::fs::read(&original).unwrap(), contents);
+    p.cargo("clean")
+        .env("CARGO_CACHE_RUSTC_INFO", "0")
+        .with_stderr_data(
+            str![[r#"
+     Removed 4 files, 68.0KiB total
+
+"#]]
+            .raw(),
+        )
+        .run();
+    assert!(!p.target_debug_dir().exists());
 }
 
 #[cargo_test]

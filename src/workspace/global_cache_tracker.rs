@@ -210,6 +210,15 @@ pub struct GitCheckout {
     pub size: Option<u64>,
 }
 
+/// The key for a blob storage entry in the database.
+#[derive(Clone, Debug, Hash, Eq, PartialEq)]
+pub struct Blob {
+    /// The content hash of the blob, which is also its filename.
+    pub hash: InternedString,
+    /// The size of the blob file in bytes.
+    pub size: u64,
+}
+
 /// Filesystem paths in the global cache.
 ///
 /// Accessing these assumes a lock has already been acquired.
@@ -224,6 +233,8 @@ struct BasePaths {
     crate_dir: PathBuf,
     /// Root path to the `src` directories.
     src: PathBuf,
+    /// Root path to the blob storage files.
+    blob: PathBuf,
 }
 
 /// Migrations which initialize the database, and can be used to evolve it over time.
@@ -304,6 +315,31 @@ fn migrations() -> Vec<Migration> {
             )?;
             Ok(())
         }),
+        // Blob storage files for content-addressed deduplication.
+        //
+        // This is `IF NOT EXISTS` rather than a plain `CREATE TABLE` because
+        // an earlier revision of this change briefly placed the blob migration
+        // before `global_data`. Databases that ran that ordering applied the
+        // blob table and the `global_data` insert twice, ending with a
+        // `user_version` that skips this entry. Keep this last so existing
+        // databases pick it up as a new pending migration.
+        basic_migration(
+            "CREATE TABLE IF NOT EXISTS blob (
+                name TEXT PRIMARY KEY NOT NULL,
+                size INTEGER NOT NULL,
+                timestamp INTEGER NOT NULL
+             )",
+        ),
+        // Catch-up for databases that ran a brief revision ordering the blob
+        // table before `global_data`. Those end at `user_version = 8` without
+        // a blob table, so the entry above is skipped as already applied.
+        basic_migration(
+            "CREATE TABLE IF NOT EXISTS blob (
+                name TEXT PRIMARY KEY NOT NULL,
+                size INTEGER NOT NULL,
+                timestamp INTEGER NOT NULL
+             )",
+        ),
     ]
 }
 
@@ -513,6 +549,23 @@ impl GlobalCacheTracker {
         Ok(rows)
     }
 
+    /// Returns all blob storage timestamps.
+    pub fn blob_all(&self) -> CargoResult<Vec<(Blob, Timestamp)>> {
+        let mut stmt = self
+            .conn
+            .prepare_cached("SELECT name, size, timestamp FROM blob")?;
+        let rows = stmt
+            .query_map([], |row| {
+                let hash = row.get_unwrap(0);
+                let size = row.get_unwrap(1);
+                let timestamp = row.get_unwrap(2);
+                let kind = Blob { hash, size };
+                Ok((kind, timestamp))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     /// Returns whether or not an auto GC should be performed, compared to the
     /// last time it was recorded in the database.
     pub fn should_run_auto_gc(&mut self, frequency: Duration) -> CargoResult<bool> {
@@ -560,14 +613,14 @@ impl GlobalCacheTracker {
             git_co: gctx.git_checkouts_path().into_path_unlocked(),
             crate_dir: gctx.registry_cache_path().into_path_unlocked(),
             src: gctx.registry_source_path().into_path_unlocked(),
+            blob: gctx.blob_storage_path().into_path_unlocked(),
         };
         let now = now();
         trace!(target: "gc", "cleaning {gc_opts:?}");
         let tx = self.conn.transaction()?;
         let mut delete_paths = Vec::new();
         // This can be an expensive operation, so only perform it if necessary.
-        if gc_opts.is_download_cache_opt_set() {
-            // TODO: Investigate how slow this might be.
+        if gc_opts.is_download_cache_opt_set() || gc_opts.is_blob_cache_opt_set() {
             Self::sync_db_with_files(
                 &tx,
                 now,
@@ -610,6 +663,10 @@ impl GlobalCacheTracker {
             let max_age = now - max_age.as_secs();
             Self::get_git_co_items_to_clean(&tx, max_age, &base.git_co, &mut delete_paths)?;
         }
+        if let Some(max_age) = gc_opts.max_blob_age {
+            let max_age = now - max_age.as_secs();
+            Self::get_blob_items_to_clean_age(&tx, max_age, &base.blob, &mut delete_paths)?;
+        }
         // Size collection must happen after date collection so that dates
         // have precedence, since size constraints are a more blunt
         // instrument.
@@ -643,6 +700,9 @@ impl GlobalCacheTracker {
         }
         if let Some(max_size) = gc_opts.max_git_size {
             Self::get_git_items_to_clean_size(&tx, max_size, &base, &mut delete_paths)?;
+        }
+        if let Some(max_size) = gc_opts.max_blob_size {
+            Self::get_blob_items_to_clean_size(&tx, max_size, &base.blob, &mut delete_paths)?;
         }
         if let Some(max_size) = gc_opts.max_download_size {
             Self::get_registry_items_to_clean_size_both(&tx, max_size, &base, &mut delete_paths)?;
@@ -741,7 +801,7 @@ impl GlobalCacheTracker {
             &base.src,
         )?;
         Self::update_db_for_removed(conn, GIT_DB_TABLE, "git_id", GIT_CO_TABLE, &base.git_co)?;
-
+        Self::update_blob_db_for_removed(conn, &base.blob)?;
         // For registry_index and git_db, remove anything from the db that
         // isn't on disk.
         //
@@ -762,9 +822,10 @@ impl GlobalCacheTracker {
             delete_paths,
         )?;
 
-        // For registry_crate, registry_src, and git_checkout, add anything
-        // that is missing in the db.
+        // For registry_crate, registry_src, git_checkout, and blobs, add
+        // anything that is missing in the db.
         Self::populate_untracked_crate(conn, now, &base.crate_dir)?;
+        Self::populate_untracked_blob(conn, now, &base.blob)?;
         Self::populate_untracked(
             conn,
             now,
@@ -931,6 +992,48 @@ impl GlobalCacheTracker {
                 let size = paths::metadata(index_path.join(&crate_name))?.len();
                 insert_stmt.execute(params![id, crate_name, size, now])?;
             }
+        }
+        Ok(())
+    }
+
+    /// Removes database entries for any blobs that are not on disk.
+    #[tracing::instrument(skip(conn, base_path))]
+    fn update_blob_db_for_removed(conn: &Connection, base_path: &Path) -> CargoResult<()> {
+        trace!(target: "gc", "checking for db entries to remove from blob");
+        let mut select_stmt = conn.prepare_cached("SELECT rowid, name FROM blob")?;
+        let mut delete_stmt = conn.prepare_cached("DELETE FROM blob WHERE rowid = ?1")?;
+        let mut rows = select_stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            let rowid: i64 = row.get_unwrap(0);
+            let name: String = row.get_unwrap(1);
+            if !base_path.join(&name).exists() {
+                delete_stmt.execute([rowid])?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Updates the database to add any blob files that are currently
+    /// not tracked (such as when they are written by an older version of
+    /// cargo).
+    #[tracing::instrument(skip(conn, now, base_path))]
+    fn populate_untracked_blob(
+        conn: &Connection,
+        now: Timestamp,
+        base_path: &Path,
+    ) -> CargoResult<()> {
+        trace!(target: "gc", "populating untracked blob files");
+        let mut insert_stmt = conn.prepare_cached(
+            "INSERT INTO blob (name, size, timestamp)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT DO NOTHING",
+        )?;
+        let names = Self::read_dir_with_filter(base_path, &|entry| {
+            entry.file_type().map_or(false, |ty| ty.is_file())
+        })?;
+        for name in names {
+            let size = paths::metadata(base_path.join(&name))?.len();
+            insert_stmt.execute(params![name, size, now])?;
         }
         Ok(())
     }
@@ -1355,6 +1458,64 @@ impl GlobalCacheTracker {
         }
         Ok(())
     }
+
+    /// Adds paths to delete from `blob` whose last use is older than the
+    /// given timestamp.
+    fn get_blob_items_to_clean_age(
+        conn: &Connection,
+        max_age: Timestamp,
+        base_path: &Path,
+        delete_paths: &mut Vec<PathBuf>,
+    ) -> CargoResult<()> {
+        debug!(target: "gc", "cleaning blob since {max_age:?}");
+        let mut stmt = conn.prepare_cached(
+            "DELETE FROM blob WHERE timestamp < ?1
+                RETURNING name",
+        )?;
+        let mut rows = stmt.query([max_age])?;
+        while let Some(row) = rows.next()? {
+            let name: String = row.get_unwrap(0);
+            delete_paths.push(base_path.join(&name));
+        }
+        Ok(())
+    }
+
+    /// Adds paths to delete from `blob` in order to keep the total size
+    /// under the given max size.
+    fn get_blob_items_to_clean_size(
+        conn: &Connection,
+        max_size: u64,
+        base_path: &Path,
+        delete_paths: &mut Vec<PathBuf>,
+    ) -> CargoResult<()> {
+        debug!(target: "gc", "cleaning blob till under {max_size:?}");
+        let total_size: u64 =
+            conn.query_row("SELECT coalesce(SUM(size), 0) FROM blob", [], |row| {
+                row.get(0)
+            })?;
+        if total_size <= max_size {
+            return Ok(());
+        }
+        let mut stmt = conn.prepare(
+            "DELETE FROM blob WHERE rowid IN \
+                (SELECT x.rowid FROM \
+                    (SELECT rowid, size, SUM(size) OVER \
+                        (ORDER BY timestamp, name ROWS UNBOUNDED PRECEDING) AS running_amount \
+                        FROM blob) x \
+                    WHERE coalesce(x.running_amount, 0) - x.size < ?1) \
+                RETURNING name;",
+        )?;
+        let rows = stmt
+            .query_map(params![total_size - max_size], |row| {
+                let name: String = row.get_unwrap(0);
+                Ok(name)
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        for name in rows {
+            delete_paths.push(base_path.join(name));
+        }
+        Ok(())
+    }
 }
 
 /// Helper to generate the upsert for the parent tables.
@@ -1443,6 +1604,8 @@ pub struct DeferredGlobalLastUse {
     git_db_timestamps: HashMap<GitDb, Timestamp>,
     /// New git checkout entries to insert.
     git_checkout_timestamps: HashMap<GitCheckout, Timestamp>,
+    /// New blob storage entries to insert.
+    blob_timestamps: HashMap<Blob, Timestamp>,
     /// This is used so that a warning about failing to update the database is
     /// only displayed once.
     save_err_has_warned: bool,
@@ -1461,6 +1624,7 @@ impl DeferredGlobalLastUse {
             registry_src_timestamps: HashMap::default(),
             git_db_timestamps: HashMap::default(),
             git_checkout_timestamps: HashMap::default(),
+            blob_timestamps: HashMap::default(),
             save_err_has_warned: false,
             now: now(),
         }
@@ -1472,6 +1636,7 @@ impl DeferredGlobalLastUse {
             && self.registry_src_timestamps.is_empty()
             && self.git_db_timestamps.is_empty()
             && self.git_checkout_timestamps.is_empty()
+            && self.blob_timestamps.is_empty()
     }
 
     fn clear(&mut self) {
@@ -1480,6 +1645,7 @@ impl DeferredGlobalLastUse {
         self.registry_src_timestamps.clear();
         self.git_db_timestamps.clear();
         self.git_checkout_timestamps.clear();
+        self.blob_timestamps.clear();
     }
 
     /// Indicates the given [`RegistryIndex`] has been used right now.
@@ -1506,6 +1672,11 @@ impl DeferredGlobalLastUse {
     /// Also implicitly marks the git db used, too.
     pub fn mark_git_checkout_used(&mut self, git_checkout: GitCheckout) {
         self.mark_git_checkout_used_stamp(git_checkout, None);
+    }
+
+    /// Indicates the given [`Blob`] has been used right now.
+    pub fn mark_blob_used(&mut self, blob: Blob) {
+        self.mark_blob_used_stamp(blob, None);
     }
 
     /// Indicates the given [`RegistryIndex`] has been used with the given
@@ -1572,6 +1743,13 @@ impl DeferredGlobalLastUse {
         self.git_checkout_timestamps.insert(git_checkout, timestamp);
     }
 
+    /// Indicates the given [`Blob`] has been used with the given
+    /// time (or "now" if `None`).
+    pub fn mark_blob_used_stamp(&mut self, blob: Blob, timestamp: Option<&SystemTime>) {
+        let timestamp = timestamp.map_or(self.now, to_timestamp);
+        self.blob_timestamps.insert(blob, timestamp);
+    }
+
     /// Saves all of the deferred information to the database.
     ///
     /// This will also clear the state of `self`.
@@ -1588,6 +1766,7 @@ impl DeferredGlobalLastUse {
         self.insert_registry_crate_from_cache(&tx)?;
         self.insert_registry_src_from_cache(&tx)?;
         self.insert_git_checkout_from_cache(&tx)?;
+        self.insert_blob_from_cache(&tx)?;
         tx.commit()?;
         trace!(target: "gc", "last-use save complete");
         Ok(())
@@ -1723,6 +1902,28 @@ impl DeferredGlobalLastUse {
             ])?;
         }
 
+        Ok(())
+    }
+
+    /// Flushes all of the `blob_timestamps` to the database,
+    /// clearing `blob_timestamps`.
+    fn insert_blob_from_cache(&mut self, conn: &Connection) -> CargoResult<()> {
+        let blob_timestamps = std::mem::take(&mut self.blob_timestamps);
+        for (blob, timestamp) in blob_timestamps {
+            trace!(target: "gc", "insert blob {blob:?} {timestamp}");
+            let mut stmt = conn.prepare_cached(
+                "INSERT INTO blob (name, size, timestamp)
+                 VALUES (?1, ?2, ?3)
+                 ON CONFLICT DO UPDATE SET timestamp=excluded.timestamp
+                    WHERE timestamp < ?4",
+            )?;
+            stmt.execute(params![
+                blob.hash,
+                blob.size,
+                timestamp,
+                timestamp - UPDATE_RESOLUTION
+            ])?;
+        }
         Ok(())
     }
 

@@ -1696,7 +1696,6 @@ fn linking_interrupted() {
                         args.next().unwrap()
                     }
                 };
-                std::fs::remove_file(&output).unwrap();
                 std::fs::write(&output, "").unwrap();
                 // Tell the test that we are ready to be interrupted.
                 let mut socket = std::net::TcpStream::connect("__ADDR__").unwrap();

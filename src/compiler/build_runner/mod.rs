@@ -94,6 +94,8 @@ pub struct BuildRunner<'a, 'gctx> {
 
     /// Manages locks for build units when fine grain locking is enabled.
     pub lock_manager: Arc<LockManager>,
+
+    pub blob_storage_outputs: Vec<String>,
 }
 
 impl<'a, 'gctx> BuildRunner<'a, 'gctx> {
@@ -135,6 +137,7 @@ impl<'a, 'gctx> BuildRunner<'a, 'gctx> {
             failed_scrape_units: Arc::new(Mutex::new(HashSet::default())),
             unused_dep_state: UnusedDepState::new(bcx),
             lock_manager: Arc::new(LockManager::new()),
+            blob_storage_outputs: Vec::new(),
         })
     }
 

@@ -268,8 +268,11 @@ fn compile<'gctx>(
                 && let Some(blob_storage) = build_runner.files().blob_storage()
             {
                 let out_dir = build_runner.files().out_dir_new_layout(unit);
-                job.after(Work::new(move |_state| {
-                    deduplicate_out_dir(&out_dir, &blob_storage)
+                job.after(Work::new(move |state| {
+                    if let Some(hash) = deduplicate_out_dir(&out_dir, &blob_storage) {
+                        state.add_blob_storage_output(hash);
+                    }
+                    Ok(())
                 }));
             }
 
@@ -713,25 +716,15 @@ fn should_dedup_out_dir(build_runner: &BuildRunner<'_, '_>, unit: &Unit) -> bool
 }
 
 #[tracing::instrument(skip_all)]
-fn deduplicate_out_dir(out_dir: &Path, blob_storage: &BlobStorage) -> CargoResult<()> {
-    for entry in walkdir::WalkDir::new(out_dir) {
-        let Ok(entry) = entry else {
-            continue;
-        };
-        if entry.file_type().is_file() {
-            match blob_storage.insert_or_dedup(entry.path()) {
-                Ok(hash) => {
-                    trace!(path = ?entry.path(), hash, "inserted file into blob storage");
-                }
-                Err(err) => {
-                    // couldn't deduplicate, but we can continue the build
-                    debug!(path = ?entry.path(), ?err, "failed to insert file into blob storage");
-                }
-            }
+fn deduplicate_out_dir(out_dir: &Path, blob_storage: &BlobStorage) -> Option<String> {
+    match blob_storage.insert_or_dedup_out_dir(out_dir) {
+        Ok(hash) => Some(hash),
+        Err(err) => {
+            // couldn't deduplicate, but we can continue the build
+            debug!(?out_dir, ?err, "failed to insert file into blob storage");
+            None
         }
     }
-
-    Ok(())
 }
 
 /// Link the compiled target (often of form `foo-{metadata_hash}`) to the

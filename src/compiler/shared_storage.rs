@@ -1,36 +1,124 @@
+use std::collections::BTreeMap;
 use std::fs::File;
-use std::io::ErrorKind;
+use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::bail;
+use blake3::Hash;
 use cargo_util::paths::create_dir_all;
 use filetime::FileTime;
-use tracing::instrument;
+use serde::{Deserialize, Serialize};
+use tracing::{instrument, trace};
 
 use crate::CargoResult;
 
 pub struct BlobStorage {
-    root: PathBuf,
+    blobs: PathBuf,
+    unit_outputs: PathBuf,
+    snapshots: PathBuf,
+    snapshot_usage: PathBuf,
 }
 
 impl BlobStorage {
-    pub fn new(root: PathBuf, build_dir: &Path) -> CargoResult<Self> {
-        create_dir_all(&root)?;
+    pub fn new(shared_storage_root: PathBuf, build_dir: &Path) -> CargoResult<Self> {
+        create_dir_all(&shared_storage_root)?;
 
-        if !is_same_filesystem(&root, build_dir).unwrap_or(false) {
+        if !is_same_filesystem(&shared_storage_root, build_dir).unwrap_or(false) {
             bail!("blob storage and build-dir are on different file systems")
         }
 
-        Ok(Self { root })
+        Ok(Self {
+            blobs: shared_storage_root.join("blobs"),
+            unit_outputs: shared_storage_root.join("unit-output"),
+            snapshots: shared_storage_root.join("snapshots"),
+            snapshot_usage: shared_storage_root.join("usage"),
+        })
+    }
+
+    pub fn insert_or_dedup_out_dir(&self, out_dir: &Path) -> CargoResult<String> {
+        let mut hasher = blake3::Hasher::new();
+        let mut outputs: BTreeMap<PathBuf, Hash> = BTreeMap::default();
+        for entry in walkdir::WalkDir::new(out_dir) {
+            let Ok(entry) = entry else {
+                continue;
+            };
+            if entry.file_type().is_file() {
+                let hash = self.insert_or_dedup(entry.path())?;
+                trace!(path = ?entry.path(), hash = hash.to_hex().to_string(), "inserted file into blob storage");
+                hasher.update(hash.as_bytes());
+                let path = entry.path().strip_prefix(out_dir)?.to_path_buf();
+                outputs.insert(path, hash);
+            }
+        }
+
+        // TODO: Do we want to keep this logic or make the entry itself content addressible?
+        //       The downside is that we have to serialize and hash it for every unit which could be
+        //       slow.
+        let unit_output_hash = hasher.finalize().to_hex().to_string();
+        let path = self
+            .unit_outputs
+            .join(&unit_output_hash[..2])
+            .join(&unit_output_hash[2..]);
+
+        if !path.exists() {
+            create_dir_all(&path.parent().unwrap())?;
+
+            let entry = UnitOutputEntry {
+                blobs: outputs
+                    .into_iter()
+                    .map(|(path, hash)| (path, hash.to_hex().to_string()))
+                    .collect::<BTreeMap<_, _>>(),
+            };
+
+            let file = File::create_new(path)?;
+
+            serde_json::to_writer(file, &entry)?;
+        }
+
+        Ok(unit_output_hash)
+    }
+
+    pub fn save_build_outputs(&self, hashes: &[String]) -> CargoResult<()> {
+        let entry = BuildSnapshot {
+            unit_outputs: hashes.to_vec(),
+        };
+
+        let output = serde_json::to_vec(&entry)?;
+
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(&output);
+        let hash = hasher.finalize().to_hex().to_string();
+
+        let path = self.snapshots.join(&hash[..2]).join(&hash[2..]);
+
+        if !path.exists() {
+            create_dir_all(path.parent().unwrap())?;
+            let mut f = File::create_new(path)?;
+            f.write_all(&output)?;
+        }
+
+        let usage = self.snapshot_usage.join(&hash[..2]).join(&hash[2..]);
+        create_dir_all(usage.parent().unwrap())?;
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis()
+            .to_string();
+        let mut usage_file = File::create(usage)?;
+        usage_file.write_all(now.as_bytes())?;
+
+        Ok(())
     }
 
     /// Inserts or deduplicates a file already in blob storage.
     ///
     /// This function will prefer reflink if available on the current filesystem but fallback to
     /// hardlinking.
-    pub fn insert_or_dedup(&self, path: &Path) -> CargoResult<String> {
+    fn insert_or_dedup(&self, path: &Path) -> CargoResult<Hash> {
         let hash = Self::hash(path)?;
-        let storage_path = self.root.join(&hash[..2]).join(&hash[2..]);
+        let hash_as_str = hash.to_hex().to_string();
+        let storage_path = self.blobs.join(&hash_as_str[..2]).join(&hash_as_str[2..]);
 
         if self.insert(path, &storage_path)? {
             return Ok(hash);
@@ -57,7 +145,7 @@ impl BlobStorage {
         // that would overwrite the existing file if there was another process inserted before us.
         let staging_dir = tempfile::Builder::new()
             .prefix(".blob")
-            .tempdir_in(&self.root)?;
+            .tempdir_in(&self.blobs)?;
         let staged = staging_dir.path().join("artifact");
         if reflink_copy::reflink(path, &staged).is_err() {
             std::fs::hard_link(path, &staged)?;
@@ -98,11 +186,11 @@ impl BlobStorage {
     }
 
     #[instrument]
-    fn hash(path: &Path) -> CargoResult<String> {
+    fn hash(path: &Path) -> CargoResult<Hash> {
         let mut hasher = blake3::Hasher::new();
         let file = File::open(path)?;
         hasher.update_reader(file)?;
-        Ok(hasher.finalize().to_hex().to_string())
+        Ok(hasher.finalize())
     }
 }
 
@@ -161,4 +249,14 @@ fn is_same_filesystem(dir1: &Path, dir2: &Path) -> std::io::Result<bool> {
             Ok(volume_serial_number(dir1)? == volume_serial_number(dir2)?)
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct UnitOutputEntry {
+    blobs: BTreeMap<PathBuf, String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct BuildSnapshot {
+    unit_outputs: Vec<String>,
 }

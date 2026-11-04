@@ -187,7 +187,7 @@ impl<'a, 'gctx: 'a> CompilationFiles<'a, 'gctx> {
         let blob_storage = build_runner
             .bcx
             .gctx
-            .blob_storage_dir()
+            .shared_storage_dir()
             .and_then(|shared| {
                 BlobStorage::new(shared, build_runner.bcx.ws.build_dir().as_path_unlocked())
                     .inspect_err(|err| warn!(?err, "Could not initialize blob storage, disabling"))

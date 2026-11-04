@@ -263,17 +263,28 @@ fn compile<'gctx>(
                 work.then(link_targets(build_runner, unit, true)?)
             });
 
-            if job.freshness().is_dirty()
-                && should_dedup_out_dir(build_runner, unit)
+            if should_dedup_out_dir(build_runner, unit)
                 && let Some(shared_storage) = build_runner.files().shared_storage()
             {
-                let out_dir = build_runner.files().out_dir_new_layout(unit);
-                job.after(Work::new(move |state| {
-                    if let Some(hash) = deduplicate_out_dir(&out_dir, &shared_storage) {
-                        state.add_blob_storage_output(hash);
-                    }
-                    Ok(())
-                }));
+                let cached_hash_file = build_runner
+                    .files()
+                    .fingerprint_dir(unit)
+                    .join("output-hash");
+
+                if job.freshness().is_dirty() {
+                    let out_dir = build_runner.files().out_dir_new_layout(unit);
+                    job.after(Work::new(move |state| {
+                        if let Some(hash) = deduplicate_out_dir(&out_dir, &shared_storage) {
+                            let mut f = File::create(cached_hash_file)?;
+                            f.write_all(hash.as_bytes())?;
+                            state.add_blob_storage_output(hash);
+                        }
+                        Ok(())
+                    }));
+                } else if cached_hash_file.exists() {
+                    let hash = std::fs::read_to_string(cached_hash_file)?;
+                    build_runner.blob_storage_outputs.push(hash);
+                }
             }
 
             // If -Zfine-grain-locking is enabled, we wrap the job with an upgrade to exclusive

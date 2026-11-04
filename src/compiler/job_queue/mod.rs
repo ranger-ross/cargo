@@ -528,7 +528,7 @@ impl<'gctx> JobQueue<'gctx> {
             ),
             finished: 0,
             per_package_future_incompat_reports: Vec::new(),
-            blob_storage_outputs: Vec::new(),
+            blob_storage_outputs: build_runner.blob_storage_outputs.clone(),
         };
 
         // Create a helper thread for acquiring jobserver tokens

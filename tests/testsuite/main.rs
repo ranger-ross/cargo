@@ -188,6 +188,7 @@ mod rustup;
 mod sbom;
 mod script;
 mod search;
+mod shared_storage;
 mod shell_quoting;
 mod source_replacement;
 mod ssh;

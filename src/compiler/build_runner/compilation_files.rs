@@ -1,5 +1,6 @@
 //! See [`CompilationFiles`].
 
+use crate::compiler::shared_storage::BlobStorage;
 use crate::util::data_structures::HashMap;
 use std::cell::OnceCell;
 use std::fmt;
@@ -8,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use cargo_util_schemas::manifest::TomlTrimPaths;
-use tracing::debug;
+use tracing::{debug, warn};
 
 use super::{BuildContext, BuildRunner, CompileKind, FileFlavor, Layout};
 use crate::compiler::trim_paths;
@@ -140,6 +141,8 @@ pub struct CompilationFiles<'a, 'gctx> {
     metas: HashMap<Unit, Metadata>,
     /// For each Unit, a list all files produced.
     outputs: HashMap<Unit, OnceCell<Arc<Vec<OutputFile>>>>,
+    /// The shared blob storage
+    blob_storage: Option<Arc<BlobStorage>>,
 }
 
 /// Info about a single file emitted by the compiler.
@@ -171,7 +174,7 @@ impl<'a, 'gctx: 'a> CompilationFiles<'a, 'gctx> {
         build_runner: &BuildRunner<'a, 'gctx>,
         host: Layout,
         target: HashMap<CompileTarget, Layout>,
-    ) -> CompilationFiles<'a, 'gctx> {
+    ) -> CargoResult<CompilationFiles<'a, 'gctx>> {
         let mut metas = HashMap::default();
         for unit in &build_runner.bcx.roots {
             metadata_of(unit, build_runner, &mut metas);
@@ -181,7 +184,17 @@ impl<'a, 'gctx: 'a> CompilationFiles<'a, 'gctx> {
             .cloned()
             .map(|unit| (unit, OnceCell::new()))
             .collect();
-        CompilationFiles {
+        let blob_storage = build_runner
+            .bcx
+            .gctx
+            .blob_storage_dir()
+            .and_then(|shared| {
+                BlobStorage::new(shared, build_runner.bcx.ws.build_dir().as_path_unlocked())
+                    .inspect_err(|err| warn!(?err, "Could not initialize blob storage, disabling"))
+                    .ok()
+            })
+            .map(Arc::new);
+        Ok(CompilationFiles {
             ws: build_runner.bcx.ws,
             host,
             target,
@@ -189,7 +202,8 @@ impl<'a, 'gctx: 'a> CompilationFiles<'a, 'gctx> {
             roots: build_runner.bcx.roots.clone(),
             metas,
             outputs,
-        }
+            blob_storage,
+        })
     }
 
     /// Returns the appropriate directory layout for either a plugin or not.
@@ -660,6 +674,10 @@ impl<'a, 'gctx: 'a> CompilationFiles<'a, 'gctx> {
         debug!("Target filenames: {:?}", ret);
 
         Ok(Arc::new(ret))
+    }
+
+    pub fn blob_storage(&self) -> Option<Arc<BlobStorage>> {
+        self.blob_storage.clone()
     }
 
     /// Append the SBOM suffix to the file name.

@@ -1,6 +1,6 @@
 //! See [`CompilationFiles`].
 
-use crate::compiler::shared_storage::BlobStorage;
+use crate::compiler::shared_storage::SharedStorage;
 use crate::util::data_structures::HashMap;
 use std::cell::OnceCell;
 use std::fmt;
@@ -142,7 +142,7 @@ pub struct CompilationFiles<'a, 'gctx> {
     /// For each Unit, a list all files produced.
     outputs: HashMap<Unit, OnceCell<Arc<Vec<OutputFile>>>>,
     /// The shared blob storage
-    blob_storage: Option<Arc<BlobStorage>>,
+    shared_storage: Option<Arc<SharedStorage>>,
 }
 
 /// Info about a single file emitted by the compiler.
@@ -184,12 +184,12 @@ impl<'a, 'gctx: 'a> CompilationFiles<'a, 'gctx> {
             .cloned()
             .map(|unit| (unit, OnceCell::new()))
             .collect();
-        let blob_storage = build_runner
+        let shared_storage = build_runner
             .bcx
             .gctx
             .shared_storage_dir()
             .and_then(|shared| {
-                BlobStorage::new(shared, build_runner.bcx.ws.build_dir().as_path_unlocked())
+                SharedStorage::new(shared, build_runner.bcx.ws.build_dir().as_path_unlocked())
                     .inspect_err(|err| warn!(?err, "Could not initialize blob storage, disabling"))
                     .ok()
             })
@@ -202,7 +202,7 @@ impl<'a, 'gctx: 'a> CompilationFiles<'a, 'gctx> {
             roots: build_runner.bcx.roots.clone(),
             metas,
             outputs,
-            blob_storage,
+            shared_storage,
         })
     }
 
@@ -676,8 +676,8 @@ impl<'a, 'gctx: 'a> CompilationFiles<'a, 'gctx> {
         Ok(Arc::new(ret))
     }
 
-    pub fn blob_storage(&self) -> Option<Arc<BlobStorage>> {
-        self.blob_storage.clone()
+    pub fn shared_storage(&self) -> Option<Arc<SharedStorage>> {
+        self.shared_storage.clone()
     }
 
     /// Append the SBOM suffix to the file name.

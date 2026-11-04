@@ -55,7 +55,7 @@ pub mod unit_dependencies;
 pub mod unit_graph;
 pub mod unused_deps;
 
-use crate::compiler::shared_storage::BlobStorage;
+use crate::compiler::shared_storage::SharedStorage;
 use crate::util::data_structures::{HashMap, HashSet};
 use std::borrow::Cow;
 use std::cell::OnceCell;
@@ -265,11 +265,11 @@ fn compile<'gctx>(
 
             if job.freshness().is_dirty()
                 && should_dedup_out_dir(build_runner, unit)
-                && let Some(blob_storage) = build_runner.files().blob_storage()
+                && let Some(shared_storage) = build_runner.files().shared_storage()
             {
                 let out_dir = build_runner.files().out_dir_new_layout(unit);
                 job.after(Work::new(move |state| {
-                    if let Some(hash) = deduplicate_out_dir(&out_dir, &blob_storage) {
+                    if let Some(hash) = deduplicate_out_dir(&out_dir, &shared_storage) {
                         state.add_blob_storage_output(hash);
                     }
                     Ok(())
@@ -716,8 +716,8 @@ fn should_dedup_out_dir(build_runner: &BuildRunner<'_, '_>, unit: &Unit) -> bool
 }
 
 #[tracing::instrument(skip_all)]
-fn deduplicate_out_dir(out_dir: &Path, blob_storage: &BlobStorage) -> Option<String> {
-    match blob_storage.insert_or_dedup_out_dir(out_dir) {
+fn deduplicate_out_dir(out_dir: &Path, shared_storage: &SharedStorage) -> Option<String> {
+    match shared_storage.insert_or_dedup_out_dir(out_dir) {
         Ok(hash) => Some(hash),
         Err(err) => {
             // couldn't deduplicate, but we can continue the build

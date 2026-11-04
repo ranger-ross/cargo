@@ -907,7 +907,7 @@ impl<'gctx> DrainState<'gctx> {
         if errors.count == 0
             && self.queue.is_empty()
             && self.pending_queue.is_empty()
-            && let Some(storage) = build_runner.files().blob_storage()
+            && let Some(storage) = build_runner.files().shared_storage()
         {
             self.blob_storage_outputs.sort_unstable();
             self.blob_storage_outputs.dedup();

@@ -13,26 +13,26 @@ use tracing::{instrument, trace};
 
 use crate::CargoResult;
 
-pub struct BlobStorage {
+pub struct SharedStorage {
     blobs: PathBuf,
     unit_outputs: PathBuf,
     snapshots: PathBuf,
     snapshot_usage: PathBuf,
 }
 
-impl BlobStorage {
-    pub fn new(shared_storage_root: PathBuf, build_dir: &Path) -> CargoResult<Self> {
-        create_dir_all(&shared_storage_root)?;
+impl SharedStorage {
+    pub fn new(root: PathBuf, build_dir: &Path) -> CargoResult<Self> {
+        create_dir_all(&root)?;
 
-        if !is_same_filesystem(&shared_storage_root, build_dir).unwrap_or(false) {
+        if !is_same_filesystem(&root, build_dir).unwrap_or(false) {
             bail!("blob storage and build-dir are on different file systems")
         }
 
         Ok(Self {
-            blobs: shared_storage_root.join("blobs"),
-            unit_outputs: shared_storage_root.join("unit-output"),
-            snapshots: shared_storage_root.join("snapshots"),
-            snapshot_usage: shared_storage_root.join("usage"),
+            blobs: root.join("blobs"),
+            unit_outputs: root.join("unit-output"),
+            snapshots: root.join("snapshots"),
+            snapshot_usage: root.join("usage"),
         })
     }
 

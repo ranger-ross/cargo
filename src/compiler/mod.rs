@@ -272,6 +272,8 @@ fn compile<'gctx>(
                     .join("output-hash");
 
                 if job.freshness().is_dirty() {
+                    _ = std::fs::remove_file(&cached_hash_file);
+
                     let out_dir = build_runner.files().out_dir_new_layout(unit);
                     job.after(Work::new(move |state| {
                         if let Some(hash) = deduplicate_out_dir(&out_dir, &shared_storage) {

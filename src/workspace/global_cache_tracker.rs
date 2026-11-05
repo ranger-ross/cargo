@@ -114,9 +114,10 @@
 //!
 //! There are checks for read-only filesystems, which is generally ignored.
 
+use crate::compiler::shared_storage::{BuildSnapshot, UnitOutputEntry};
 use crate::ops::CleanContext;
 use crate::util::cache_lock::CacheLockMode;
-use crate::util::data_structures::HashMap;
+use crate::util::data_structures::{HashMap, HashSet};
 use crate::util::interning::InternedString;
 use crate::util::sqlite::{self, Migration, basic_migration};
 use crate::util::{Filesystem, Progress, ProgressStyle};
@@ -224,6 +225,7 @@ struct BasePaths {
     crate_dir: PathBuf,
     /// Root path to the `src` directories.
     src: PathBuf,
+    shared_storage: Option<PathBuf>,
 }
 
 /// Migrations which initialize the database, and can be used to evolve it over time.
@@ -560,6 +562,7 @@ impl GlobalCacheTracker {
             git_co: gctx.git_checkouts_path().into_path_unlocked(),
             crate_dir: gctx.registry_cache_path().into_path_unlocked(),
             src: gctx.registry_source_path().into_path_unlocked(),
+            shared_storage: gctx.shared_storage_dir(),
         };
         let now = now();
         trace!(target: "gc", "cleaning {gc_opts:?}");
@@ -646,6 +649,11 @@ impl GlobalCacheTracker {
         }
         if let Some(max_size) = gc_opts.max_download_size {
             Self::get_registry_items_to_clean_size_both(&tx, max_size, &base, &mut delete_paths)?;
+        }
+        if let Some(max_age) = gc_opts.max_shared_storage_age
+            && let Some(shared_storage) = &base.shared_storage
+        {
+            Self::get_shared_storage_items_to_clean(max_age, shared_storage, &mut delete_paths)?;
         }
 
         clean_ctx.remove_paths(&delete_paths)?;
@@ -1353,6 +1361,135 @@ impl GlobalCacheTracker {
             // cannot be used without their db.
             delete_paths.push(base.git_co.join(&name));
         }
+        Ok(())
+    }
+
+    /// The algorithm to garbage collect shared storage is:
+    /// 1. Walk snapshot usages
+    /// 2. Walk all snapshots deleting those without usages
+    /// 3. Create a set of all units being used
+    /// 4. Wall all units deleting those not referenced.
+    /// 5. Walk all blobs deleting those not referenced.
+    fn get_shared_storage_items_to_clean(
+        max_age: Duration,
+        shared_storage: &Path,
+        delete_paths: &mut Vec<PathBuf>,
+    ) -> CargoResult<()> {
+        // 1. Walk snapshot usages
+        let usage = shared_storage.join("usage");
+        if !usage.try_exists()? {
+            return Ok(());
+        }
+        let mut used_snapshots = HashSet::default();
+        let cutoff = Duration::from_secs(now())
+            .as_millis()
+            .saturating_sub(max_age.as_millis());
+        for entry in walkdir::WalkDir::new(&usage).min_depth(2).max_depth(2) {
+            let entry = entry?;
+            if !entry.file_type().is_file() {
+                continue;
+            }
+            let timestamp = paths::read(entry.path())?
+                .parse::<u128>()
+                .with_context(|| {
+                    format!(
+                        "invalid snapshot usage timestamp in `{}`",
+                        entry.path().display()
+                    )
+                })?;
+            if timestamp < cutoff {
+                delete_paths.push(entry.into_path());
+            } else {
+                used_snapshots.insert(entry.path().strip_prefix(&usage)?.to_path_buf());
+            }
+        }
+
+        // 2. Walk all snapshots deleting those without usages
+        let snapshots = shared_storage.join("snapshots");
+        if !snapshots.try_exists()? {
+            return Ok(());
+        }
+        let mut used_units = HashSet::default();
+        for entry in walkdir::WalkDir::new(&snapshots).min_depth(2).max_depth(2) {
+            let entry = entry?;
+            if !entry.file_type().is_file() {
+                continue;
+            }
+            if !used_snapshots.contains(entry.path().strip_prefix(&snapshots)?) {
+                delete_paths.push(entry.into_path());
+            } else {
+                // 3. Create a set of all units being used
+                let snapshot: BuildSnapshot = serde_json::from_str(&paths::read(entry.path())?)
+                    .with_context(|| {
+                        format!("failed to read snapshot `{}`", entry.path().display())
+                    })?;
+                used_units.extend(snapshot.unit_outputs);
+            }
+        }
+
+        // 4. Walk all units deleting those not referenced.
+        let unit_outputs = shared_storage.join("unit-output");
+        let mut entry_hash = String::with_capacity(64);
+        let mut used_blobs = HashSet::default();
+        if !unit_outputs.try_exists()? {
+            return Ok(());
+        }
+        for entry in walkdir::WalkDir::new(&unit_outputs)
+            .min_depth(2)
+            .max_depth(2)
+        {
+            let entry = entry?;
+            if !entry.file_type().is_file() {
+                continue;
+            }
+            let prefix = entry.path().parent().unwrap().file_name().unwrap().to_str();
+            let suffix = entry.file_name().to_str();
+            let is_used = match (prefix, suffix) {
+                (Some(prefix), Some(suffix)) => {
+                    entry_hash.clear();
+                    entry_hash.push_str(prefix);
+                    entry_hash.push_str(suffix);
+                    used_units.contains(&entry_hash)
+                }
+                _ => false,
+            };
+            if !is_used {
+                delete_paths.push(entry.into_path());
+            } else {
+                let unit: UnitOutputEntry = serde_json::from_str(&paths::read(entry.path())?)
+                    .with_context(|| {
+                        format!("failed to read unit output `{}`", entry.path().display())
+                    })?;
+                used_blobs.extend(unit.blobs.into_values());
+            }
+        }
+
+        // 5. Walk all blobs deleting those not referenced.
+        let blobs = shared_storage.join("blobs");
+        if !blobs.try_exists()? {
+            return Ok(());
+        }
+        for entry in walkdir::WalkDir::new(&blobs).min_depth(2).max_depth(2) {
+            let entry = entry?;
+            if !entry.file_type().is_file() {
+                continue;
+            }
+            let prefix = entry.path().parent().unwrap().file_name().unwrap().to_str();
+            let suffix = entry.file_name().to_str();
+            let is_used = match (prefix, suffix) {
+                (Some(prefix), Some(suffix)) => {
+                    entry_hash.clear();
+                    entry_hash.push_str(prefix);
+                    entry_hash.push_str(suffix);
+                    used_blobs.contains(&entry_hash)
+                }
+                _ => false,
+            };
+            if !is_used {
+                delete_paths.push(entry.into_path());
+            }
+        }
+
         Ok(())
     }
 }

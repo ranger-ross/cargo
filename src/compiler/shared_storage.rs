@@ -252,11 +252,11 @@ fn is_same_filesystem(dir1: &Path, dir2: &Path) -> std::io::Result<bool> {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct UnitOutputEntry {
-    blobs: BTreeMap<PathBuf, String>,
+pub(crate) struct UnitOutputEntry {
+    pub(crate) blobs: BTreeMap<PathBuf, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct BuildSnapshot {
-    unit_outputs: Vec<String>,
+pub(crate) struct BuildSnapshot {
+    pub(crate) unit_outputs: Vec<String>,
 }

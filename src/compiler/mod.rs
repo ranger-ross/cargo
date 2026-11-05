@@ -46,7 +46,7 @@ mod lto;
 mod output_depinfo;
 mod output_sbom;
 pub mod rustdoc;
-mod shared_storage;
+pub(crate) mod shared_storage;
 pub mod standard_lib;
 pub mod timings;
 pub(crate) mod trim_paths;

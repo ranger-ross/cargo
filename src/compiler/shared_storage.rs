@@ -52,7 +52,7 @@ impl SharedStorage {
             }
         }
 
-        // TODO: Do we want to keep this logic or make the entry itself content addressible?
+        // TODO: Do we want to keep this logic or make the entry itself content addressable?
         //       The downside is that we have to serialize and hash it for every unit which could be
         //       slow.
         let unit_output_hash = hasher.finalize().to_hex().to_string();

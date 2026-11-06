@@ -853,6 +853,14 @@ impl GlobalContext {
         Ok(Filesystem::new(path))
     }
 
+    pub fn shared_storage_dir(&self) -> Option<PathBuf> {
+        if !self.cli_unstable().shared_blob_storage || !self.cli_unstable().build_dir_new_layout {
+            return None;
+        }
+
+        return Some(self.home_path.as_path_unlocked().join("shared-storage"));
+    }
+
     /// This is a helper for getting a CV from a file or env var.
     pub(crate) fn get_cv_with_env(&self, key: &ConfigKey) -> CargoResult<Option<CV>> {
         // Determine if value comes from env, cli, or file, and merge env if

@@ -270,25 +270,36 @@ fn compile<'gctx>(
                     .files()
                     .fingerprint_dir(unit)
                     .join("output-hash");
+                let out_dir = build_runner.files().out_dir_new_layout(unit);
 
-                if job.freshness().is_dirty() {
-                    _ = std::fs::remove_file(&cached_hash_file);
-
-                    let out_dir = build_runner.files().out_dir_new_layout(unit);
+                let add_deduplicate_step = |job: &mut Job| {
+                    let cached_hash_file = cached_hash_file.clone();
+                    let shared_storage = shared_storage.clone();
                     job.after(Work::new(move |state| {
                         if let Some(hash) = deduplicate_out_dir(&out_dir, &shared_storage) {
-                            let mut f = File::create(cached_hash_file)?;
+                            let mut f = File::create(&cached_hash_file)?;
                             f.write_all(hash.as_bytes())?;
                             state.add_blob_storage_output(hash);
                         }
                         Ok(())
                     }));
+                };
+
+                if job.freshness().is_dirty() {
+                    _ = std::fs::remove_file(&cached_hash_file);
+
+                    add_deduplicate_step(&mut job);
                 } else if cached_hash_file.exists() {
-                    // FIXME: If a previous build added blobs to shared storage and then they were
+                    let hash = std::fs::read_to_string(&cached_hash_file)?;
+
+                    // If a previous build added blobs to shared storage and then they were
                     // removed via GC, we need to re-link them into shared storage, otherwise the
                     // snapshot would be created with "dangling pointers" to blobs that dont exist
-                    let hash = std::fs::read_to_string(cached_hash_file)?;
-                    build_runner.blob_storage_outputs.push(hash);
+                    if !shared_storage.unit_output_exists(&hash) {
+                        add_deduplicate_step(&mut job);
+                    } else {
+                        build_runner.blob_storage_outputs.push(hash);
+                    }
                 }
             }
 

@@ -131,6 +131,7 @@ use std::collections::hash_map;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 use tracing::{debug, trace};
+use walkdir::WalkDir;
 
 /// The filename of the database.
 const GLOBAL_CACHE_FILENAME: &str = ".global-cache";
@@ -1365,34 +1366,52 @@ impl GlobalCacheTracker {
     }
 
     /// Get the paths to delete from shared storage.
-    ///
-    /// The algorithm to garbage collect shared storage is:
-    ///  1. Walk snapshot usages
-    ///  2. Walk all snapshots deleting those without usages
-    ///  3. Create a set of all units being used
-    ///  4. Wall all units deleting those not referenced.
-    ///  5. Walk all blobs deleting those not referenced.
     fn get_shared_storage_items_to_clean(
         max_age: Duration,
         shared_storage: &Path,
         delete_paths: &mut Vec<PathBuf>,
     ) -> CargoResult<()> {
-        let SharedStorageLayout {
-            blobs,
-            unit_outputs,
-            snapshots,
-            snapshot_usage,
-        } = SharedStorageLayout::new(shared_storage);
+        // The algorithm to garbage collect shared storage is basically
+        //  1. Walk snapshot usages
+        //  2. Walk all snapshots deleting those without usages
+        //  3. Create a set of all units being used
+        //  4. Wall all units deleting those not referenced.
+        //  5. Walk all blobs deleting those not referenced.
+        let storage = SharedStorageLayout::new(shared_storage);
 
-        // Walk snapshot usages
-        if !snapshot_usage.try_exists()? {
+        if !storage.snapshot_usage.try_exists()? {
             return Ok(());
         }
-        let mut used_snapshots = HashSet::default();
         let cutoff = Duration::from_secs(now())
             .as_millis()
             .saturating_sub(max_age.as_millis());
-        for entry in walkdir::WalkDir::new(&snapshot_usage)
+        let used_snapshots = Self::walk_snapshot_usages(&storage, cutoff, delete_paths)?;
+
+        if !storage.snapshots.try_exists()? {
+            return Ok(());
+        }
+        let used_units = Self::walk_snapshots(&storage, &used_snapshots, delete_paths)?;
+
+        if !storage.unit_outputs.try_exists()? {
+            return Ok(());
+        }
+        let used_blobs = Self::walk_unit_outputs(&storage, &used_units, delete_paths)?;
+
+        if !storage.blobs.try_exists()? {
+            return Ok(());
+        }
+        Self::walk_blobs(&storage, &used_blobs, delete_paths)?;
+
+        Ok(())
+    }
+
+    fn walk_snapshot_usages(
+        storage: &SharedStorageLayout,
+        cutoff: u128,
+        delete_paths: &mut Vec<PathBuf>,
+    ) -> CargoResult<HashSet<PathBuf>> {
+        let mut used_snapshots = HashSet::default();
+        for entry in WalkDir::new(&storage.snapshot_usage)
             .min_depth(2)
             .max_depth(2)
         {
@@ -1411,21 +1430,30 @@ impl GlobalCacheTracker {
             if timestamp < cutoff {
                 delete_paths.push(entry.into_path());
             } else {
-                used_snapshots.insert(entry.path().strip_prefix(&snapshot_usage)?.to_path_buf());
+                used_snapshots.insert(
+                    entry
+                        .path()
+                        .strip_prefix(&storage.snapshot_usage)?
+                        .to_path_buf(),
+                );
             }
         }
 
-        // Walk all snapshots deleting those without usages and create a set of all units being used
-        if !snapshots.try_exists()? {
-            return Ok(());
-        }
+        Ok(used_snapshots)
+    }
+
+    fn walk_snapshots(
+        storage: &SharedStorageLayout,
+        used_snapshots: &HashSet<PathBuf>,
+        delete_paths: &mut Vec<PathBuf>,
+    ) -> CargoResult<HashSet<String>> {
         let mut used_units = HashSet::default();
-        for entry in walkdir::WalkDir::new(&snapshots).min_depth(2).max_depth(2) {
+        for entry in WalkDir::new(&storage.snapshots).min_depth(2).max_depth(2) {
             let entry = entry?;
             if !entry.file_type().is_file() {
                 continue;
             }
-            if !used_snapshots.contains(entry.path().strip_prefix(&snapshots)?) {
+            if !used_snapshots.contains(entry.path().strip_prefix(&storage.snapshots)?) {
                 delete_paths.push(entry.into_path());
             } else {
                 let snapshot: BuildSnapshot = serde_json::from_str(&paths::read(entry.path())?)
@@ -1436,13 +1464,17 @@ impl GlobalCacheTracker {
             }
         }
 
-        // Walk all units deleting those not referenced.
+        Ok(used_units)
+    }
+
+    fn walk_unit_outputs(
+        storage: &SharedStorageLayout,
+        used_units: &HashSet<String>,
+        delete_paths: &mut Vec<PathBuf>,
+    ) -> CargoResult<HashSet<String>> {
         let mut entry_hash = String::with_capacity(64);
         let mut used_blobs = HashSet::default();
-        if !unit_outputs.try_exists()? {
-            return Ok(());
-        }
-        for entry in walkdir::WalkDir::new(&unit_outputs)
+        for entry in WalkDir::new(&storage.unit_outputs)
             .min_depth(2)
             .max_depth(2)
         {
@@ -1472,11 +1504,16 @@ impl GlobalCacheTracker {
             }
         }
 
-        // Walk all blobs deleting those not referenced.
-        if !blobs.try_exists()? {
-            return Ok(());
-        }
-        for entry in walkdir::WalkDir::new(&blobs).min_depth(2).max_depth(2) {
+        Ok(used_blobs)
+    }
+
+    fn walk_blobs(
+        storage: &SharedStorageLayout,
+        used_blobs: &HashSet<String>,
+        delete_paths: &mut Vec<PathBuf>,
+    ) -> CargoResult<()> {
+        let mut entry_hash = String::with_capacity(64);
+        for entry in WalkDir::new(&storage.blobs).min_depth(2).max_depth(2) {
             let entry = entry?;
             if !entry.file_type().is_file() {
                 continue;

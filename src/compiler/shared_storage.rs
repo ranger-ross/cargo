@@ -1,12 +1,12 @@
 use std::collections::BTreeMap;
 use std::fs::File;
-use std::io::{ErrorKind, Write};
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::bail;
 use blake3::Hash;
-use cargo_util::paths::create_dir_all;
+use cargo_util::paths::{self, create_dir_all};
 use filetime::FileTime;
 use serde::{Deserialize, Serialize};
 use tracing::{instrument, trace};
@@ -67,9 +67,9 @@ impl SharedStorage {
                     .collect::<BTreeMap<_, _>>(),
             };
 
-            let file = File::create_new(path)?;
-
-            serde_json::to_writer(file, &entry)?;
+            let mut buf = vec![0; 1024];
+            serde_json::to_writer(&mut buf, &entry)?;
+            paths::write_atomic(path, buf)?;
         }
 
         Ok(unit_output_hash)
@@ -90,8 +90,7 @@ impl SharedStorage {
 
         if !path.exists() {
             create_dir_all(path.parent().unwrap())?;
-            let mut f = File::create_new(path)?;
-            f.write_all(&output)?;
+            paths::write_atomic(path, output)?;
         }
 
         let usage = self.layout.snapshot_usage.join(&hash[..2]).join(&hash[2..]);
@@ -101,8 +100,8 @@ impl SharedStorage {
             .unwrap()
             .as_millis()
             .to_string();
-        let mut usage_file = File::create(usage)?;
-        usage_file.write_all(now.as_bytes())?;
+
+        paths::write_atomic(usage, now.as_bytes())?;
 
         Ok(())
     }

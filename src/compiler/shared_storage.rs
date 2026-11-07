@@ -14,10 +14,7 @@ use tracing::{instrument, trace};
 use crate::CargoResult;
 
 pub struct SharedStorage {
-    blobs: PathBuf,
-    unit_outputs: PathBuf,
-    snapshots: PathBuf,
-    snapshot_usage: PathBuf,
+    layout: SharedStorageLayout,
 }
 
 impl SharedStorage {
@@ -29,10 +26,7 @@ impl SharedStorage {
         }
 
         Ok(Self {
-            blobs: root.join("blobs"),
-            unit_outputs: root.join("unit-output"),
-            snapshots: root.join("snapshots"),
-            snapshot_usage: root.join("usage"),
+            layout: SharedStorageLayout::new(&root),
         })
     }
 
@@ -57,6 +51,7 @@ impl SharedStorage {
         //       slow.
         let unit_output_hash = hasher.finalize().to_hex().to_string();
         let path = self
+            .layout
             .unit_outputs
             .join(&unit_output_hash[..2])
             .join(&unit_output_hash[2..]);
@@ -90,7 +85,7 @@ impl SharedStorage {
         hasher.update(&output);
         let hash = hasher.finalize().to_hex().to_string();
 
-        let path = self.snapshots.join(&hash[..2]).join(&hash[2..]);
+        let path = self.layout.snapshots.join(&hash[..2]).join(&hash[2..]);
 
         if !path.exists() {
             create_dir_all(path.parent().unwrap())?;
@@ -98,7 +93,7 @@ impl SharedStorage {
             f.write_all(&output)?;
         }
 
-        let usage = self.snapshot_usage.join(&hash[..2]).join(&hash[2..]);
+        let usage = self.layout.snapshot_usage.join(&hash[..2]).join(&hash[2..]);
         create_dir_all(usage.parent().unwrap())?;
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -112,7 +107,7 @@ impl SharedStorage {
     }
 
     pub fn unit_output_exists(&self, hash: &str) -> bool {
-        let output = self.unit_outputs.join(&hash[..2]).join(&hash[2..]);
+        let output = self.layout.unit_outputs.join(&hash[..2]).join(&hash[2..]);
         return output.exists();
     }
 
@@ -123,7 +118,11 @@ impl SharedStorage {
     fn insert_or_dedup(&self, path: &Path) -> CargoResult<Hash> {
         let hash = Self::hash(path)?;
         let hash_as_str = hash.to_hex().to_string();
-        let storage_path = self.blobs.join(&hash_as_str[..2]).join(&hash_as_str[2..]);
+        let storage_path = self
+            .layout
+            .blobs
+            .join(&hash_as_str[..2])
+            .join(&hash_as_str[2..]);
 
         if self.insert(path, &storage_path)? {
             return Ok(hash);
@@ -150,7 +149,7 @@ impl SharedStorage {
         // that would overwrite the existing file if there was another process inserted before us.
         let staging_dir = tempfile::Builder::new()
             .prefix(".blob")
-            .tempdir_in(&self.blobs)?;
+            .tempdir_in(&self.layout.blobs)?;
         let staged = staging_dir.path().join("artifact");
         if reflink_copy::reflink(path, &staged).is_err() {
             std::fs::hard_link(path, &staged)?;
@@ -196,6 +195,24 @@ impl SharedStorage {
         let file = File::open(path)?;
         hasher.update_reader(file)?;
         Ok(hasher.finalize())
+    }
+}
+
+pub struct SharedStorageLayout {
+    pub blobs: PathBuf,
+    pub unit_outputs: PathBuf,
+    pub snapshots: PathBuf,
+    pub snapshot_usage: PathBuf,
+}
+
+impl SharedStorageLayout {
+    pub fn new(root: &Path) -> Self {
+        Self {
+            blobs: root.join("blobs"),
+            unit_outputs: root.join("unit-output"),
+            snapshots: root.join("snapshots"),
+            snapshot_usage: root.join("usage"),
+        }
     }
 }
 

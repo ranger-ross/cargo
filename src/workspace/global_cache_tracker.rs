@@ -114,7 +114,7 @@
 //!
 //! There are checks for read-only filesystems, which is generally ignored.
 
-use crate::compiler::shared_storage::{BuildSnapshot, UnitOutputEntry};
+use crate::compiler::shared_storage::{BuildSnapshot, SharedStorageLayout, UnitOutputEntry};
 use crate::ops::CleanContext;
 use crate::util::cache_lock::CacheLockMode;
 use crate::util::data_structures::{HashMap, HashSet};
@@ -1364,27 +1364,38 @@ impl GlobalCacheTracker {
         Ok(())
     }
 
+    /// Get the paths to delete from shared storage.
+    ///
     /// The algorithm to garbage collect shared storage is:
-    /// 1. Walk snapshot usages
-    /// 2. Walk all snapshots deleting those without usages
-    /// 3. Create a set of all units being used
-    /// 4. Wall all units deleting those not referenced.
-    /// 5. Walk all blobs deleting those not referenced.
+    ///  1. Walk snapshot usages
+    ///  2. Walk all snapshots deleting those without usages
+    ///  3. Create a set of all units being used
+    ///  4. Wall all units deleting those not referenced.
+    ///  5. Walk all blobs deleting those not referenced.
     fn get_shared_storage_items_to_clean(
         max_age: Duration,
         shared_storage: &Path,
         delete_paths: &mut Vec<PathBuf>,
     ) -> CargoResult<()> {
-        // 1. Walk snapshot usages
-        let usage = shared_storage.join("usage");
-        if !usage.try_exists()? {
+        let SharedStorageLayout {
+            blobs,
+            unit_outputs,
+            snapshots,
+            snapshot_usage,
+        } = SharedStorageLayout::new(shared_storage);
+
+        // Walk snapshot usages
+        if !snapshot_usage.try_exists()? {
             return Ok(());
         }
         let mut used_snapshots = HashSet::default();
         let cutoff = Duration::from_secs(now())
             .as_millis()
             .saturating_sub(max_age.as_millis());
-        for entry in walkdir::WalkDir::new(&usage).min_depth(2).max_depth(2) {
+        for entry in walkdir::WalkDir::new(&snapshot_usage)
+            .min_depth(2)
+            .max_depth(2)
+        {
             let entry = entry?;
             if !entry.file_type().is_file() {
                 continue;
@@ -1400,12 +1411,11 @@ impl GlobalCacheTracker {
             if timestamp < cutoff {
                 delete_paths.push(entry.into_path());
             } else {
-                used_snapshots.insert(entry.path().strip_prefix(&usage)?.to_path_buf());
+                used_snapshots.insert(entry.path().strip_prefix(&snapshot_usage)?.to_path_buf());
             }
         }
 
-        // 2. Walk all snapshots deleting those without usages
-        let snapshots = shared_storage.join("snapshots");
+        // Walk all snapshots deleting those without usages and create a set of all units being used
         if !snapshots.try_exists()? {
             return Ok(());
         }
@@ -1418,7 +1428,6 @@ impl GlobalCacheTracker {
             if !used_snapshots.contains(entry.path().strip_prefix(&snapshots)?) {
                 delete_paths.push(entry.into_path());
             } else {
-                // 3. Create a set of all units being used
                 let snapshot: BuildSnapshot = serde_json::from_str(&paths::read(entry.path())?)
                     .with_context(|| {
                         format!("failed to read snapshot `{}`", entry.path().display())
@@ -1427,8 +1436,7 @@ impl GlobalCacheTracker {
             }
         }
 
-        // 4. Walk all units deleting those not referenced.
-        let unit_outputs = shared_storage.join("unit-output");
+        // Walk all units deleting those not referenced.
         let mut entry_hash = String::with_capacity(64);
         let mut used_blobs = HashSet::default();
         if !unit_outputs.try_exists()? {
@@ -1464,8 +1472,7 @@ impl GlobalCacheTracker {
             }
         }
 
-        // 5. Walk all blobs deleting those not referenced.
-        let blobs = shared_storage.join("blobs");
+        // Walk all blobs deleting those not referenced.
         if !blobs.try_exists()? {
             return Ok(());
         }

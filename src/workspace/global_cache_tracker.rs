@@ -1411,10 +1411,7 @@ impl GlobalCacheTracker {
         delete_paths: &mut Vec<PathBuf>,
     ) -> CargoResult<HashSet<PathBuf>> {
         let mut used_snapshots = HashSet::default();
-        for entry in WalkDir::new(&storage.snapshot_usage)
-            .min_depth(2)
-            .max_depth(2)
-        {
+        for entry in walk_partitioned_dir(&storage.snapshot_usage) {
             let entry = entry?;
             if !entry.file_type().is_file() {
                 continue;
@@ -1448,7 +1445,7 @@ impl GlobalCacheTracker {
         delete_paths: &mut Vec<PathBuf>,
     ) -> CargoResult<HashSet<String>> {
         let mut used_units = HashSet::default();
-        for entry in WalkDir::new(&storage.snapshots).min_depth(2).max_depth(2) {
+        for entry in walk_partitioned_dir(&storage.snapshots) {
             let entry = entry?;
             if !entry.file_type().is_file() {
                 continue;
@@ -1474,10 +1471,7 @@ impl GlobalCacheTracker {
     ) -> CargoResult<HashSet<String>> {
         let mut entry_hash = String::with_capacity(64);
         let mut used_blobs = HashSet::default();
-        for entry in WalkDir::new(&storage.unit_outputs)
-            .min_depth(2)
-            .max_depth(2)
-        {
+        for entry in walk_partitioned_dir(&storage.unit_outputs) {
             let entry = entry?;
             if !entry.file_type().is_file() {
                 continue;
@@ -1513,7 +1507,7 @@ impl GlobalCacheTracker {
         delete_paths: &mut Vec<PathBuf>,
     ) -> CargoResult<()> {
         let mut entry_hash = String::with_capacity(64);
-        for entry in WalkDir::new(&storage.blobs).min_depth(2).max_depth(2) {
+        for entry in walk_partitioned_dir(&storage.blobs) {
             let entry = entry?;
             if !entry.file_type().is_file() {
                 continue;
@@ -2018,4 +2012,10 @@ fn du(path: &Path, table_name: &str) -> CargoResult<u64> {
     } else {
         cargo_util::du(&path, &[])
     }
+}
+
+/// Creates a [`WalkDir`] that walks files in a directory partitioned by `hash[..2]/hash[2..]`
+/// This is primarily meant for directories in [`SharedStorageLayout`]
+fn walk_partitioned_dir(path: impl AsRef<Path>) -> WalkDir {
+    WalkDir::new(path).min_depth(2).max_depth(2)
 }

@@ -893,17 +893,6 @@ impl<'gctx> DrainState<'gctx> {
         {
             self.handle_error(&mut build_runner.bcx.gctx.shell(), &mut errors, e);
         }
-        if build_runner.bcx.build_config.emit_json() {
-            let mut shell = build_runner.bcx.gctx.shell();
-            let msg = machine_message::BuildFinished {
-                success: errors.count == 0,
-            }
-            .to_json_string();
-            if let Err(e) = writeln!(shell.out(), "{}", msg) {
-                self.handle_error(&mut shell, &mut errors, e);
-            }
-        }
-
         if errors.count == 0
             && self.queue.is_empty()
             && self.pending_queue.is_empty()
@@ -917,6 +906,16 @@ impl<'gctx> DrainState<'gctx> {
                 .context("failed to save blob storage outputs")
             {
                 self.handle_error(&mut build_runner.bcx.gctx.shell(), &mut errors, err);
+            }
+        }
+        if build_runner.bcx.build_config.emit_json() {
+            let mut shell = build_runner.bcx.gctx.shell();
+            let msg = machine_message::BuildFinished {
+                success: errors.count == 0,
+            }
+            .to_json_string();
+            if let Err(e) = writeln!(shell.out(), "{}", msg) {
+                self.handle_error(&mut shell, &mut errors, e);
             }
         }
 

@@ -114,7 +114,8 @@
 //!
 //! There are checks for read-only filesystems, which is generally ignored.
 
-use crate::compiler::shared_storage::{BuildSnapshot, SharedStorageLayout, UnitOutputEntry};
+use crate::compiler::layout::SharedStorageLayout;
+use crate::compiler::shared_storage::{BuildSnapshot, UnitOutputEntry};
 use crate::ops::CleanContext;
 use crate::util::cache_lock::CacheLockMode;
 use crate::util::data_structures::{HashMap, HashSet};

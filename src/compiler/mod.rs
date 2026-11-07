@@ -300,6 +300,10 @@ fn compile<'gctx>(
                     } else {
                         build_runner.blob_storage_outputs.push(hash);
                     }
+                } else {
+                    // If the unit was not deduplicated for some reason, go ahead try to deduplicate
+                    // it now.
+                    add_deduplicate_step(&mut job);
                 }
             }
 

@@ -67,8 +67,7 @@ impl SharedStorage {
                     .collect::<BTreeMap<_, _>>(),
             };
 
-            let mut buf = vec![0; 1024];
-            serde_json::to_writer(&mut buf, &entry)?;
+            let buf = serde_json::to_vec(&entry)?;
             paths::write_atomic(path, buf)?;
         }
 

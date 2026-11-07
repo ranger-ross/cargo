@@ -107,6 +107,7 @@ impl SharedStorage {
     }
 
     pub fn unit_output_exists(&self, hash: &str) -> bool {
+        debug_assert_eq!(hash.len(), 64);
         let output = self.layout.unit_outputs.join(&hash[..2]).join(&hash[2..]);
         return output.exists();
     }

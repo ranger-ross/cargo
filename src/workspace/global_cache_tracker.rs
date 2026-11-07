@@ -131,7 +131,7 @@ use std::collections::hash_map;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 use tracing::{debug, trace};
-use walkdir::WalkDir;
+use walkdir::{DirEntry, WalkDir};
 
 /// The filename of the database.
 const GLOBAL_CACHE_FILENAME: &str = ".global-cache";
@@ -1411,11 +1411,7 @@ impl GlobalCacheTracker {
         delete_paths: &mut Vec<PathBuf>,
     ) -> CargoResult<HashSet<PathBuf>> {
         let mut used_snapshots = HashSet::default();
-        for entry in walk_partitioned_dir(&storage.snapshot_usage) {
-            let entry = entry?;
-            if !entry.file_type().is_file() {
-                continue;
-            }
+        walk_partitioned_dir(&storage.snapshot_usage, |entry| {
             let timestamp = paths::read(entry.path())?
                 .parse::<u128>()
                 .with_context(|| {
@@ -1434,7 +1430,8 @@ impl GlobalCacheTracker {
                         .to_path_buf(),
                 );
             }
-        }
+            Ok(())
+        })?;
 
         Ok(used_snapshots)
     }
@@ -1445,11 +1442,7 @@ impl GlobalCacheTracker {
         delete_paths: &mut Vec<PathBuf>,
     ) -> CargoResult<HashSet<String>> {
         let mut used_units = HashSet::default();
-        for entry in walk_partitioned_dir(&storage.snapshots) {
-            let entry = entry?;
-            if !entry.file_type().is_file() {
-                continue;
-            }
+        walk_partitioned_dir(&storage.snapshots, |entry| {
             if !used_snapshots.contains(entry.path().strip_prefix(&storage.snapshots)?) {
                 delete_paths.push(entry.into_path());
             } else {
@@ -1459,7 +1452,8 @@ impl GlobalCacheTracker {
                     })?;
                 used_units.extend(snapshot.unit_outputs);
             }
-        }
+            Ok(())
+        })?;
 
         Ok(used_units)
     }
@@ -1471,11 +1465,7 @@ impl GlobalCacheTracker {
     ) -> CargoResult<HashSet<String>> {
         let mut entry_hash = String::with_capacity(64);
         let mut used_blobs = HashSet::default();
-        for entry in walk_partitioned_dir(&storage.unit_outputs) {
-            let entry = entry?;
-            if !entry.file_type().is_file() {
-                continue;
-            }
+        walk_partitioned_dir(&storage.unit_outputs, |entry| {
             let prefix = entry.path().parent().unwrap().file_name().unwrap().to_str();
             let suffix = entry.file_name().to_str();
             let is_used = match (prefix, suffix) {
@@ -1496,7 +1486,8 @@ impl GlobalCacheTracker {
                     })?;
                 used_blobs.extend(unit.blobs.into_values());
             }
-        }
+            Ok(())
+        })?;
 
         Ok(used_blobs)
     }
@@ -1507,11 +1498,7 @@ impl GlobalCacheTracker {
         delete_paths: &mut Vec<PathBuf>,
     ) -> CargoResult<()> {
         let mut entry_hash = String::with_capacity(64);
-        for entry in walk_partitioned_dir(&storage.blobs) {
-            let entry = entry?;
-            if !entry.file_type().is_file() {
-                continue;
-            }
+        walk_partitioned_dir(&storage.blobs, |entry| {
             let prefix = entry.path().parent().unwrap().file_name().unwrap().to_str();
             let suffix = entry.file_name().to_str();
             let is_used = match (prefix, suffix) {
@@ -1526,9 +1513,8 @@ impl GlobalCacheTracker {
             if !is_used {
                 delete_paths.push(entry.into_path());
             }
-        }
-
-        Ok(())
+            Ok(())
+        })
     }
 }
 
@@ -2014,8 +2000,17 @@ fn du(path: &Path, table_name: &str) -> CargoResult<u64> {
     }
 }
 
-/// Creates a [`WalkDir`] that walks files in a directory partitioned by `hash[..2]/hash[2..]`
-/// This is primarily meant for directories in [`SharedStorageLayout`]
-fn walk_partitioned_dir(path: impl AsRef<Path>) -> WalkDir {
-    WalkDir::new(path).min_depth(2).max_depth(2)
+/// Visits files in a directory partitioned by `hash[..2]/hash[2..]`.
+/// This is primarily meant for directories in [`SharedStorageLayout`].
+fn walk_partitioned_dir(
+    path: impl AsRef<Path>,
+    mut visit: impl FnMut(DirEntry) -> CargoResult<()>,
+) -> CargoResult<()> {
+    for entry in WalkDir::new(path).min_depth(2).max_depth(2) {
+        let entry = entry?;
+        if entry.file_type().is_file() {
+            visit(entry)?;
+        }
+    }
+    Ok(())
 }

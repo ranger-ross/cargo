@@ -1,5 +1,6 @@
 //! See [`CompilationFiles`].
 
+use crate::compiler::blob_storage::BlobStorage;
 use crate::util::data_structures::HashMap;
 use std::cell::OnceCell;
 use std::fmt;
@@ -141,6 +142,8 @@ pub struct CompilationFiles<'a, 'gctx> {
     metas: HashMap<Unit, Metadata>,
     /// For each Unit, a list all files produced.
     outputs: HashMap<Unit, OnceCell<Arc<Vec<OutputFile>>>>,
+    /// The shared blob storage
+    blob_storage: Arc<BlobStorage>,
 }
 
 /// Info about a single file emitted by the compiler.
@@ -182,6 +185,7 @@ impl<'a, 'gctx: 'a> CompilationFiles<'a, 'gctx> {
             .cloned()
             .map(|unit| (unit, OnceCell::new()))
             .collect();
+        let blob_storage = Arc::new(BlobStorage::new(host.blob_storage().clone()));
         CompilationFiles {
             ws: build_runner.bcx.ws,
             host,
@@ -190,6 +194,7 @@ impl<'a, 'gctx: 'a> CompilationFiles<'a, 'gctx> {
             roots: build_runner.bcx.roots.clone(),
             metas,
             outputs,
+            blob_storage,
         }
     }
 
@@ -661,6 +666,10 @@ impl<'a, 'gctx: 'a> CompilationFiles<'a, 'gctx> {
         debug!("Target filenames: {:?}", ret);
 
         Ok(Arc::new(ret))
+    }
+
+    pub fn blob_storage(&self) -> Arc<BlobStorage> {
+        self.blob_storage.clone()
     }
 
     /// Append the SBOM suffix to the file name.

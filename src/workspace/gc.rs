@@ -102,12 +102,16 @@ pub struct GcOpts {
     pub max_git_co_age: Option<Duration>,
     /// The `--max-git-db-age` CLI option.
     pub max_git_db_age: Option<Duration>,
+    /// The `--max-blob-age` CLI option.
+    pub max_blob_age: Option<Duration>,
     /// The `--max-src-size` CLI option.
     pub max_src_size: Option<u64>,
     /// The `--max-crate-size` CLI option.
     pub max_crate_size: Option<u64>,
     /// The `--max-git-size` CLI option.
     pub max_git_size: Option<u64>,
+    /// The `--max-blob-size` CLI option.
+    pub max_blob_size: Option<u64>,
     /// The `--max-download-size` CLI option.
     pub max_download_size: Option<u64>,
 }
@@ -132,6 +136,10 @@ impl GcOpts {
             || self.max_crate_size.is_some()
             || self.max_git_size.is_some()
             || self.max_download_size.is_some()
+    }
+    /// Returns whether any blob storage cleaning options are set.
+    pub fn is_blob_cache_opt_set(&self) -> bool {
+        self.max_blob_age.is_some() || self.max_blob_size.is_some()
     }
 
     /// Updates the `GcOpts` to incorporate the specified max download age.
@@ -218,6 +226,16 @@ impl GcOpts {
                 config,
                 max_git_db_age,
                 DEFAULT_MAX_AGE_DOWNLOADED,
+                unstable_allowed
+            ),
+        )?;
+        self.max_blob_age = newer_time_span_for_config(
+            self.max_blob_age,
+            "gc.auto.max-blob-age",
+            config_default!(
+                config,
+                max_blob_age,
+                DEFAULT_MAX_AGE_EXTRACTED,
                 unstable_allowed
             ),
         )?;

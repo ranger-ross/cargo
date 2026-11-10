@@ -220,6 +220,7 @@ use std::path::{Path, PathBuf};
 pub struct Layout {
     artifact_dir: Option<ArtifactDirLayout>,
     build_dir: BuildDirLayout,
+    blob_storage: BlobStorageLayout,
     _lock: Option<FileLock>,
 }
 
@@ -333,6 +334,9 @@ impl Layout {
                 _lock: build_dir_lock,
                 is_new_layout,
             },
+            blob_storage: BlobStorageLayout {
+                root: ws.gctx().blob_storage_path().into_path_unlocked(),
+            },
             _lock: lock,
         })
     }
@@ -343,6 +347,7 @@ impl Layout {
             artifact_dir.prepare()?;
         }
         self.build_dir.prepare()?;
+        self.blob_storage.prepare()?;
 
         Ok(())
     }
@@ -353,6 +358,10 @@ impl Layout {
 
     pub fn build_dir(&self) -> &BuildDirLayout {
         &self.build_dir
+    }
+
+    pub fn blob_storage(&self) -> &BlobStorageLayout {
+        &self.blob_storage
     }
 }
 
@@ -521,5 +530,21 @@ impl BuildDirLayout {
     pub fn prepare_tmp(&self) -> CargoResult<&Path> {
         paths::create_dir_all(&self.tmp)?;
         Ok(&self.tmp)
+    }
+}
+
+#[derive(Clone)]
+pub struct BlobStorageLayout {
+    root: PathBuf,
+}
+
+impl BlobStorageLayout {
+    /// Makes sure all directories stored in the Layout exist on the filesystem.
+    pub fn prepare(&mut self) -> CargoResult<()> {
+        paths::create_dir_all(&self.root)?;
+        Ok(())
+    }
+    pub fn root(&self) -> &Path {
+        &self.root
     }
 }

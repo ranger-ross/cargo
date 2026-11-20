@@ -44,7 +44,7 @@ pub struct CleanContext<'gctx> {
     num_files_removed: u64,
     num_dirs_removed: u64,
     total_bytes_removed: u64,
-    seen_file_ids: HashSet<FileId>,
+    file_bytes: FileBytes,
 }
 
 /// Cleans various caches.
@@ -513,7 +513,7 @@ impl<'gctx> CleanContext<'gctx> {
             num_files_removed: 0,
             num_dirs_removed: 0,
             total_bytes_removed: 0,
-            seen_file_ids: HashSet::default(),
+            file_bytes: FileBytes::default(),
         }
     }
 
@@ -547,7 +547,7 @@ impl<'gctx> CleanContext<'gctx> {
 
         let mut rm_file = |path: &Path, meta: Result<std::fs::Metadata, _>| {
             if let Ok(meta) = meta {
-                self.total_bytes_removed += count_bytes(&mut self.seen_file_ids, path, &meta);
+                self.total_bytes_removed += self.file_bytes.count(path, &meta);
             }
             self.num_files_removed += 1;
             if !self.dry_run {
@@ -729,25 +729,30 @@ impl<'gctx> CleaningProgressBar for CleaningPackagesBar<'gctx> {
     }
 }
 
-fn count_bytes(seen: &mut HashSet<FileId>, path: &Path, meta: &fs::Metadata) -> u64 {
-    if !meta.is_file() {
-        return meta.len();
-    }
-    // We don't follow symlinks, so the meta here for the symlink itself.
-    // So we just report the size of the symlink since that is what we
-    // are deleting it.
-    if meta.is_symlink() {
-        return meta.len();
-    }
-    match FileId::new_with_link_count(meta, path) {
-        Some((id, nlink)) => {
-            if nlink <= 1 || seen.insert(id) {
-                meta.len()
-            } else {
-                0
+#[derive(Default)]
+struct FileBytes {
+    seen: HashSet<FileId>,
+    #[cfg(target_os = "linux")]
+    reflinks: reflinks::Reflinks,
+}
+
+impl FileBytes {
+    fn count(&mut self, path: &Path, meta: &fs::Metadata) -> u64 {
+        if !meta.is_file() {
+            return meta.len();
+        }
+        if let Some((id, nlink)) = FileId::new_with_link_count(meta, path) {
+            if self.seen.contains(&id) {
+                return 0;
+            }
+            if nlink > 1 {
+                self.seen.insert(id);
             }
         }
-        None => meta.len(),
+        #[cfg(target_os = "linux")]
+        return self.reflinks.count(path, meta);
+        #[cfg(not(target_os = "linux"))]
+        meta.len()
     }
 }
 
@@ -756,9 +761,6 @@ fn count_bytes(seen: &mut HashSet<FileId>, path: &Path, meta: &fs::Metadata) -> 
 /// [`FileId`] is similar to [`same_file::Handle`] but does not require holding on
 /// to a file descriptor. This is important when dealing with tracking large
 /// amounts of files like when cleaning target-dir/build-dir.
-///
-/// NOTE: Currently works for hardlinks, but will not work for reflinks.
-///       Cargo does not current use reflinks, but may in the future.
 #[derive(PartialEq, Eq, Hash)]
 struct FileId((u64, u64));
 
@@ -810,5 +812,148 @@ impl FileId {
             FileId((info.dwVolumeSerialNumber as u64, file_index)),
             info.nNumberOfLinks as u64,
         ))
+    }
+}
+
+#[cfg(target_os = "linux")]
+mod reflinks {
+    use super::*;
+    use std::collections::BTreeMap;
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+
+    const LAST: u32 = 0x0001;
+    const SHARED: u32 = 0x2000;
+
+    #[derive(Default)]
+    pub(super) struct Reflinks {
+        extents: BTreeMap<(u64, u64), u64>,
+        unsupported: HashSet<u64>,
+    }
+
+    #[repr(C)]
+    #[derive(Default)]
+    struct Fiemap {
+        start: u64,
+        length: u64,
+        flags: u32,
+        mapped_extents: u32,
+        extent_count: u32,
+        reserved: u32,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    struct Extent {
+        logical: u64,
+        physical: u64,
+        length: u64,
+        reserved64: [u64; 2],
+        flags: u32,
+        reserved: [u32; 3],
+    }
+
+    #[repr(C)]
+    struct Buffer {
+        map: Fiemap,
+        extents: [Extent; 32],
+    }
+
+    impl Reflinks {
+        pub(super) fn count(&mut self, path: &Path, meta: &fs::Metadata) -> u64 {
+            let mut bytes = meta.len();
+            let dev = meta.dev();
+            if bytes == 0 || self.unsupported.contains(&dev) {
+                return bytes;
+            }
+            let Ok(file) = fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+                .open(path)
+            else {
+                return bytes;
+            };
+            let mut buffer = Buffer {
+                map: Fiemap {
+                    length: meta.len(),
+                    extent_count: 32,
+                    ..Fiemap::default()
+                },
+                extents: [Extent::default(); 32],
+            };
+            loop {
+                // The ioctl size describes only the header, followed by the extent array.
+                let result = unsafe {
+                    libc::ioctl(
+                        file.as_raw_fd(),
+                        libc::_IOWR::<Fiemap>(b'f' as u32, 11),
+                        &mut buffer,
+                    )
+                };
+                if result == -1 {
+                    if matches!(
+                        io::Error::last_os_error().raw_os_error(),
+                        Some(libc::ENOTTY | libc::EOPNOTSUPP | libc::ENOSYS)
+                    ) {
+                        self.unsupported.insert(dev);
+                    }
+                    return bytes;
+                }
+                let extents = &buffer.extents[..buffer.map.mapped_extents as usize];
+                let Some(last) = extents.last() else {
+                    return bytes;
+                };
+                for extent in extents {
+                    // Only ordinary, fully mapped extents have comparable byte ranges.
+                    if extent.flags & !(LAST | SHARED) != 0 {
+                        continue;
+                    }
+                    let length = extent.length.min(meta.len().saturating_sub(extent.logical));
+                    if length == 0 {
+                        continue;
+                    }
+                    let Some(end) = extent.physical.checked_add(length) else {
+                        continue;
+                    };
+                    bytes -= self.overlap(dev, extent.physical, end, extent.flags & SHARED != 0);
+                }
+                let next = last.logical.saturating_add(last.length);
+                if last.flags & LAST != 0 || next >= meta.len() || next <= buffer.map.start {
+                    return bytes;
+                }
+                buffer.map.start = next;
+                buffer.map.length = meta.len() - next;
+                buffer.map.mapped_extents = 0;
+            }
+        }
+
+        fn overlap(&mut self, dev: u64, start: u64, end: u64, shared: bool) -> u64 {
+            let mut merged_start = start;
+            let mut merged_end = end;
+            let mut overlap = 0;
+            if let Some((&(device, previous), &previous_end)) =
+                self.extents.range(..=(dev, start)).next_back()
+                && device == dev
+                && previous_end >= start
+            {
+                if previous_end >= end {
+                    return end - start;
+                }
+                merged_start = previous;
+            }
+            while let Some((&key, &previous_end)) = self
+                .extents
+                .range((dev, merged_start)..=(dev, merged_end))
+                .next()
+            {
+                overlap += end.min(previous_end).saturating_sub(start.max(key.1));
+                merged_end = merged_end.max(previous_end);
+                self.extents.remove(&key);
+            }
+            if shared || overlap != 0 || merged_start != start || merged_end != end {
+                self.extents.insert((dev, merged_start), merged_end);
+            }
+            overlap
+        }
     }
 }

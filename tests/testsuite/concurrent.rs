@@ -14,7 +14,7 @@ use cargo_test_support::install::assert_has_installed_exe;
 use cargo_test_support::paths;
 use cargo_test_support::registry::Package;
 use cargo_test_support::str;
-use cargo_test_support::{basic_manifest, execs, project, retry, sleep_ms, slow_cpu_multiplier};
+use cargo_test_support::{basic_manifest, execs, project, retry, slow_cpu_multiplier};
 
 fn pkg(name: &str, vers: &str) {
     Package::new(name, vers)
@@ -527,16 +527,10 @@ fn verbose_file_lock_blocking() {
             "build.rs",
             r#"
                 fn main() {
-                    let blocking = std::env::var("BLOCKING").unwrap_or_default();
-                    if blocking == "1" {
+                    if let Some(hold) = std::env::var_os("HOLD_BUILD") {
                         std::fs::write("blocking", "").unwrap();
-                        let path = std::path::Path::new("ready");
-                        loop {
-                            if path.exists() {
-                                break;
-                            } else {
-                                std::thread::sleep(std::time::Duration::from_millis(100))
-                            }
+                        while std::path::Path::new(&hold).exists() {
+                            std::thread::sleep(std::time::Duration::from_millis(100));
                         }
                     }
                 }
@@ -544,34 +538,42 @@ fn verbose_file_lock_blocking() {
         )
         .build();
 
-    // start a build that will hold the lock on the build directory
+    // Start a build that will hold the build directory lock until the file is
+    // removed, which also happens if the test panics.
+    let hold = tempfile::NamedTempFile::new_in(paths::root()).unwrap();
     let mut a = p
         .cargo("check")
         .build_command()
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .env("BLOCKING", "1")
+        .env("HOLD_BUILD", hold.path())
         .spawn()
         .unwrap();
 
     // wait for the build script to start
     retry(100, || p.root().join("blocking").exists().then_some(()));
 
+    let stderr = paths::root().join("blocked.stderr");
     let blocked_p = p
         .cargo("check -vv")
         .build_command()
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .env("BLOCKING", "0")
+        .stderr(fs::File::create(&stderr).unwrap())
+        .env_remove("HOLD_BUILD")
         .spawn()
         .unwrap();
 
-    sleep_ms(500);
+    retry(100, || {
+        String::from_utf8_lossy(&fs::read(&stderr).unwrap())
+            .contains("waiting for file lock on build directory")
+            .then_some(())
+    });
 
     // release the lock on the build directory
-    std::fs::write(p.root().join("ready"), "").unwrap();
+    hold.close().unwrap();
 
-    let blocked_p_otpt = blocked_p.wait_with_output().unwrap();
+    let mut blocked_p_otpt = blocked_p.wait_with_output().unwrap();
+    blocked_p_otpt.stderr = fs::read(stderr).unwrap();
 
     assert!(a.wait().unwrap().success());
     execs()

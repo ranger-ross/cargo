@@ -1584,8 +1584,6 @@ fn stale_cached_version() {
     git::add(&repo);
     git::commit(&repo);
 
-    sleep_ms(1000);
-
     let rev = repo.revparse_single("HEAD").unwrap().id();
 
     foo.change_file(

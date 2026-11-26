@@ -687,7 +687,12 @@ fn rebuild_on_mid_build_file_modification() {
 
     let t = thread::spawn(move || {
         let socket = server.accept().unwrap().0;
-        sleep_ms(1000);
+        // Wait for a real filesystem tick while rustc is blocked: a future-dated
+        // edit would be dirty even if Cargo used the end of the build as its timestamp.
+        let clock = root.join("clock");
+        let sample = || cargo_util::paths::set_invocation_time(&clock).unwrap();
+        let start = sample();
+        cargo_test_support::retry(100, || (sample() > start).then_some(()));
         let mut file = OpenOptions::new()
             .write(true)
             .append(true)

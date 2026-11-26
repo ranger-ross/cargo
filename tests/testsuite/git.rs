@@ -823,8 +823,6 @@ fn update_with_shared_deps() {
     git::add(&repo);
     git::commit(&repo);
 
-    sleep_ms(1000);
-
     // By default, not transitive updates
     println!("dep1 update");
     p.cargo("update dep1")

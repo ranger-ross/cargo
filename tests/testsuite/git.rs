@@ -1716,7 +1716,6 @@ project2
     git::add(&repo);
     git::commit(&repo);
 
-    sleep_ms(1000);
     // Update the dependency and carry on!
     println!("update");
     p.cargo("update")

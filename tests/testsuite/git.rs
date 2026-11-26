@@ -13,7 +13,7 @@ use crate::prelude::*;
 use cargo_test_support::git::add_submodule;
 use cargo_test_support::paths;
 use cargo_test_support::registry::Package;
-use cargo_test_support::{Project, sleep_ms, str, t};
+use cargo_test_support::{Project, str, t};
 use cargo_test_support::{basic_lib_manifest, basic_manifest, git, main_file, project};
 
 #[cargo_test]
@@ -1848,8 +1848,6 @@ fn git_build_cmd_freshness() {
     });
     foo.root().move_into_the_past();
 
-    sleep_ms(1000);
-
     foo.cargo("check")
         .with_stderr_data(str![[r#"
 [COMPILING] foo v0.0.0 ([ROOT]/foo)
@@ -1870,6 +1868,7 @@ fn git_build_cmd_freshness() {
     // Modify an ignored file and make sure we don't rebuild
     println!("second pass");
     foo.change_file("src/bar.rs", "");
+    foo.root().join("src/bar.rs").move_into_the_future();
     foo.cargo("check")
         .with_stderr_data(str![[r#"
 [FINISHED] `dev` profile [unoptimized + full debuginfo] target(s) in [ELAPSED]s

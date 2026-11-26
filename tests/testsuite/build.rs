@@ -21,7 +21,7 @@ use cargo_test_support::registry::Package;
 use cargo_test_support::str;
 use cargo_test_support::{
     Execs, ProjectBuilder, basic_bin_manifest, basic_lib_manifest, basic_manifest, git, is_nightly,
-    main_file, paths, process, project, rustc_host, sleep_ms, symlink_supported, t,
+    main_file, paths, process, project, retry, rustc_host, symlink_supported, t,
 };
 use cargo_util::paths::dylib_path_envvar;
 use cargo_util_terminal::Shell;
@@ -3031,12 +3031,14 @@ fn compile_then_delete() {
     let p = project().file("src/main.rs", "fn main() {}").build();
 
     p.cargo("run -v").run();
-    assert!(p.bin("foo").is_file());
-    if cfg!(windows) {
-        // On windows unlinking immediately after running often fails, so sleep
-        sleep_ms(100);
-    }
-    fs::remove_file(&p.bin("foo")).unwrap();
+    let bin = p.bin("foo");
+    assert!(bin.is_file());
+    // Windows may keep the just-executed binary open briefly.
+    retry(10, || match fs::remove_file(&bin) {
+        Err(e) if cfg!(windows) && matches!(e.raw_os_error(), Some(5 | 32)) => None,
+        result => Some(result),
+    })
+    .unwrap();
     p.cargo("run -v").run();
 }
 

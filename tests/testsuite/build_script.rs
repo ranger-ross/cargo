@@ -18,8 +18,8 @@ use cargo_test_support::compare::assert_e2e;
 use cargo_test_support::paths::cargo_home;
 use cargo_test_support::registry::Package;
 use cargo_test_support::str;
-use cargo_test_support::{basic_manifest, cross_compile, is_coarse_mtime, project, project_in};
-use cargo_test_support::{git, rustc_host, sleep_ms, slow_cpu_multiplier, symlink_supported};
+use cargo_test_support::{basic_manifest, cross_compile, project, project_in};
+use cargo_test_support::{git, rustc_host, slow_cpu_multiplier, symlink_supported};
 use cargo_util::paths::dylib_path_envvar;
 use cargo_util::paths::{self, remove_dir_all};
 
@@ -4533,10 +4533,15 @@ fn rebuild_only_on_explicit_paths() {
 "#]])
         .run();
 
-    sleep_ms(1000);
+    let age_build = || {
+        p.root().move_into_the_past();
+        p.build_dir().move_into_the_past();
+    };
+    age_build();
     p.change_file("foo", "");
     p.change_file("bar", "");
-    sleep_ms(1000); // make sure the to-be-created outfile has a timestamp distinct from the infiles
+    // Keep the new inputs between the previous build and the one about to run.
+    age_build();
 
     // now the exist, so run once, catch the mtime, then shouldn't run again
     println!("run with");
@@ -4560,7 +4565,7 @@ fn rebuild_only_on_explicit_paths() {
 "#]])
         .run();
 
-    sleep_ms(1000);
+    age_build();
 
     // random other files do not affect freshness
     println!("run baz");
@@ -6335,9 +6340,23 @@ fn rerun_if_directory() {
 
 "#]]);
 
-    if is_coarse_mtime() {
-        sleep_ms(1000);
-    }
+    let output = p
+        .glob("target/debug/build/foo/*/run/stdout")
+        .next()
+        .unwrap()
+        .unwrap();
+    let age_build = || {
+        output.move_into_the_past();
+        // Only the next operation should make the directory dirty. Age existing
+        // entries, including the directory and the symlink itself, before it.
+        let before_build =
+            output.metadata().unwrap().modified().unwrap() - std::time::Duration::from_secs(60);
+        let before_build = filetime::FileTime::from_system_time(before_build);
+        for path in p.root().join("somedir").ls_r() {
+            filetime::set_symlink_file_times(path, before_build, before_build).unwrap();
+        }
+    };
+    age_build();
 
     // Empty directory.
     fs::create_dir(p.root().join("somedir")).unwrap();
@@ -6351,9 +6370,7 @@ fn rerun_if_directory() {
 "#]]);
     fresh();
 
-    if is_coarse_mtime() {
-        sleep_ms(1000);
-    }
+    age_build();
 
     // Add a file.
     p.change_file("somedir/foo", "");
@@ -6368,9 +6385,7 @@ fn rerun_if_directory() {
 "#]]);
     fresh();
 
-    if is_coarse_mtime() {
-        sleep_ms(1000);
-    }
+    age_build();
 
     // Add a symlink.
     p.symlink("foo", "somedir/link");
@@ -6384,9 +6399,7 @@ fn rerun_if_directory() {
 "#]]);
     fresh();
 
-    if is_coarse_mtime() {
-        sleep_ms(1000);
-    }
+    age_build();
 
     // Move the symlink.
     fs::remove_file(p.root().join("somedir/link")).unwrap();
@@ -6401,9 +6414,7 @@ fn rerun_if_directory() {
 "#]]);
     fresh();
 
-    if is_coarse_mtime() {
-        sleep_ms(1000);
-    }
+    age_build();
 
     // Remove a file.
     fs::remove_file(p.root().join("somedir/foo")).unwrap();

@@ -8,6 +8,7 @@
 
 use std::env;
 use std::fmt::Write;
+use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -24,8 +25,7 @@ use cargo_test_support::paths;
 use cargo_test_support::paths::ReadOnly;
 use cargo_test_support::registry::{Package, RegistryBuilder};
 use cargo_test_support::{
-    Execs, Project, basic_manifest, execs, git, process, project, retry, sleep_ms, str,
-    thread_wait_timeout,
+    Execs, Project, basic_manifest, execs, git, process, project, retry, str, thread_wait_timeout,
 };
 use itertools::Itertools;
 
@@ -1240,13 +1240,9 @@ fn package_cache_lock_during_build() {
             r#"
                 fn main() {
                     std::fs::write("blocking", "").unwrap();
-                    let path = std::path::Path::new("ready");
-                    loop {
-                        if path.exists() {
-                            break;
-                        } else {
-                            std::thread::sleep(std::time::Duration::from_millis(100))
-                        }
+                    let hold = std::env::var_os("HOLD_BUILD").unwrap();
+                    while std::path::Path::new(&hold).exists() {
+                        std::thread::sleep(std::time::Duration::from_millis(100));
                     }
                 }
             "#,
@@ -1273,11 +1269,14 @@ fn package_cache_lock_during_build() {
         .build();
 
     // Start a build that will pause once the build starts.
+    // Dropping the file also releases the build if the test panics.
+    let hold = tempfile::NamedTempFile::new_in(paths::root()).unwrap();
     let mut foo_child = p_foo
         .cargo("check")
         .build_command()
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        .env("HOLD_BUILD", hold.path())
         .spawn()
         .unwrap();
 
@@ -1312,21 +1311,27 @@ fn package_cache_lock_during_build() {
         .arg("-Zgc")
         .masquerade_as_nightly_cargo(&["gc"])
         .build_command();
-    clean_cmd.stderr(Stdio::piped());
+    let stderr = paths::root().join("clean.stderr");
+    clean_cmd.stderr(fs::File::create(&stderr).unwrap());
     let mut clean_child = clean_cmd.spawn().unwrap();
 
-    // Give the clean command a chance to finish (it shouldn't).
-    sleep_ms(500);
+    // Wait until the clean command has actually tried to acquire the lock.
+    retry(100, || {
+        String::from_utf8_lossy(&fs::read(&stderr).unwrap())
+            .contains("waiting for file lock on package cache mutation")
+            .then_some(())
+    });
     // They should both still be running.
     assert!(matches!(foo_child.try_wait(), Ok(None)));
     assert!(matches!(clean_child.try_wait(), Ok(None)));
 
     // Let the original build finish.
-    p_foo.change_file("ready", "");
+    hold.close().unwrap();
 
     // Wait for clean to finish.
     let thread = std::thread::spawn(|| clean_child.wait_with_output().unwrap());
-    let output = thread_wait_timeout(100, thread);
+    let mut output = thread_wait_timeout(100, thread);
+    output.stderr = fs::read(stderr).unwrap();
     assert!(output.status.success());
     // Validate the output of the clean.
     execs()

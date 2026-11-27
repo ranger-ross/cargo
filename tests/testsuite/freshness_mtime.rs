@@ -310,7 +310,7 @@ fn no_rebuild_when_rename_dir() {
                 default = "allow"
             "#,
         )
-        .file("src/_unused.rs", "")
+        .file("src/lib.rs", "")
         .file("build.rs", "fn main() {}")
         .file("foo/Cargo.toml", &basic_manifest("foo", "0.0.1"))
         .file("foo/src/lib.rs", "")
@@ -320,8 +320,9 @@ fn no_rebuild_when_rename_dir() {
     // make sure the most recently modified file is `src/lib.rs`, not
     // `Cargo.toml`, to expose a historical bug where we forgot to strip the
     // `Cargo.toml` path from looking for the package root.
-    cargo_test_support::sleep_ms(100);
-    fs::write(p.root().join("src/lib.rs"), "").unwrap();
+    p.cargo("generate-lockfile").run();
+    p.root().move_into_the_past();
+    p.change_file("src/lib.rs", "");
 
     p.cargo("build").run();
     let mut new = p.root();
@@ -686,7 +687,12 @@ fn rebuild_on_mid_build_file_modification() {
 
     let t = thread::spawn(move || {
         let socket = server.accept().unwrap().0;
-        sleep_ms(1000);
+        // Wait for a real filesystem tick while rustc is blocked: a future-dated
+        // edit would be dirty even if Cargo used the end of the build as its timestamp.
+        let clock = root.join("clock");
+        let sample = || cargo_util::paths::set_invocation_time(&clock).unwrap();
+        let start = sample();
+        cargo_test_support::retry(100, || (sample() > start).then_some(()));
         let mut file = OpenOptions::new()
             .write(true)
             .append(true)
